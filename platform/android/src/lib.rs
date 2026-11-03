@@ -208,12 +208,13 @@ impl App {
             log::warn!("{id:?}: {why}");
         }
 
-        renderer.set_chart(&got.line_slices(), &got.points);
+        renderer.set_chart(&got.lines, &got.points);
         log::debug!(
-            "charts: {} tiles, {} polylines, {} points",
+            "charts: {} tiles, {} polylines, {} points, styles {:?}",
             got.tiles.len(),
             got.lines.len(),
-            got.points.len()
+            got.points.len(),
+            got.styles()
         );
 
         self.loaded = got.tiles;

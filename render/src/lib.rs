@@ -28,7 +28,11 @@
 //! MBTiles — and linking SQLite — stays in `rutter-charts`, where a renderer
 //! does not have to care about it.
 
-use rutter_core::chart::{self, TileId};
+pub mod ui;
+
+pub use ui::{Action, ImageryState, LayerEntry, Ui};
+
+use rutter_core::chart::{self, ChartStyle, StyledLine, StyledPoint, TileId};
 use rutter_core::View;
 
 /// Sea. Everything is drawn over this.
@@ -45,11 +49,49 @@ const GRID_COLOUR: [f32; 4] = [0.25, 0.42, 0.55, 1.0];
 /// The mark at the view centre — where the boat would be.
 const MARK_COLOUR: [f32; 4] = [0.95, 0.75, 0.15, 1.0];
 
-/// Chart linework: coastlines, depth area boundaries, contours.
-const CHART_COLOUR: [f32; 4] = [0.82, 0.90, 0.95, 1.0];
+/// Colour for a chart feature.
+///
+/// Loosely after the IHO's day palette, which is the convention every
+/// chartplotter follows: land buff, shallow water pale, deep water dark,
+/// dangers conspicuous. Not a faithful implementation of S-52 — that
+/// specifies exact colours per depth band and viewing condition — but close
+/// enough that the chart reads the way a navigator expects.
+fn colour_for(style: ChartStyle) -> [f32; 4] {
+    match style {
+        // Land: the buff every paper chart uses.
+        ChartStyle::Land => [0.85, 0.78, 0.60, 1.0],
+        // Coastline: the strongest line on the chart, so the brightest.
+        ChartStyle::Coastline => [0.96, 0.93, 0.85, 1.0],
+        // Depth areas and contours: cool and recessive, they are context.
+        ChartStyle::DepthArea => [0.35, 0.58, 0.72, 1.0],
+        ChartStyle::DepthContour => [0.45, 0.68, 0.82, 1.0],
+        // Soundings: legible but quiet; there are hundreds of them.
+        ChartStyle::Sounding => [0.62, 0.80, 0.88, 1.0],
+        // Marks: warm, so they separate from the blue water behind.
+        ChartStyle::Buoy => [0.95, 0.75, 0.20, 1.0],
+        ChartStyle::Beacon => [0.90, 0.60, 0.25, 1.0],
+        ChartStyle::Light => [0.98, 0.90, 0.35, 1.0],
+        // Dangers: the one thing on a chart that should be alarming.
+        ChartStyle::Danger => [0.95, 0.35, 0.35, 1.0],
+        // Advisory areas: dim magenta, as on paper.
+        ChartStyle::Area => [0.70, 0.45, 0.70, 1.0],
+        ChartStyle::Other => [0.55, 0.62, 0.68, 1.0],
+    }
+}
 
-/// Point features — soundings, buoys, beacons.
-const SOUNDING_COLOUR: [f32; 4] = [0.60, 0.85, 0.70, 1.0];
+/// Half-size of a point mark, as a multiple of the computed base arm.
+///
+/// Soundings are the smallest because they are the most numerous; a danger
+/// is drawn large because missing one matters more than tidiness.
+fn mark_scale(style: ChartStyle) -> f32 {
+    match style {
+        ChartStyle::Sounding => 0.7,
+        ChartStyle::Buoy | ChartStyle::Beacon => 1.3,
+        ChartStyle::Light => 1.6,
+        ChartStyle::Danger => 1.8,
+        _ => 1.0,
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -61,11 +103,49 @@ struct Vertex {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageryVertex {
+    /// Offset from the imagery layer's reference point, in world units.
+    offset: [f32; 2],
+    uv: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageryUniform {
+    scale: [f32; 2],
+    origin: [f32; 2],
+    opacity: f32,
+    /// WGSL rounds a struct up to a 16-byte boundary; spelling the padding
+    /// out keeps the Rust and WGSL layouts obviously identical rather than
+    /// coincidentally so.
+    _pad: [f32; 3],
+}
+
+/// One imagery tile on the GPU: its texture, its binding, and where its
+/// quad sits in the vertex buffer.
+struct ImageryTile {
+    id: TileId,
+    bind_group: wgpu::BindGroup,
+    /// Index of this tile's first vertex. Six per tile — two triangles,
+    /// unindexed, because at a hundred-odd tiles the index buffer would
+    /// save a few kilobytes and cost a chunk of bookkeeping.
+    first_vertex: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ViewUniform {
     scale: [f32; 2],
     /// This buffer's reference point relative to the view centre.
     origin: [f32; 2],
 }
+
+/// How strongly imagery shows through by default.
+///
+/// Not fully opaque: chart linework has to stay readable over an aerial
+/// photograph, and a slight fade buys that contrast without restyling every
+/// line. Adjustable at runtime — on a clear day you may want the photograph.
+const DEFAULT_IMAGERY_OPACITY: f32 = 0.75;
 
 /// Vertices the grid buffer holds. Fixed, because the grid is bounded: a
 /// viewport covers a few hundred tiles at most, eight vertices each for four
@@ -93,7 +173,6 @@ struct Layer {
     bind_group: wgpu::BindGroup,
 }
 
-#[derive(Debug)]
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -101,10 +180,32 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_layout: wgpu::BindGroupLayout,
+    /// egui's wgpu backend, which owns its own pipelines and font atlas and
+    /// draws into the chart's render pass.
+    ///
+    /// Not `Debug`, hence the manual impl for `Renderer` below.
+    egui: egui_wgpu::Renderer,
     /// Tile boundaries and the centre mark. Rebuilt every frame.
     grid: Layer,
     /// Real chart geometry. Uploaded on change, then left alone.
     charts: Layer,
+
+    /// Aerial imagery, drawn under everything else.
+    imagery_pipeline: wgpu::RenderPipeline,
+    imagery_texture_layout: wgpu::BindGroupLayout,
+    imagery_uniform: wgpu::Buffer,
+    imagery_view_bind: wgpu::BindGroup,
+    imagery_vertices: wgpu::Buffer,
+    imagery_capacity: u64,
+    imagery_tiles: Vec<ImageryTile>,
+    /// Reference point the imagery quads are measured from, in f64 so the
+    /// subtraction against the view centre keeps its precision.
+    imagery_origin: chart::WorldXY,
+    /// How strongly the imagery shows through, 0..1.
+    imagery_opacity: f32,
+    /// Shared by every imagery tile: linear filtering, clamped at the edges
+    /// so a tile does not bleed its neighbour's pixels across the seam.
+    imagery_sampler: wgpu::Sampler,
     /// Scratch, kept between frames so a redraw does not allocate.
     scratch: Vec<Vertex>,
 }
@@ -131,6 +232,35 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl std::fmt::Debug for Renderer {
+    /// Written by hand because `egui_wgpu::Renderer` is not `Debug`, and the
+    /// workspace lints ask every public type to be. The useful fields are
+    /// the surface size and what is currently uploaded; the GPU handles
+    /// would print as opaque ids.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Renderer")
+            .field("size", &(self.config.width, self.config.height))
+            .field("format", &self.config.format)
+            .field("grid_vertices", &self.grid.count)
+            .field("chart_vertices", &self.charts.count)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One frame of interface, ready to composite.
+///
+/// The primitive list is borrowed, because it is the tessellated interface
+/// and can be large. The texture delta is **owned**, because it must be: it
+/// carries a `Drop` assertion that fires if it is dropped with deltas still
+/// unapplied, so a painter has to consume it rather than read it. Taking it
+/// by value here makes that the type's problem instead of the caller's.
+#[derive(Debug)]
+pub struct GuiFrame<'a> {
+    pub primitives: &'a [egui::ClippedPrimitive],
+    pub textures: egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
 
 /// What came of asking for a frame.
 ///
@@ -309,9 +439,146 @@ impl Renderer {
             cache: None,
         });
 
+        // ── Imagery pipeline ───────────────────────────────────────────
+        //
+        // A second pipeline rather than a branch in the first: textured
+        // quads and coloured lines need different vertex layouts, different
+        // topologies and different bind groups, and merging them would mean
+        // a shader that does neither job clearly.
+        let imagery_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("imagery"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("imagery.wgsl").into()),
+        });
+
+        let imagery_view_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("imagery view"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let imagery_texture_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("imagery tile"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let imagery_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("imagery"),
+            bind_group_layouts: &[Some(&imagery_view_layout), Some(&imagery_texture_layout)],
+            immediate_size: 0,
+        });
+
+        let imagery_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("imagery"),
+            layout: Some(&imagery_layout),
+            vertex: wgpu::VertexState {
+                module: &imagery_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImageryVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &imagery_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let imagery_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("imagery view"),
+            size: std::mem::size_of::<ImageryUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let imagery_view_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("imagery view"),
+            layout: &imagery_view_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: imagery_uniform.as_entire_binding(),
+            }],
+        });
+
+        let imagery_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("imagery"),
+            // Clamp, not repeat: at a tile's edge, repeating wraps the
+            // opposite side of the photograph into the seam.
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let imagery_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("imagery"),
+            size: std::mem::size_of::<ImageryVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let grid = Layer::new(&device, &bind_layout, "grid", GRID_CAPACITY);
         // The chart layer starts empty; `set_chart` sizes it to the data.
         let charts = Layer::new(&device, &bind_layout, "charts", 1);
+
+        // No depth buffer and no MSAA, matching the chart pipeline.
+        // Dithering on, which is egui's own default and matters for the flat
+        // panel fills this draws.
+        let egui = egui_wgpu::Renderer::new(
+            &device,
+            format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                depth_stencil_format: None,
+                dithering: true,
+                predictable_texture_filtering: false,
+            },
+        );
 
         Ok(Self {
             surface,
@@ -320,8 +587,19 @@ impl Renderer {
             config,
             pipeline,
             bind_layout,
+            egui,
             grid,
             charts,
+            imagery_pipeline,
+            imagery_texture_layout,
+            imagery_uniform,
+            imagery_view_bind,
+            imagery_vertices,
+            imagery_capacity: 1,
+            imagery_tiles: Vec::new(),
+            imagery_origin: chart::WorldXY { x: 0.0, y: 0.0 },
+            imagery_opacity: DEFAULT_IMAGERY_OPACITY,
+            imagery_sampler,
             scratch: Vec::with_capacity(4096),
         })
     }
@@ -354,12 +632,68 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Draw one frame of `view`.
+    /// Draw one frame of `view`, with no interface over it.
     pub fn render(&mut self, view: &View) -> Frame {
+        self.render_with_ui(view, None)
+    }
+
+    /// Draw one frame of `view`, compositing an egui frame over it.
+    ///
+    /// The interface shares the chart's render pass rather than taking its
+    /// own, which is why egui was chosen: one surface, one submit, and the
+    /// panel is simply drawn last.
+    pub fn render_with_ui(&mut self, view: &View, mut gui: Option<GuiFrame<'_>>) -> Frame {
         use wgpu::CurrentSurfaceTexture as Acquired;
 
         self.build_geometry(view);
         self.upload(view);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
+
+        // egui's textures and buffers are updated here — deliberately before
+        // the surface is acquired, and the delta is drained rather than read.
+        //
+        // The ordering is forced by `TexturesDelta`'s Drop assertion, which
+        // fires if it is dropped with anything still unapplied. Acquiring
+        // the surface first would mean the early returns below — timed out,
+        // occluded, lost — drop the delta unapplied, and a panic inside Drop
+        // mid-frame surfaces as a segfault rather than as an error. That is
+        // exactly the bug this ordering replaced.
+        let mut egui_prepared = None;
+        let mut to_free: Vec<egui::TextureId> = Vec::new();
+        if let Some(gui) = &mut gui {
+            // One texture can have several deltas queued in a frame — a
+            // partial font-atlas update followed by another — so this is a
+            // map of id to a list, not a single delta each.
+            for (id, deltas) in gui.textures.set.drain() {
+                for delta in deltas {
+                    self.egui
+                        .update_texture(&self.device, &self.queue, id, &delta);
+                }
+            }
+            // Freed textures are released after the pass, since the pass may
+            // still reference them; the ids are taken now so the delta can
+            // be emptied.
+            to_free = gui.textures.free.drain().collect();
+            debug_assert!(gui.textures.set.is_empty() && gui.textures.free.is_empty());
+
+            let descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: gui.pixels_per_point,
+            };
+            self.egui.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                gui.primitives,
+                &descriptor,
+            );
+            egui_prepared = Some(descriptor);
+        }
 
         let frame = match self.surface.get_current_texture() {
             Acquired::Success(f) => f,
@@ -385,12 +719,6 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame"),
-            });
-
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("chart"),
@@ -409,6 +737,18 @@ impl Renderer {
                 multiview_mask: None,
             });
 
+            // Imagery first of all: a photograph is the ground everything
+            // else is drawn on.
+            if !self.imagery_tiles.is_empty() {
+                pass.set_pipeline(&self.imagery_pipeline);
+                pass.set_bind_group(0, &self.imagery_view_bind, &[]);
+                pass.set_vertex_buffer(0, self.imagery_vertices.slice(..));
+                for tile in &self.imagery_tiles {
+                    pass.set_bind_group(1, &tile.bind_group, &[]);
+                    pass.draw(tile.first_vertex..tile.first_vertex + 6, 0..1);
+                }
+            }
+
             pass.set_pipeline(&self.pipeline);
 
             // Grid first, chart over it: the grid is scaffolding and should
@@ -421,6 +761,18 @@ impl Renderer {
                 pass.set_vertex_buffer(0, layer.vertices.slice(..));
                 pass.draw(0..layer.count, 0..1);
             }
+
+            // Interface last, over everything.
+            if let (Some(gui), Some(descriptor)) = (&gui, &egui_prepared) {
+                self.egui
+                    .render(&mut pass.forget_lifetime(), gui.primitives, descriptor);
+            }
+        }
+
+        // Release textures egui dropped this frame. Skipping this leaks GPU
+        // memory slowly, which is the worst kind of leak to find later.
+        for id in &to_free {
+            self.egui.free_texture(id);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -470,8 +822,45 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.grid.vertices, 0, bytemuck::cast_slice(&self.scratch));
         }
-    }
 
+        // The imagery layer's own uniform. Same reference-point arithmetic,
+        // its own buffer because it carries an opacity the line shader has
+        // no use for.
+        if !self.imagery_tiles.is_empty() {
+            let uniform = ImageryUniform {
+                scale,
+                origin: [
+                    (self.imagery_origin.x - centre.x) as f32,
+                    (self.imagery_origin.y - centre.y) as f32,
+                ],
+                opacity: self.imagery_opacity,
+                _pad: [0.0; 3],
+            };
+            self.queue
+                .write_buffer(&self.imagery_uniform, 0, bytemuck::bytes_of(&uniform));
+        }
+    }
+}
+
+/// Mean centre of a set of imagery tiles, used as their reference point.
+fn imagery_origin(tiles: &[chart::TileImage]) -> chart::WorldXY {
+    if tiles.is_empty() {
+        return chart::WorldXY { x: 0.0, y: 0.0 };
+    }
+    let mut sum = (0.0f64, 0.0f64);
+    for tile in tiles {
+        let n = f64::from(TileId::grid_size(tile.id.z));
+        sum.0 += (f64::from(tile.id.x) + 0.5) / n;
+        sum.1 += (f64::from(tile.id.y) + 0.5) / n;
+    }
+    let count = tiles.len() as f64;
+    chart::WorldXY {
+        x: sum.0 / count,
+        y: sum.1 / count,
+    }
+}
+
+impl Renderer {
     /// Replace the chart geometry.
     ///
     /// Call this when the set of visible tiles changes, not every frame.
@@ -483,45 +872,52 @@ impl Renderer {
     /// rather than from the current view. That is what lets a pan leave this
     /// buffer untouched: tying the origin to the view would invalidate every
     /// vertex the moment the view moved.
-    pub fn set_chart(&mut self, lines: &[&[chart::WorldXY]], points: &[chart::WorldXY]) {
+    pub fn set_chart(&mut self, lines: &[StyledLine], points: &[StyledPoint]) {
         let mut vertices: Vec<Vertex> = Vec::new();
 
         let origin = centroid(lines, points);
 
         let offset = |p: chart::WorldXY| [(p.x - origin.x) as f32, (p.y - origin.y) as f32];
 
+        // Caller order is draw order: rutter-charts sorts by depth_order so
+        // land and depth areas arrive before the marks that sit on them.
+        // Preserving it here is the whole reason this takes a slice rather
+        // than something unordered.
         for line in lines {
+            let colour = colour_for(line.style);
             // A polyline of n points is n-1 separate segments under
             // LineList. A line strip topology would halve this, but it
             // cannot express several disconnected polylines in one draw.
-            for pair in line.windows(2) {
+            for pair in line.points.windows(2) {
                 vertices.push(Vertex {
                     offset: offset(pair[0]),
-                    colour: CHART_COLOUR,
+                    colour,
                 });
                 vertices.push(Vertex {
                     offset: offset(pair[1]),
-                    colour: CHART_COLOUR,
+                    colour,
                 });
             }
         }
 
-        // Soundings as small crosses, in world units scaled so they stay a
-        // constant size on screen is not possible here — this buffer does
-        // not know the zoom. Size them in world units relative to the data's
-        // own extent instead, which keeps them visible at the zoom the chart
-        // was loaded for.
+        // Marks as small crosses. Keeping them a constant size on screen is
+        // not possible here — this buffer does not know the zoom, and that
+        // is deliberate, because it is reused across zooms without being
+        // rewritten. Size them against the data's own extent instead, then
+        // scale per style so a danger is bigger than a sounding.
         let arm = point_arm(lines, points);
-        for &p in points {
-            let c = offset(p);
-            for (dx, dy) in [(arm, 0.0), (0.0, arm)] {
+        for p in points {
+            let c = offset(p.at);
+            let colour = colour_for(p.style);
+            let a = arm * mark_scale(p.style);
+            for (dx, dy) in [(a, 0.0), (0.0, a)] {
                 vertices.push(Vertex {
                     offset: [c[0] - dx, c[1] - dy],
-                    colour: SOUNDING_COLOUR,
+                    colour,
                 });
                 vertices.push(Vertex {
                     offset: [c[0] + dx, c[1] + dy],
-                    colour: SOUNDING_COLOUR,
+                    colour,
                 });
             }
         }
@@ -551,6 +947,168 @@ impl Renderer {
     /// Drop the chart geometry.
     pub fn clear_chart(&mut self) {
         self.charts.count = 0;
+    }
+
+    /// Replace the aerial imagery.
+    ///
+    /// Call when the set of visible imagery tiles changes, not per frame:
+    /// each tile becomes a GPU texture, and re-uploading a hundred
+    /// quarter-megabyte textures every frame would be ruinous.
+    ///
+    /// Tiles already on the GPU are kept. That is the point of keying them
+    /// by [`TileId`]: panning typically changes a row or a column, and
+    /// re-uploading the twenty tiles that did not move is pure waste.
+    pub fn set_imagery(&mut self, tiles: &[chart::TileImage]) {
+        // Drop textures no longer wanted, keep the rest.
+        let wanted: Vec<TileId> = tiles.iter().map(|t| t.id).collect();
+        self.imagery_tiles.retain(|t| wanted.contains(&t.id));
+
+        let mut vertices: Vec<ImageryVertex> = Vec::with_capacity(tiles.len() * 6);
+        let origin = imagery_origin(tiles);
+        let mut placed: Vec<ImageryTile> = Vec::with_capacity(tiles.len());
+
+        for tile in tiles {
+            if !tile.is_consistent() {
+                log::warn!(
+                    "imagery {:?}: {} bytes for {}x{}, skipping",
+                    tile.id,
+                    tile.rgba.len(),
+                    tile.width,
+                    tile.height
+                );
+                continue;
+            }
+
+            let first_vertex = vertices.len() as u32;
+
+            // The tile's corners in world units, then as offsets from the
+            // layer's reference point.
+            let n = f64::from(TileId::grid_size(tile.id.z));
+            let (x0, y0) = (f64::from(tile.id.x) / n, f64::from(tile.id.y) / n);
+            let (x1, y1) = (f64::from(tile.id.x + 1) / n, f64::from(tile.id.y + 1) / n);
+
+            let corner = |x: f64, y: f64, u: f32, v: f32| ImageryVertex {
+                offset: [(x - origin.x) as f32, (y - origin.y) as f32],
+                uv: [u, v],
+            };
+
+            // Two triangles. v=0 at the tile's north edge, because image
+            // rows run top-down and so does world y — the one place those
+            // two conventions agree, and worth saying so since everywhere
+            // else they fight.
+            let (nw, ne) = (corner(x0, y0, 0.0, 0.0), corner(x1, y0, 1.0, 0.0));
+            let (sw, se) = (corner(x0, y1, 0.0, 1.0), corner(x1, y1, 1.0, 1.0));
+            vertices.extend_from_slice(&[nw, ne, se, nw, se, sw]);
+
+            // Reuse the texture if this tile is already resident.
+            if let Some(existing) = self.imagery_tiles.iter().find(|t| t.id == tile.id) {
+                placed.push(ImageryTile {
+                    id: tile.id,
+                    bind_group: existing.bind_group.clone(),
+                    first_vertex,
+                });
+                continue;
+            }
+
+            placed.push(ImageryTile {
+                id: tile.id,
+                bind_group: self.upload_tile(tile),
+                first_vertex,
+            });
+        }
+
+        self.imagery_origin = origin;
+        self.imagery_tiles = placed;
+
+        if vertices.is_empty() {
+            return;
+        }
+
+        let needed = vertices.len() as u64;
+        if needed > self.imagery_capacity {
+            let capacity = needed.next_power_of_two();
+            log::debug!("growing imagery buffer to {capacity} vertices");
+            self.imagery_vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("imagery"),
+                size: capacity * std::mem::size_of::<ImageryVertex>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.imagery_capacity = capacity;
+        }
+
+        self.queue
+            .write_buffer(&self.imagery_vertices, 0, bytemuck::cast_slice(&vertices));
+    }
+
+    /// Create a texture and binding for one decoded tile.
+    fn upload_tile(&self, tile: &chart::TileImage) -> wgpu::BindGroup {
+        let size = wgpu::Extent3d {
+            width: tile.width,
+            height: tile.height,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imagery tile"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Srgb, because the surface is sRGB and the photograph's bytes
+            // are gamma-encoded. Using the linear format here makes aerial
+            // imagery look washed out, which is a subtle enough wrongness
+            // to live with for months.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &tile.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(tile.width * 4),
+                rows_per_image: Some(tile.height),
+            },
+            size,
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("imagery tile"),
+            layout: &self.imagery_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.imagery_sampler),
+                },
+            ],
+        })
+    }
+
+    /// Drop the imagery, freeing its textures.
+    pub fn clear_imagery(&mut self) {
+        self.imagery_tiles.clear();
+    }
+
+    /// Imagery tiles currently resident on the GPU.
+    pub fn imagery_tile_count(&self) -> usize {
+        self.imagery_tiles.len()
+    }
+
+    /// How strongly imagery shows through, clamped to 0..1.
+    pub fn set_imagery_opacity(&mut self, opacity: f32) {
+        self.imagery_opacity = opacity.clamp(0.0, 1.0);
+    }
+
+    pub fn imagery_opacity(&self) -> f32 {
+        self.imagery_opacity
     }
 
     /// Vertices currently held in the chart buffer.
@@ -682,11 +1240,15 @@ impl Layer {
 /// The mean rather than the bounding-box centre: it is cheaper, it needs no
 /// special case for empty input, and the only property that matters is being
 /// *near* the data so the f32 offsets stay small.
-fn centroid(lines: &[&[chart::WorldXY]], points: &[chart::WorldXY]) -> chart::WorldXY {
+fn centroid(lines: &[StyledLine], points: &[StyledPoint]) -> chart::WorldXY {
     let mut sum = (0.0f64, 0.0f64);
     let mut n = 0u64;
 
-    for p in lines.iter().flat_map(|l| l.iter()).chain(points.iter()) {
+    for p in lines
+        .iter()
+        .flat_map(|l| l.points.iter())
+        .chain(points.iter().map(|p| &p.at))
+    {
         sum.0 += p.x;
         sum.1 += p.y;
         n += 1;
@@ -708,11 +1270,15 @@ fn centroid(lines: &[&[chart::WorldXY]], points: &[chart::WorldXY]) -> chart::Wo
 /// coastline's gets larger ones. A fixed world-unit size would be invisible
 /// at one zoom and cover the screen at another, and this buffer cannot know
 /// the zoom — it is uploaded once and reused across many.
-fn point_arm(lines: &[&[chart::WorldXY]], points: &[chart::WorldXY]) -> f32 {
+fn point_arm(lines: &[StyledLine], points: &[StyledPoint]) -> f32 {
     let mut min = (f64::MAX, f64::MAX);
     let mut max = (f64::MIN, f64::MIN);
 
-    for p in lines.iter().flat_map(|l| l.iter()).chain(points.iter()) {
+    for p in lines
+        .iter()
+        .flat_map(|l| l.points.iter())
+        .chain(points.iter().map(|p| &p.at))
+    {
         min.0 = min.0.min(p.x);
         min.1 = min.1.min(p.y);
         max.0 = max.0.max(p.x);
@@ -742,6 +1308,21 @@ mod tests {
         WorldXY { x, y }
     }
 
+    fn line(points: Vec<WorldXY>) -> StyledLine {
+        StyledLine {
+            style: ChartStyle::Coastline,
+            points,
+        }
+    }
+
+    fn point(at: WorldXY) -> StyledPoint {
+        StyledPoint {
+            style: ChartStyle::Sounding,
+            at,
+            value: None,
+        }
+    }
+
     #[test]
     fn centroid_of_nothing_is_the_origin() {
         let c = centroid(&[], &[]);
@@ -750,8 +1331,8 @@ mod tests {
 
     #[test]
     fn centroid_averages_every_vertex() {
-        let line = [w(0.0, 0.0), w(1.0, 1.0)];
-        let c = centroid(&[&line], &[w(2.0, 2.0)]);
+        let l = line(vec![w(0.0, 0.0), w(1.0, 1.0)]);
+        let c = centroid(&[l], &[point(w(2.0, 2.0))]);
         assert!((c.x - 1.0).abs() < 1e-12, "x was {}", c.x);
         assert!((c.y - 1.0).abs() < 1e-12, "y was {}", c.y);
     }
@@ -759,8 +1340,8 @@ mod tests {
     #[test]
     fn centroid_counts_lines_and_points_alike() {
         // Two points on one side, one on the other: the mean must lean.
-        let line = [w(0.0, 0.0), w(0.0, 0.0)];
-        let c = centroid(&[&line], &[w(0.3, 0.0)]);
+        let l = line(vec![w(0.0, 0.0), w(0.0, 0.0)]);
+        let c = centroid(&[l], &[point(w(0.3, 0.0))]);
         assert!((c.x - 0.1).abs() < 1e-12, "x was {}", c.x);
     }
 
@@ -769,10 +1350,10 @@ mod tests {
         // The whole point of a reference point: offsets from it must be
         // small even when the data sits in a corner of the world where f32
         // has no precision left.
-        let line = [w(0.999_999_0, 0.999_999_0), w(0.999_999_5, 0.999_999_5)];
-        let c = centroid(&[&line], &[]);
+        let pts = vec![w(0.999_999_0, 0.999_999_0), w(0.999_999_5, 0.999_999_5)];
+        let c = centroid(&[line(pts.clone())], &[]);
 
-        for p in line {
+        for p in pts {
             let offset = ((p.x - c.x) as f32, (p.y - c.y) as f32);
             assert!(offset.0.abs() < 1e-5, "offset {offset:?} is not small");
             // And the offset must survive f32 without collapsing to zero,
@@ -783,10 +1364,10 @@ mod tests {
 
     #[test]
     fn point_arm_scales_with_the_data_extent() {
-        let small = [w(0.5, 0.5), w(0.501, 0.501)];
-        let large = [w(0.0, 0.0), w(1.0, 1.0)];
+        let small = line(vec![w(0.5, 0.5), w(0.501, 0.501)]);
+        let large = line(vec![w(0.0, 0.0), w(1.0, 1.0)]);
         assert!(
-            point_arm(&[&small], &[]) < point_arm(&[&large], &[]),
+            point_arm(&[small], &[]) < point_arm(&[large], &[]),
             "a tighter chart should get smaller marks"
         );
     }
@@ -794,16 +1375,101 @@ mod tests {
     #[test]
     fn point_arm_is_positive_for_degenerate_input() {
         // A single point has no extent; the mark must still be drawable.
-        assert!(point_arm(&[], &[w(0.5, 0.5)]) > 0.0);
+        assert!(point_arm(&[], &[point(w(0.5, 0.5))]) > 0.0);
         assert!(point_arm(&[], &[]) > 0.0);
         // A vertical line has zero width but real height.
-        let vertical = [w(0.5, 0.4), w(0.5, 0.6)];
-        assert!(point_arm(&[&vertical], &[]) > 0.0);
+        let vertical = line(vec![w(0.5, 0.4), w(0.5, 0.6)]);
+        assert!(point_arm(&[vertical], &[]) > 0.0);
     }
 
     #[test]
     fn point_arm_is_finite() {
-        let line = [w(0.0, 0.0), w(1.0, 1.0)];
-        assert!(point_arm(&[&line], &[w(0.5, 0.5)]).is_finite());
+        let l = line(vec![w(0.0, 0.0), w(1.0, 1.0)]);
+        assert!(point_arm(&[l], &[point(w(0.5, 0.5))]).is_finite());
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    /// Every style must be visually distinguishable from every other.
+    ///
+    /// Not aesthetics — a chart where a danger and a depth contour are the
+    /// same colour is a chart that can get you wrecked. This is the cheapest
+    /// possible guard against a copy-paste in the palette.
+    #[test]
+    fn no_two_styles_share_a_colour() {
+        let styles = [
+            ChartStyle::Coastline,
+            ChartStyle::Land,
+            ChartStyle::DepthArea,
+            ChartStyle::DepthContour,
+            ChartStyle::Sounding,
+            ChartStyle::Buoy,
+            ChartStyle::Beacon,
+            ChartStyle::Light,
+            ChartStyle::Danger,
+            ChartStyle::Area,
+            ChartStyle::Other,
+        ];
+
+        for (i, a) in styles.iter().enumerate() {
+            for b in &styles[i + 1..] {
+                assert_ne!(
+                    colour_for(*a),
+                    colour_for(*b),
+                    "{a:?} and {b:?} are the same colour"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_colour_is_opaque_and_in_range() {
+        for style in [
+            ChartStyle::Coastline,
+            ChartStyle::Land,
+            ChartStyle::DepthArea,
+            ChartStyle::DepthContour,
+            ChartStyle::Sounding,
+            ChartStyle::Buoy,
+            ChartStyle::Beacon,
+            ChartStyle::Light,
+            ChartStyle::Danger,
+            ChartStyle::Area,
+            ChartStyle::Other,
+        ] {
+            let c = colour_for(style);
+            for channel in c {
+                assert!(
+                    (0.0..=1.0).contains(&channel),
+                    "{style:?} has an out-of-range channel in {c:?}"
+                );
+            }
+            assert_eq!(c[3], 1.0, "{style:?} should be opaque");
+        }
+    }
+
+    #[test]
+    fn dangers_are_drawn_larger_than_soundings() {
+        // A chart has hundreds of soundings and a handful of dangers; the
+        // dangers are the ones that must catch the eye.
+        assert!(mark_scale(ChartStyle::Danger) > mark_scale(ChartStyle::Sounding));
+        assert!(mark_scale(ChartStyle::Buoy) > mark_scale(ChartStyle::Sounding));
+    }
+
+    #[test]
+    fn every_mark_scale_is_positive() {
+        for style in [
+            ChartStyle::Sounding,
+            ChartStyle::Buoy,
+            ChartStyle::Beacon,
+            ChartStyle::Light,
+            ChartStyle::Danger,
+            ChartStyle::Other,
+        ] {
+            assert!(mark_scale(style) > 0.0, "{style:?} would be invisible");
+        }
     }
 }

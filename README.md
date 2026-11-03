@@ -52,7 +52,7 @@ know what it is running on, the split has failed.
 **`core` is the part that matters.** Projection, tile selection, harmonic tide
 prediction, wind field interpolation, distances and bearings — all of it is
 arithmetic over data, with no GPU, no window, no filesystem and no clock. It
-is portable by construction. It and `charts` are where the tests are — 113 of
+is portable by construction. It and `charts` are where the tests are — 119 of
 them, running in under a tenth of a second, which means they get run.
 
 One of them earned its keep immediately. `tide::extremes` classified a
@@ -66,7 +66,8 @@ Vector Tiles, and this crate goes all the way down: SQL, gunzip, protobuf,
 geometry. The protobuf decoder is written by hand rather than generated — the
 MVT schema is eight messages, frozen since 2016, and the decoder is shorter
 than the generated code would be while keeping the module dependency-free and
-unit-testable.
+unit-testable. It also classifies S-57 object classes into the handful of
+styles the renderer draws differently.
 
 **`render` is wgpu**, and wgpu is the reason the whole thing is Rust. One
 renderer over Vulkan (Android, Linux), Metal (iOS, macOS), D3D12 (Windows) and
@@ -92,6 +93,52 @@ outlives it. That is why `View` lives in `core`.
 | Windows | reachable from here via `pkgsCross.mingw32`; not wired up. |
 | macOS | this same `default.nix` should work on a mac; untested. |
 | iOS | **not buildable from NixOS, at all.** Apple requires Xcode on macOS to compile and sign. `core` and `render` will cross-compile to `aarch64-apple-ios` from a mac; the shell around them has to be built there. The code is ready; the build is not. |
+
+## Chart sources
+
+**Any chart you have.** `rutter charts <source> <out.mbtiles>` takes anything
+GDAL reads — an ENC `.000` cell, a Shapefile, a GeoPackage, GeoJSON — and
+produces tiles the app loads. That is the front door, and it is the reason the
+app itself only reads MBTiles: one conversion step, then a format that opens
+instantly on a phone.
+
+**NOAA by default.** `rutter noaa` fetches official ENCs for US waters, free
+and without registration. Southern California, San Diego out to Catalina:
+
+```sh
+export RUTTER_NOAA_CATALOG=12Region_ENCProdCat_19115.xml   # smaller than national
+rutter noaa --box 32.5,-118.7,33.6,-117.0
+rutter run --charts build/charts/noaa.mbtiles
+```
+
+or by position, or by name:
+
+```sh
+rutter noaa --near 32.71,-117.17   # cells covering a position
+rutter noaa US5CA72M               # San Diego Bay, 1:12,000
+rutter noaa --list                 # everything in the catalogue
+```
+
+It downloads the cells, merges their layers into one source, and runs them
+through the same pipeline as any other chart. Outside US waters most
+hydrographic offices charge for ENCs; the free routes are OpenSeaMap, GSHHG
+coastlines and GEBCO or EMODnet bathymetry, all of which `rutter charts`
+converts.
+
+**Not yet run against a real NOAA cell.** Downloads are blocked from the
+environment this was developed in, so the fetch itself has never executed.
+What *is* verified: the catalogue parser, against
+`scripts/testdata/catalog-sample.xml` — a cut-down catalogue in NOAA's real
+shape, carrying the actual San Diego and Catalina cells. The parser picks the
+right cells for a position, the right set for the San Diego–Catalina box, and
+correctly excludes a Boston cell.
+
+That last check matters more than it sounds. NOAA records coverage as a
+`gml:Polygon` of `gml:pos` values in **latitude-longitude** order, not as the
+`EX_GeographicBoundingBox` the schema's name suggests and not in the
+lon/lat order most geo tooling uses. The first version of this parser looked
+for the wrong element and would have silently found zero cells; reading the
+order backwards would have found cells in the Indian Ocean.
 
 ## Getting started
 
@@ -236,10 +283,6 @@ Stated plainly, because the whole point of
   without one is how you get a chart that fights you.
 - **No filled polygons.** Depth areas are outlines, not shaded bands. Needs a
   triangulator.
-- **No chart styling.** Every line is the same colour and width. A real chart
-  distinguishes a coastline from a 10-metre contour from a cable area, and
-  that means reading the S-57 layer and attributes — which `charts` already
-  decodes and hands over, so this is presentation work rather than plumbing.
 - **No labels.** No depth figures, no place names. Text rendering is its own
   project.
 - **No real charts vendored.** They are large, often licensed, and never ours
@@ -303,6 +346,17 @@ Stated plainly, because the whole point of
   (`-Wl,-z,max-page-size=16384`) controls the ELF's own segments; `zipalign -P
   16` controls the offsets inside the APK's zip. Neither implies the other,
   and `rutter apk` reads both back rather than trusting them.
+- **One tile layer per S-57 object class, not one flattened layer.** The
+  pipeline used to pass `-l chart` to tippecanoe, which collapsed all ~100
+  object classes in an ENC cell into one undifferentiated layer — throwing
+  away the only thing a renderer can style on. A coastline and a cable area
+  came out identical. The fixture is multi-layer now specifically so this
+  cannot regress unnoticed.
+- **Nix indented strings strip the *common* leading whitespace.** One line at
+  column 0 inside `''…''` stops every other line being dedented. That broke
+  the `rutter help` heredoc, whose terminator then sat indented and never
+  matched — and the whole driver script stopped parsing. Help is `printf` now,
+  and the layer report is SQL rather than a multi-line Python block.
 - **MBTiles rows count from the south.** MBTiles inherited TMS numbering,
   where row 0 is the bottom of the world; slippy-map tile y counts from the
   top. The conversion is `row = 2^zoom - 1 - y`, and getting it wrong gives a

@@ -38,6 +38,15 @@ pub struct MbTiles {
     meta: Metadata,
 }
 
+/// One vector layer the file declares.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LayerInfo {
+    /// The layer's name — an S-57 object class for ENC-derived charts.
+    pub name: String,
+    /// Attribute names the layer's features carry.
+    pub fields: Vec<String>,
+}
+
 /// What the file says about itself.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Metadata {
@@ -48,15 +57,38 @@ pub struct Metadata {
     pub max_zoom: u8,
     /// West, south, east, north in degrees, if declared.
     pub bounds: Option<[f64; 4]>,
+    /// Every vector layer in the file, in the order declared.
+    ///
+    /// This is what makes a layer picker possible: a real ENC-derived chart
+    /// has sixty or more object classes and no caller can know which in
+    /// advance. Read from the `json` metadata row, which tippecanoe and
+    /// every other writer populates.
+    pub layers: Vec<LayerInfo>,
+    /// Credit line the file asks to be shown, if any.
+    ///
+    /// Imagery usually carries one. `rutter imagery` writes the USGS/USDA
+    /// credit here even though the data is public domain, because the
+    /// courtesy is owed regardless of what the licence compels.
+    pub attribution: Option<String>,
 }
 
 impl Metadata {
-    /// Whether this file holds vector tiles, which is all the renderer
-    /// currently draws.
+    /// Whether this file holds vector tiles.
     pub fn is_vector(&self) -> bool {
         self.format.eq_ignore_ascii_case("pbf")
             || self.format.eq_ignore_ascii_case("mvt")
             || self.format.eq_ignore_ascii_case("pbf.gz")
+    }
+
+    /// Whether this file holds raster imagery.
+    ///
+    /// Not simply `!is_vector()`: an empty or unrecognised format should be
+    /// neither, so a mystery file is rejected by both readers rather than
+    /// accepted by one of them.
+    pub fn is_raster(&self) -> bool {
+        ["jpg", "jpeg", "png", "webp"]
+            .iter()
+            .any(|f| self.format.eq_ignore_ascii_case(f))
     }
 }
 
@@ -72,9 +104,12 @@ pub enum Error {
     Decompress(std::io::Error),
     /// A tile blob decompressed but would not decode.
     Mvt(mvt::Error),
-    /// Raster tiles, which this reader understands the container of but
-    /// cannot yet draw.
+    /// Raster tiles where vector ones were expected.
     NotVector(String),
+    /// Vector tiles where raster ones were expected.
+    NotRaster(String),
+    /// A raster tile would not decode.
+    Image(image::ImageError),
 }
 
 impl std::fmt::Display for Error {
@@ -88,8 +123,13 @@ impl std::fmt::Display for Error {
             Self::Mvt(e) => write!(f, "tile will not decode: {e}"),
             Self::NotVector(format) => write!(
                 f,
-                "tile format '{format}' is raster; only vector tiles can be drawn yet"
+                "tile format '{format}' is raster, but a vector chart was expected"
             ),
+            Self::NotRaster(format) => write!(
+                f,
+                "tile format '{format}' is vector, but raster imagery was expected"
+            ),
+            Self::Image(e) => write!(f, "tile image will not decode: {e}"),
         }
     }
 }
@@ -161,6 +201,8 @@ impl MbTiles {
                 "minzoom" => min_zoom = value.parse().ok(),
                 "maxzoom" => max_zoom = value.parse().ok(),
                 "bounds" => meta.bounds = parse_bounds(&value),
+                "json" => meta.layers = parse_layers(&value),
+                "attribution" => meta.attribution = Some(value),
                 _ => {}
             }
         }
@@ -298,6 +340,81 @@ fn maybe_gunzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut out = Vec::with_capacity(data.len() * 4);
     flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
     Ok(out)
+}
+
+/// Parse layer names out of the `json` metadata row.
+///
+/// The row holds a `vector_layers` array of `{id, fields}` objects. Parsed by
+/// hand rather than with serde: it is one shape, read once per file, and
+/// adding a derive-heavy dependency to a crate that cross-compiles to four
+/// Android ABIs for this is a poor trade.
+///
+/// A malformed or absent row yields no layers, which degrades to "show
+/// everything" rather than to an error — a chart that draws without a layer
+/// list is far better than one that refuses to open.
+fn parse_layers(value: &str) -> Vec<LayerInfo> {
+    let Some(start) = value.find("\"vector_layers\"") else {
+        return Vec::new();
+    };
+    let tail = &value[start..];
+
+    let mut out = Vec::new();
+    let mut rest = tail;
+
+    // Each layer is an object with an "id". Walk them in order.
+    while let Some(at) = rest.find("\"id\"") {
+        rest = &rest[at + 4..];
+        let Some(name) = next_json_string(rest) else {
+            break;
+        };
+
+        // Fields for this layer, if the object declares them before the next
+        // layer's id begins.
+        let next_id = rest.find("\"id\"").unwrap_or(rest.len());
+        let scope = &rest[..next_id];
+        let fields = match scope.find("\"fields\"") {
+            Some(f) => json_object_keys(&scope[f + 8..]),
+            None => Vec::new(),
+        };
+
+        out.push(LayerInfo { name, fields });
+    }
+    out
+}
+
+/// The first JSON string value after a colon in `s`.
+fn next_json_string(s: &str) -> Option<String> {
+    let colon = s.find(':')?;
+    let rest = &s[colon + 1..];
+    let open = rest.find('"')?;
+    let after = &rest[open + 1..];
+    let close = after.find('"')?;
+    Some(after[..close].to_owned())
+}
+
+/// Keys of the first JSON object in `s`.
+fn json_object_keys(s: &str) -> Vec<String> {
+    let Some(open) = s.find('{') else {
+        return Vec::new();
+    };
+    let body = &s[open + 1..];
+    let end = body.find('}').unwrap_or(body.len());
+    let body = &body[..end];
+
+    let mut keys = Vec::new();
+    let mut rest = body;
+    while let Some(q) = rest.find('"') {
+        let after = &rest[q + 1..];
+        let Some(close) = after.find('"') else { break };
+        keys.push(after[..close].to_owned());
+        // Skip past this key's value to the next key.
+        let remainder = &after[close + 1..];
+        match remainder.find(',') {
+            Some(c) => rest = &remainder[c + 1..],
+            None => break,
+        }
+    }
+    keys
 }
 
 /// Parse the `bounds` metadata: `west,south,east,north`.

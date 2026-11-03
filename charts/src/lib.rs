@@ -32,13 +32,67 @@
 // in tests/ are a separate crate and carry their own copy of this.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod imagery;
 pub mod mbtiles;
 pub mod mvt;
 
+pub use imagery::ImagerySource;
 pub use mbtiles::{MbTiles, Metadata};
 
-use rutter_core::chart::{self, TileId, WorldXY};
+use rutter_core::chart::{self, ChartStyle, StyledLine, StyledPoint, TileId, WorldXY};
 use rutter_core::View;
+
+/// Classify an S-57 object class — or any other layer name — into a style.
+///
+/// S-57 defines over 170 object classes with six-letter acronyms. These are
+/// the ones that carry most of a chart's meaning; everything else falls
+/// through to [`ChartStyle::Other`] and still draws, just undistinguished.
+///
+/// Matching is case-insensitive because tooling disagrees: GDAL's S-57
+/// driver gives upper case, hand-made GeoJSON often does not.
+pub fn style_for_layer(name: &str) -> ChartStyle {
+    // Upper-cased into a small buffer rather than allocating: this is called
+    // once per layer per tile, which at a few hundred tiles is often enough
+    // to matter and never enough to be interesting.
+    let mut buf = [0u8; 16];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(buf.len());
+    for i in 0..n {
+        buf[i] = bytes[i].to_ascii_uppercase();
+    }
+    let upper = &buf[..n];
+
+    match upper {
+        b"COALNE" | b"SLCONS" => ChartStyle::Coastline,
+        b"LNDARE" | b"LNDRGN" | b"LNDELV" => ChartStyle::Land,
+        b"DEPARE" | b"DRGARE" | b"UNSARE" => ChartStyle::DepthArea,
+        b"DEPCNT" => ChartStyle::DepthContour,
+        b"SOUNDG" => ChartStyle::Sounding,
+        b"LIGHTS" => ChartStyle::Light,
+        b"WRECKS" | b"OBSTRN" | b"UWTROC" | b"ROCKS" => ChartStyle::Danger,
+        b"ACHARE" | b"RESARE" | b"TSSLPT" | b"CBLARE" | b"PIPARE" | b"MIPARE" => ChartStyle::Area,
+        // Buoys and beacons each come in half a dozen categories — lateral,
+        // cardinal, isolated danger, safe water, special purpose — all of
+        // which are the same symbol family to a renderer this coarse.
+        _ if upper.starts_with(b"BOY") => ChartStyle::Buoy,
+        _ if upper.starts_with(b"BCN") => ChartStyle::Beacon,
+        _ => ChartStyle::Other,
+    }
+}
+
+/// The attribute a point feature's label should come from, by style.
+///
+/// Soundings carry DEPTH (GDAL's S-57 driver synthesises it from the vertex
+/// Z when ADD_SOUNDG_DEPTH is on); wrecks and obstructions carry VALSOU, the
+/// sounded depth over them.
+fn value_attribute(style: ChartStyle) -> &'static [&'static str] {
+    match style {
+        ChartStyle::Sounding => &["DEPTH", "depth"],
+        ChartStyle::Danger => &["VALSOU", "valsou", "DEPTH", "depth"],
+        ChartStyle::Light => &["HEIGHT", "height"],
+        _ => &[],
+    }
+}
 
 /// One tile's geometry, converted to world coordinates and flattened into
 /// the two things the renderer can draw.
@@ -51,9 +105,12 @@ use rutter_core::View;
 pub struct ChartTile {
     pub id: TileId,
     /// Polylines: linestrings as they came, plus one entry per polygon ring.
-    pub lines: Vec<Vec<WorldXY>>,
-    /// Point features — soundings, buoys, beacons.
-    pub points: Vec<WorldXY>,
+    /// Each carries the style of the layer it came from, which is the only
+    /// reason the multi-layer pipeline exists.
+    pub lines: Vec<StyledLine>,
+    /// Point features — soundings, buoys, beacons — with their depth or
+    /// height where the chart recorded one.
+    pub points: Vec<StyledPoint>,
 }
 
 impl ChartTile {
@@ -74,6 +131,9 @@ impl ChartTile {
                 continue;
             }
 
+            let style = style_for_layer(&layer.name);
+            let value_keys = value_attribute(style);
+
             // Tile-local integers to world units. The tile's own corner,
             // plus the local coordinate as a fraction of the tile's extent,
             // all divided by the number of tiles across the world.
@@ -85,14 +145,29 @@ impl ChartTile {
             };
 
             for feature in &layer.features {
+                // A sounding's depth, a wreck's clearance, a light's height
+                // — whichever this style labels itself with.
+                let value = value_keys
+                    .iter()
+                    .find_map(|k| feature.attribute(k))
+                    .and_then(mvt::Value::as_f64);
+
                 match &feature.geometry {
                     mvt::Geometry::Points(points) => {
-                        out.points.extend(points.iter().copied().map(to_world));
+                        out.points
+                            .extend(points.iter().copied().map(|p| StyledPoint {
+                                style,
+                                at: to_world(p),
+                                value,
+                            }));
                     }
                     mvt::Geometry::Lines(lines) => {
                         for line in lines {
                             if line.len() >= 2 {
-                                out.lines.push(line.iter().copied().map(to_world).collect());
+                                out.lines.push(StyledLine {
+                                    style,
+                                    points: line.iter().copied().map(to_world).collect(),
+                                });
                             }
                         }
                     }
@@ -100,7 +175,10 @@ impl ChartTile {
                         for polygon in polygons {
                             for ring in polygon.rings() {
                                 if ring.len() >= 2 {
-                                    out.lines.push(ring.iter().copied().map(to_world).collect());
+                                    out.lines.push(StyledLine {
+                                        style,
+                                        points: ring.iter().copied().map(to_world).collect(),
+                                    });
                                 }
                             }
                         }
@@ -109,6 +187,12 @@ impl ChartTile {
                 }
             }
         }
+
+        // Draw order: land and depth areas under the marks that sit on them.
+        // A stable sort, so features within one style keep the order the
+        // chart gave them.
+        out.lines.sort_by_key(|l| l.style.depth_order());
+        out.points.sort_by_key(|p| p.style.depth_order());
 
         out
     }
@@ -120,7 +204,13 @@ impl ChartTile {
 
     /// Total vertices across every polyline, for sizing a GPU buffer.
     pub fn line_vertex_count(&self) -> usize {
-        self.lines.iter().map(Vec::len).sum()
+        self.lines.iter().map(|l| l.points.len()).sum()
+    }
+
+    /// Which styles appear in this tile, in draw order. Useful for reporting
+    /// what a chart actually contains, which is otherwise guesswork.
+    pub fn styles(&self) -> Vec<ChartStyle> {
+        collect_styles(&self.lines, &self.points)
     }
 }
 
@@ -177,6 +267,58 @@ impl ChartSource {
 
     pub fn clamp_zoom(&self, zoom: u8) -> u8 {
         self.file.clamp_zoom(zoom)
+    }
+
+    /// Layer names currently drawn, or empty for "all of them".
+    pub fn selected_layers(&self) -> &[String] {
+        &self.layers
+    }
+
+    /// Replace the layer filter.
+    ///
+    /// Clears the decoded-tile cache, because every cached tile was decoded
+    /// under the old filter and would otherwise keep showing layers the
+    /// caller just switched off. That is the entire subtlety here, and
+    /// forgetting it gives a layer picker that appears to do nothing until
+    /// you pan.
+    ///
+    /// Returns true if the selection actually changed, so a caller can skip
+    /// the reupload when a redundant toggle arrives.
+    pub fn set_layers(&mut self, layers: &[String]) -> bool {
+        if self.layers == layers {
+            return false;
+        }
+        self.layers = layers.to_vec();
+        self.clear_cache();
+        true
+    }
+
+    /// Turn one layer on or off, leaving the rest as they are.
+    ///
+    /// An empty selection means "all layers", so switching one off from that
+    /// state has to first expand the implicit set into an explicit one —
+    /// otherwise hiding a single layer would hide everything else with it.
+    pub fn toggle_layer(&mut self, name: &str, visible: bool) -> bool {
+        let mut selection = if self.layers.is_empty() {
+            self.file
+                .metadata()
+                .layers
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>()
+        } else {
+            self.layers.clone()
+        };
+
+        if visible {
+            if !selection.iter().any(|l| l == name) {
+                selection.push(name.to_owned());
+            }
+        } else {
+            selection.retain(|l| l != name);
+        }
+
+        self.set_layers(&selection)
     }
 
     /// Get a tile, decoding and caching it if needed.
@@ -257,18 +399,31 @@ impl ChartSource {
             return out;
         }
 
-        for id in &out.tiles {
-            match self.file.tile(*id) {
-                Ok(Some(tile)) => {
-                    let names: Vec<&str> = self.layers.iter().map(String::as_str).collect();
-                    let decoded = ChartTile::from_mvt(*id, &tile, &names);
-                    out.lines.extend(decoded.lines);
-                    out.points.extend(decoded.points);
+        // Through `self.tile`, so the decoded-tile cache is actually used.
+        //
+        // This went through `self.file.tile` directly at first, which
+        // bypassed the cache completely — so every change of tile set
+        // re-queried SQLite, re-gunzipped and re-decoded protobuf for
+        // geometry that was already decoded, and the cache that exists for
+        // exactly this was dead weight. A test asserting the cache is
+        // non-empty after a collect caught it.
+        let ids = out.tiles.clone();
+        for id in ids {
+            match self.tile(id) {
+                Ok(tile) => {
+                    out.lines.extend(tile.lines.iter().cloned());
+                    out.points.extend(tile.points.iter().copied());
                 }
-                Ok(None) => {}
-                Err(e) => out.failed.push((*id, e.to_string())),
+                Err(e) => out.failed.push((id, e.to_string())),
             }
         }
+
+        // Re-sort across tiles. Each tile was ordered on its own, but
+        // concatenating them interleaves the styles again — and the next
+        // tile's depth area drawn over this tile's soundings is exactly the
+        // kind of wrongness that reads as a renderer bug.
+        out.lines.sort_by_key(|l| l.style.depth_order());
+        out.points.sort_by_key(|p| p.style.depth_order());
 
         out
     }
@@ -281,8 +436,8 @@ pub struct Collected {
     /// against the previous call to decide whether a reupload is needed —
     /// most of a drag stays within the same tiles.
     pub tiles: Vec<TileId>,
-    pub lines: Vec<Vec<WorldXY>>,
-    pub points: Vec<WorldXY>,
+    pub lines: Vec<StyledLine>,
+    pub points: Vec<StyledPoint>,
     /// Tiles that would not decode, with the reason. Empty in the normal
     /// case; non-empty means the file is damaged, not that the view is wrong.
     pub failed: Vec<(TileId, String)>,
@@ -296,10 +451,26 @@ impl Collected {
         self.lines.is_empty() && self.points.is_empty()
     }
 
-    /// The polylines as slices, which is the shape a renderer wants.
-    pub fn line_slices(&self) -> Vec<&[WorldXY]> {
-        self.lines.iter().map(Vec::as_slice).collect()
+    /// Which feature types this viewport actually contains, in draw order.
+    pub fn styles(&self) -> Vec<ChartStyle> {
+        collect_styles(&self.lines, &self.points)
     }
+}
+
+/// Distinct styles present in some geometry, in draw order.
+fn collect_styles(lines: &[StyledLine], points: &[StyledPoint]) -> Vec<ChartStyle> {
+    let mut seen: Vec<ChartStyle> = Vec::new();
+    for style in lines
+        .iter()
+        .map(|l| l.style)
+        .chain(points.iter().map(|p| p.style))
+    {
+        if !seen.contains(&style) {
+            seen.push(style);
+        }
+    }
+    seen.sort_by_key(|s| s.depth_order());
+    seen
 }
 
 #[cfg(test)]
@@ -332,8 +503,8 @@ mod tests {
         let chart = ChartTile::from_mvt(id, &point_tile([0, 0], 4096), &[]);
 
         assert_eq!(chart.points.len(), 1);
-        approx(chart.points[0].x, 1.0 / 4.0, 1e-12);
-        approx(chart.points[0].y, 3.0 / 4.0, 1e-12);
+        approx(chart.points[0].at.x, 1.0 / 4.0, 1e-12);
+        approx(chart.points[0].at.y, 3.0 / 4.0, 1e-12);
     }
 
     #[test]
@@ -343,8 +514,8 @@ mod tests {
         let id = TileId { z: 2, x: 1, y: 3 };
         let chart = ChartTile::from_mvt(id, &point_tile([4096, 4096], 4096), &[]);
 
-        approx(chart.points[0].x, 2.0 / 4.0, 1e-12);
-        approx(chart.points[0].y, 4.0 / 4.0, 1e-12);
+        approx(chart.points[0].at.x, 2.0 / 4.0, 1e-12);
+        approx(chart.points[0].at.y, 4.0 / 4.0, 1e-12);
     }
 
     #[test]
@@ -354,8 +525,8 @@ mod tests {
         for extent in [256u32, 512, 4096, 16384] {
             let half = (extent / 2) as i32;
             let chart = ChartTile::from_mvt(id, &point_tile([half, half], extent), &[]);
-            approx(chart.points[0].x, 0.25, 1e-12);
-            approx(chart.points[0].y, 0.25, 1e-12);
+            approx(chart.points[0].at.x, 0.25, 1e-12);
+            approx(chart.points[0].at.y, 0.25, 1e-12);
         }
     }
 
@@ -363,8 +534,8 @@ mod tests {
     fn zoom_zero_spans_the_whole_world() {
         let id = TileId { z: 0, x: 0, y: 0 };
         let chart = ChartTile::from_mvt(id, &point_tile([4096, 4096], 4096), &[]);
-        approx(chart.points[0].x, 1.0, 1e-12);
-        approx(chart.points[0].y, 1.0, 1e-12);
+        approx(chart.points[0].at.x, 1.0, 1e-12);
+        approx(chart.points[0].at.y, 1.0, 1e-12);
     }
 
     #[test]
@@ -470,7 +641,7 @@ mod tests {
         // built Tile and must not trust it.
         let id = TileId { z: 0, x: 0, y: 0 };
         let chart = ChartTile::from_mvt(id, &point_tile([1, 1], 0), &[]);
-        assert!(chart.points[0].x.is_finite());
-        assert!(chart.points[0].y.is_finite());
+        assert!(chart.points[0].at.x.is_finite());
+        assert!(chart.points[0].at.y.is_finite());
     }
 }

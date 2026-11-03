@@ -12,5 +12,10 @@ wgpu.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 
+# The interface. egui draws into the same render pass as the chart, so the
+# panel is composited on the GPU rather than being a separate surface.
+egui.workspace = true
+egui-wgpu.workspace = true
+
 [lints]
 workspace = true

@@ -20,6 +20,16 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 # zlib C shim, so there is one less C library to cross-compile.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
+# Raster tiles — aerial imagery — arrive as JPEG or PNG. Only those two
+# decoders, and no default features: the rest of the crate's formats are
+# dead weight in an APK, and the defaults pull in a rayon thread pool this
+# has no use for.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# A damaged imagery tile is logged and skipped rather than fatal, so this
+# needs somewhere to say so.
+log.workspace = true
+
 [dev-dependencies]
 # Integration tests in tests/ see only the public API and dev-dependencies,
 # not this crate's own dependencies — and one test builds a SQLite file that

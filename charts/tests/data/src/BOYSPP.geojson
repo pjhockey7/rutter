@@ -1,0 +1,4 @@
+{"type":"FeatureCollection","features":[
+{"type":"Feature","properties":{"OBJNAM":"Fairway","COLOUR":"3"},"geometry":{"type":"Point","coordinates":[-5.045,50.091]}},
+{"type":"Feature","properties":{"OBJNAM":"East Cardinal","COLOUR":"6"},"geometry":{"type":"Point","coordinates":[-5.015,50.080]}}
+]}

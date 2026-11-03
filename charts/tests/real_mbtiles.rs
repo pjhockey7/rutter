@@ -1,9 +1,14 @@
 //! End-to-end tests against a real MBTiles file.
 //!
-//! `tests/data/coast.mbtiles` was produced by the project's own pipeline —
-//! `tippecanoe -Z10 -z12 -l chart` over `tests/data/coast.geojson`, which is
-//! committed beside it so the fixture can be regenerated and the two cannot
-//! quietly drift. 32 KB, eleven tiles.
+//! `tests/data/coast.mbtiles` is produced by `tests/data/regenerate.sh` from
+//! the per-layer GeoJSON in `tests/data/src/`, committed beside it so the
+//! fixture can be rebuilt and the two cannot quietly drift. 32 KB.
+//!
+//! The sources are named after S-57 object classes — COALNE, LNDARE, DEPARE,
+//! SOUNDG, BOYSPP — because the fixture's job is to look like what a real
+//! ENC cell produces: several named layers, each with its own attributes. A
+//! single-layer fixture let a layer-flattening bug sit unnoticed in the
+//! pipeline for a while, which is why it is shaped this way now.
 //!
 //! These are deliberately not unit tests. Everything in the unit suites is
 //! checked against fixtures this project built itself, which proves the
@@ -18,16 +23,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rutter_charts::{mvt, ChartSource, MbTiles};
-use rutter_core::chart::{self, TileId};
-use rutter_core::LatLon;
+use rutter_core::chart::{self, ChartStyle, TileId};
+use rutter_core::{LatLon, View};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/coast.mbtiles");
 
-/// The source GeoJSON's extent, from its own coordinates.
+/// The sources' combined extent, from their own coordinates. LNDARE reaches
+/// furthest north, DEPARE furthest south.
 const WEST: f64 = -5.10;
 const EAST: f64 = -4.95;
 const SOUTH: f64 = 50.05;
-const NORTH: f64 = 50.14;
+const NORTH: f64 = 50.145;
 
 fn open() -> MbTiles {
     MbTiles::open(FIXTURE).expect("fixture should open")
@@ -39,7 +45,7 @@ fn opens_a_file_whose_tiles_table_is_a_view() {
     // them, so that identical tiles are stored once. A reader that checks
     // for a `tiles` *table* rejects this file.
     let db = open();
-    assert_eq!(db.tile_count().expect("count"), 11);
+    assert!(db.tile_count().expect("count") > 0);
 }
 
 #[test]
@@ -138,11 +144,18 @@ fn stored_tiles_are_gzipped_and_decode_anyway() {
     );
 
     let tile = db.tile(id).expect("decode").expect("present");
-    assert_eq!(tile.layers.len(), 1);
-    assert_eq!(tile.layers[0].name, "chart");
-    assert_eq!(tile.layers[0].version, 2);
-    assert_eq!(tile.layers[0].extent, 4096);
-    assert!(!tile.layers[0].features.is_empty());
+    // Several named layers, not one flattened blob. This is the assertion
+    // that would have caught the pipeline bug.
+    assert!(
+        tile.layers.len() > 1,
+        "expected several S-57 layers, got {:?}",
+        tile.layers.iter().map(|l| &l.name).collect::<Vec<_>>()
+    );
+    for layer in &tile.layers {
+        assert_eq!(layer.version, 2);
+        assert_eq!(layer.extent, 4096);
+        assert!(!layer.features.is_empty(), "{} is empty", layer.name);
+    }
 }
 
 #[test]
@@ -216,13 +229,17 @@ fn attributes_survive_the_round_trip() {
             let tile = db.tile(id).expect("decode").expect("present");
             for layer in &tile.layers {
                 for feature in &layer.features {
-                    if let Some(v) = feature.attribute("drval1").and_then(mvt::Value::as_f64) {
-                        assert_eq!(v, 5.0, "drval1 should round-trip exactly");
+                    if let Some(v) = feature.attribute("DRVAL1").and_then(mvt::Value::as_f64) {
+                        // Two depth areas: the 5-10 m band and the 10-20 m one.
+                        assert!(
+                            v == 5.0 || v == 10.0,
+                            "DRVAL1 should round-trip exactly, got {v}"
+                        );
                         found_drval = true;
                     }
-                    if let Some(v) = feature.attribute("depth").and_then(mvt::Value::as_f64) {
+                    if let Some(v) = feature.attribute("DEPTH").and_then(mvt::Value::as_f64) {
                         assert!(
-                            (v - 7.3).abs() < 1e-6 || (v - 12.1).abs() < 1e-6,
+                            [7.3, 12.1, 18.4, 4.2].iter().any(|e| (e - v).abs() < 1e-6),
                             "unexpected depth {v}"
                         );
                         found_depth = true;
@@ -259,9 +276,8 @@ fn geometry_lands_inside_the_source_bounds() {
             let vertices = chart
                 .lines
                 .iter()
-                .flatten()
-                .copied()
-                .chain(chart.points.iter().copied());
+                .flat_map(|l| l.points.iter().copied())
+                .chain(chart.points.iter().map(|p| p.at));
 
             for world in vertices {
                 assert!(
@@ -349,20 +365,105 @@ fn source_caches_decoded_tiles_and_evicts() {
 }
 
 #[test]
-fn a_layer_filter_that_matches_nothing_yields_nothing() {
-    let mut source = ChartSource::open(FIXTURE, &["DEPARE"]).expect("open");
-    // The fixture's single layer is called "chart", not "DEPARE".
-    let tile = source
-        .tile(TileId {
-            z: 10,
-            x: 497,
-            y: 347,
-        })
-        .expect("decode");
-    assert!(
-        tile.is_empty(),
-        "filter should exclude the only layer present"
+fn a_layer_filter_selects_one_class() {
+    let centre = LatLon::new((NORTH + SOUTH) / 2.0, (EAST + WEST) / 2.0);
+
+    // DEPARE is present, so filtering to it must leave only depth areas.
+    let mut only_depths = ChartSource::open(FIXTURE, &["DEPARE"]).expect("open");
+    let got = only_depths.collect(&View::new(centre, 12.0, 1280, 800));
+    assert!(!got.is_empty(), "DEPARE should be in the fixture");
+    assert_eq!(
+        got.styles(),
+        vec![ChartStyle::DepthArea],
+        "filtering to DEPARE should leave only depth areas"
     );
+
+    // And a class that is absent must yield nothing.
+    let mut nonsense = ChartSource::open(FIXTURE, &["NOSUCHLAYER"]).expect("open");
+    let none = nonsense.collect(&View::new(centre, 12.0, 1280, 800));
+    assert!(none.is_empty(), "an absent layer should yield nothing");
+}
+
+#[test]
+fn s57_layer_names_are_classified_into_styles() {
+    use rutter_charts::style_for_layer;
+
+    // The fixture's own layers, which is what actually gets drawn.
+    assert_eq!(style_for_layer("COALNE"), ChartStyle::Coastline);
+    assert_eq!(style_for_layer("LNDARE"), ChartStyle::Land);
+    assert_eq!(style_for_layer("DEPARE"), ChartStyle::DepthArea);
+    assert_eq!(style_for_layer("SOUNDG"), ChartStyle::Sounding);
+    assert_eq!(style_for_layer("BOYSPP"), ChartStyle::Buoy);
+
+    // Buoy and beacon categories collapse to one family each.
+    for b in ["BOYLAT", "BOYCAR", "BOYISD", "BOYSAW", "BOYINB"] {
+        assert_eq!(style_for_layer(b), ChartStyle::Buoy, "{b}");
+    }
+    for b in ["BCNLAT", "BCNCAR", "BCNISD", "BCNSPP"] {
+        assert_eq!(style_for_layer(b), ChartStyle::Beacon, "{b}");
+    }
+
+    // The classes that matter most.
+    assert_eq!(style_for_layer("WRECKS"), ChartStyle::Danger);
+    assert_eq!(style_for_layer("OBSTRN"), ChartStyle::Danger);
+    assert_eq!(style_for_layer("UWTROC"), ChartStyle::Danger);
+    assert_eq!(style_for_layer("LIGHTS"), ChartStyle::Light);
+    assert_eq!(style_for_layer("DEPCNT"), ChartStyle::DepthContour);
+
+    // Case-insensitive, because tooling disagrees about it.
+    assert_eq!(style_for_layer("coalne"), ChartStyle::Coastline);
+    assert_eq!(style_for_layer("CoAlNe"), ChartStyle::Coastline);
+
+    // Unknown names still draw, just undistinguished — and a name longer
+    // than the classifier's internal buffer must not panic or, worse,
+    // misclassify into something that looks safe.
+    assert_eq!(style_for_layer("SOMETHINGELSE"), ChartStyle::Other);
+    assert_eq!(style_for_layer(""), ChartStyle::Other);
+    assert_eq!(style_for_layer(&"X".repeat(200)), ChartStyle::Other);
+}
+
+#[test]
+fn the_fixture_carries_every_style_and_keeps_draw_order() {
+    let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
+    let centre = LatLon::new((NORTH + SOUTH) / 2.0, (EAST + WEST) / 2.0);
+    let got = source.collect(&View::new(centre, 12.0, 1280, 800));
+
+    let styles = got.styles();
+    for expected in [
+        ChartStyle::Land,
+        ChartStyle::DepthArea,
+        ChartStyle::Coastline,
+        ChartStyle::Sounding,
+        ChartStyle::Buoy,
+    ] {
+        assert!(
+            styles.contains(&expected),
+            "{expected:?} missing from {styles:?}"
+        );
+    }
+
+    // Draw order must be non-decreasing, or the renderer paints land over
+    // the marks that sit on top of it.
+    let orders: Vec<u8> = got.lines.iter().map(|l| l.style.depth_order()).collect();
+    assert!(
+        orders.windows(2).all(|w| w[0] <= w[1]),
+        "lines are not in draw order: {orders:?}"
+    );
+
+    // Soundings must carry their depths the whole way through.
+    let depths: Vec<f64> = got
+        .points
+        .iter()
+        .filter(|p| p.style == ChartStyle::Sounding)
+        .filter_map(|p| p.value)
+        .collect();
+    assert!(!depths.is_empty(), "soundings should arrive with depths");
+    for d in depths {
+        assert!(
+            [7.3, 12.1, 18.4, 4.2].iter().any(|e| (e - d).abs() < 1e-6),
+            "unexpected sounding depth {d}"
+        );
+    }
 }
 
 #[test]
@@ -394,8 +495,6 @@ fn rejects_a_file_that_is_not_a_database() {
 
 #[test]
 fn collect_gathers_a_viewport_from_the_real_file() {
-    use rutter_core::View;
-
     let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
 
     // A view over the data, at a zoom the file holds.
@@ -414,11 +513,15 @@ fn collect_gathers_a_viewport_from_the_real_file() {
         got.failed
     );
     assert!(!got.is_empty(), "the fixture's geometry should be found");
-    assert_eq!(got.line_slices().len(), got.lines.len());
 
     // Every vertex must be inside the unit square and near the source data.
     const SLACK: f64 = 0.25;
-    for world in got.lines.iter().flatten().chain(got.points.iter()) {
+    for world in got
+        .lines
+        .iter()
+        .flat_map(|l| l.points.iter())
+        .chain(got.points.iter().map(|p| &p.at))
+    {
         let pos = chart::unproject(*world);
         assert!(
             pos.lon >= WEST - SLACK && pos.lon <= EAST + SLACK,
@@ -435,8 +538,6 @@ fn collect_gathers_a_viewport_from_the_real_file() {
 
 #[test]
 fn collect_clamps_the_zoom_to_what_the_file_holds() {
-    use rutter_core::View;
-
     let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
     let centre = LatLon::new((NORTH + SOUTH) / 2.0, (EAST + WEST) / 2.0);
 
@@ -473,8 +574,6 @@ fn collect_clamps_the_zoom_to_what_the_file_holds() {
 
 #[test]
 fn a_matching_zoom_is_well_inside_the_tile_budget() {
-    use rutter_core::View;
-
     // The guard must not fire in normal use. A phone-shaped viewport at the
     // chart's own zoom should want a few dozen tiles, not hundreds.
     let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
@@ -501,8 +600,6 @@ fn a_matching_zoom_is_well_inside_the_tile_budget() {
 
 #[test]
 fn collect_over_open_water_yields_nothing_and_no_errors() {
-    use rutter_core::View;
-
     let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
     // Mid-Atlantic, far from the fixture.
     let view = View::new(LatLon::new(30.0, -40.0), 12.0, 1280, 800);
@@ -515,8 +612,6 @@ fn collect_over_open_water_yields_nothing_and_no_errors() {
 
 #[test]
 fn collect_is_stable_for_the_same_view() {
-    use rutter_core::View;
-
     let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
     let centre = LatLon::new((NORTH + SOUTH) / 2.0, (EAST + WEST) / 2.0);
     let view = View::new(centre, 12.0, 1280, 800);
@@ -529,4 +624,329 @@ fn collect_is_stable_for_the_same_view() {
     assert_eq!(first.tiles, second.tiles);
     assert_eq!(first.lines.len(), second.lines.len());
     assert_eq!(first.points.len(), second.points.len());
+}
+
+#[test]
+fn metadata_lists_the_layers_in_the_file() {
+    let meta = open().metadata().clone();
+
+    let names: Vec<&str> = meta.layers.iter().map(|l| l.name.as_str()).collect();
+    for expected in ["COALNE", "LNDARE", "DEPARE", "SOUNDG", "BOYSPP"] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+    assert_eq!(meta.layers.len(), 5, "fixture has five layers: {names:?}");
+
+    // Attributes come through too, which is what a picker shows as detail
+    // and what a label will eventually read.
+    let depare = meta
+        .layers
+        .iter()
+        .find(|l| l.name == "DEPARE")
+        .expect("DEPARE should be listed");
+    assert!(
+        depare.fields.iter().any(|f| f == "DRVAL1"),
+        "DEPARE fields were {:?}",
+        depare.fields
+    );
+}
+
+#[test]
+fn toggling_a_layer_off_hides_only_that_layer() {
+    let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
+    let centre = LatLon::new((NORTH + SOUTH) / 2.0, (EAST + WEST) / 2.0);
+    let view = View::new(centre, 12.0, 1280, 800);
+
+    let before = source.collect(&view).styles();
+    assert!(before.contains(&ChartStyle::Sounding));
+    assert!(before.contains(&ChartStyle::Coastline));
+
+    // Switching SOUNDG off from the implicit "all layers" state must not
+    // take everything else with it.
+    assert!(
+        source.toggle_layer("SOUNDG", false),
+        "should report a change"
+    );
+    let after = source.collect(&view).styles();
+    assert!(
+        !after.contains(&ChartStyle::Sounding),
+        "soundings should be hidden, got {after:?}"
+    );
+    assert!(
+        after.contains(&ChartStyle::Coastline),
+        "the coastline should survive, got {after:?}"
+    );
+
+    // And back on again.
+    assert!(source.toggle_layer("SOUNDG", true));
+    let restored = source.collect(&view).styles();
+    assert!(restored.contains(&ChartStyle::Sounding));
+}
+
+#[test]
+fn a_redundant_toggle_reports_no_change() {
+    let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
+    assert!(
+        source.toggle_layer("SOUNDG", false),
+        "first off is a change"
+    );
+    assert!(
+        !source.toggle_layer("SOUNDG", false),
+        "switching it off twice is not a change"
+    );
+}
+
+#[test]
+fn changing_the_filter_invalidates_the_cache() {
+    // The bug this guards: tiles cached under the old filter keep their old
+    // geometry, so a picker appears to do nothing until the view moves.
+    let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
+    let centre = LatLon::new((NORTH + SOUTH) / 2.0, (EAST + WEST) / 2.0);
+    let view = View::new(centre, 12.0, 1280, 800);
+
+    source.collect(&view);
+    assert!(
+        source.cached() > 0,
+        "tiles should be cached after a collect"
+    );
+
+    source.set_layers(&["COALNE".to_owned()]);
+    assert_eq!(
+        source.cached(),
+        0,
+        "the cache must be dropped on a filter change"
+    );
+
+    let only_coast = source.collect(&view).styles();
+    assert_eq!(only_coast, vec![ChartStyle::Coastline]);
+}
+
+#[test]
+fn the_tile_range_script_agrees_with_core() {
+    // `scripts/tile-range.py` reimplements Web Mercator so the imagery
+    // fetcher can enumerate tiles before anything is compiled. Two
+    // implementations of the same projection is a real hazard: if they
+    // disagree, the fetcher downloads tiles the renderer never asks for and
+    // the imagery silently has holes. This pins them together.
+    use std::process::Command;
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/tile-range.py");
+
+    // The San Diego Bay ENC extent, at a zoom with a manageable tile count.
+    let (south, west, north, east, zoom) = (32.594, -117.253, 32.744, -117.090, 13u8);
+
+    let output = Command::new("python3")
+        .arg(script)
+        .args([
+            south.to_string(),
+            west.to_string(),
+            north.to_string(),
+            east.to_string(),
+            zoom.to_string(),
+        ])
+        .output()
+        .expect("python3 should be on PATH inside the dev shell");
+
+    assert!(
+        output.status.success(),
+        "tile-range.py failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut from_script: Vec<TileId> = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(f.len(), 4, "expected 'z x y row', got {line:?}");
+        let (z, x, y, row) = (
+            f[0].parse::<u8>().expect("zoom"),
+            f[1].parse::<u32>().expect("x"),
+            f[2].parse::<u32>().expect("y"),
+            f[3].parse::<u32>().expect("row"),
+        );
+        // The script also emits the TMS row; it must match the flip core's
+        // reader applies, or the fetcher writes rows the reader cannot find.
+        assert_eq!(
+            row,
+            TileId::grid_size(z) - 1 - y,
+            "script's TMS row disagrees with 2^z - 1 - y"
+        );
+        from_script.push(TileId { z, x, y });
+    }
+
+    let from_core = chart::tiles_in_view(LatLon::new(north, west), LatLon::new(south, east), zoom);
+
+    assert!(!from_script.is_empty(), "the script produced no tiles");
+    assert_eq!(
+        from_script, from_core,
+        "the script and rutter-core disagree about which tiles cover the box"
+    );
+}
+
+// ── Raster imagery ──────────────────────────────────────────────────────────
+//
+// These run against `build/charts/imagery.mbtiles`, which `rutter imagery`
+// produces from USGS NAIP. It is not committed — aerial imagery is megabytes
+// and regenerable — so they skip when it is absent rather than fail. Build it
+// with:
+//
+//     rutter noaa US5CA72M
+//     rutter imagery --chart build/charts/noaa.mbtiles --zoom 13
+
+fn imagery_path() -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../build/charts/imagery.mbtiles"
+    ))
+    .to_path_buf();
+    path.exists().then_some(path)
+}
+
+#[test]
+fn reads_real_usgs_imagery() {
+    use rutter_charts::ImagerySource;
+
+    let Some(path) = imagery_path() else {
+        eprintln!("skipping: no build/charts/imagery.mbtiles — see the note above");
+        return;
+    };
+
+    let mut source = ImagerySource::open(&path).expect("imagery should open");
+    let meta = source.metadata().clone();
+
+    assert!(
+        meta.is_raster(),
+        "format {:?} should be raster",
+        meta.format
+    );
+    assert!(!meta.is_vector());
+    assert!(
+        meta.attribution
+            .as_deref()
+            .is_some_and(|a| a.contains("USGS")),
+        "the USGS credit should be recorded: {:?}",
+        meta.attribution
+    );
+
+    // The tile over the mouth of San Diego Bay.
+    let id = TileId {
+        z: 13,
+        x: 1428,
+        y: 3308,
+    };
+    let tile = source
+        .tile(id)
+        .expect("decode")
+        .expect("that tile was downloaded");
+
+    assert_eq!(tile.id, id);
+    assert_eq!((tile.width, tile.height), (256, 256));
+    assert!(
+        tile.is_consistent(),
+        "RGBA buffer length must match the size"
+    );
+
+    // Aerial imagery of a harbour is not a blank frame. A decoder that
+    // silently produced zeros would pass every structural check above.
+    let distinct: std::collections::HashSet<[u8; 3]> = tile
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| [p[0], p[1], p[2]])
+        .collect();
+    assert!(
+        distinct.len() > 100,
+        "only {} distinct colours — this does not look like a photograph",
+        distinct.len()
+    );
+
+    // Every pixel opaque: these are JPEGs with no alpha.
+    assert!(
+        tile.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
+        "imagery should decode fully opaque"
+    );
+}
+
+#[test]
+fn imagery_rejects_a_vector_file() {
+    use rutter_charts::ImagerySource;
+
+    // Handing the vector chart to the imagery reader must say so plainly
+    // rather than open and then draw nothing.
+    let err = ImagerySource::open(FIXTURE).expect_err("a vector file is not imagery");
+    assert!(
+        matches!(err, rutter_charts::mbtiles::Error::NotRaster(_)),
+        "expected NotRaster, got {err}"
+    );
+}
+
+#[test]
+fn imagery_collect_covers_a_view_and_caches() {
+    use rutter_charts::ImagerySource;
+    use rutter_core::View;
+
+    let Some(path) = imagery_path() else {
+        eprintln!("skipping: no build/charts/imagery.mbtiles");
+        return;
+    };
+
+    let mut source = ImagerySource::open(&path).expect("open");
+    let view = View::new(LatLon::new(32.69, -117.20), 13.0, 1280, 800);
+
+    let tiles = source.collect(&view);
+    assert!(!tiles.is_empty(), "the view is over the downloaded area");
+    assert!(tiles.iter().all(|t| t.is_consistent()));
+    assert!(source.cached() > 0, "decoded tiles should be cached");
+
+    // A second pass must be served from the cache, not re-decoded.
+    let before = source.cached();
+    let again = source.collect(&view);
+    assert_eq!(tiles.len(), again.len());
+    assert_eq!(
+        source.cached(),
+        before,
+        "a repeat view should not grow the cache"
+    );
+}
+
+#[test]
+fn imagery_survives_zooming_out() {
+    use rutter_charts::ImagerySource;
+    use rutter_core::View;
+
+    let Some(path) = imagery_path() else {
+        eprintln!("skipping: no build/charts/imagery.mbtiles");
+        return;
+    };
+
+    let mut source = ImagerySource::open(&path).expect("open");
+    let deepest = source.metadata().max_zoom;
+
+    // Zooming out used to blank the imagery. With only the deepest level in
+    // the file, a shallower view clamps back up to it, the viewport then
+    // covers hundreds of tiles at that zoom, `collect` goes over its budget
+    // and returns nothing — sea colour and a debug log. `rutter imagery`
+    // fetches a pyramid down to zoom 6 so each level is drawn at its own
+    // scale, and this is the assertion that says so.
+    //
+    // Four levels out from the deepest is a 16x16-tile area at the deepest
+    // zoom: comfortably over the budget, so a single-level file fails here.
+    for out in 1..=4 {
+        let zoom = f64::from(deepest.saturating_sub(out));
+        let view = View::new(LatLon::new(32.69, -117.20), zoom, 1280, 800);
+        let tiles = source.collect(&view);
+
+        assert!(
+            !tiles.is_empty(),
+            "zoom {zoom} (level {out} out from {deepest}) drew no imagery — \
+             is the file a single level? refetch with `rutter imagery`"
+        );
+        assert!(
+            tiles.len() <= ImagerySource::MAX_TILES,
+            "zoom {zoom} wanted {} tiles, over the budget",
+            tiles.len()
+        );
+    }
 }

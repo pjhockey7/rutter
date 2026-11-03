@@ -413,12 +413,15 @@ impl Feature {
             }
         }
 
-        if tags.len() % 2 != 0 {
+        if !tags.len().is_multiple_of(2) {
             return Err(Error::Geometry("odd number of attribute tags"));
         }
 
         let mut attributes = Vec::with_capacity(tags.len() / 2);
-        for pair in tags.chunks_exact(2) {
+        // Pairs of (key index, value index). `as_chunks::<2>` gives fixed
+        // arrays rather than slices, so the indexing below cannot be out of
+        // bounds — the length is in the type.
+        for pair in tags.as_chunks::<2>().0 {
             let key = keys.get(pair[0] as usize).ok_or(Error::TagOutOfRange)?;
             let value = values.get(pair[1] as usize).ok_or(Error::TagOutOfRange)?;
             attributes.push((key.clone(), value.clone()));
@@ -492,7 +495,7 @@ fn decode_runs(commands: &[u32]) -> Result<Vec<Vec<[i32; 2]>>, Error> {
                     None => return Err(Error::Geometry("line before any move")),
                 };
 
-                for point in params.chunks_exact(2) {
+                for point in params.as_chunks::<2>().0 {
                     cursor[0] = cursor[0].wrapping_add(zigzag32(point[0]));
                     cursor[1] = cursor[1].wrapping_add(zigzag32(point[1]));
                     run.push(cursor);

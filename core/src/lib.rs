@@ -103,8 +103,10 @@ impl View {
 
 impl Default for View {
     fn default() -> Self {
-        // Falmouth, for want of anywhere better to start.
-        Self::new(LatLon::new(50.1531, -5.0659), 12.0, 1280, 720)
+        // The entrance to San Diego Bay, at a zoom where the harbour fills
+        // the screen. Somewhere real has to be the default, and this is
+        // where the charts being developed against are.
+        Self::new(LatLon::new(32.6800, -117.2300), 12.0, 1280, 720)
     }
 }
 

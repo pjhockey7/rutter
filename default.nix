@@ -776,25 +776,453 @@ let
         work=$(mktemp -d)
         trap 'rm -rf "$work"' EXIT
 
-        echo "reading $src"
-        gdalinfo --version
-        # ENC cells carry many layers; DEPARE (depth areas), COALNE
-        # (coastline) and SOUNDG (soundings) are the ones a chart is mostly
-        # made of. Everything else can come later.
-        ogr2ogr -f GeoJSONSeq "$work/chart.geojsons" "$src" \
-          -t_srs EPSG:4326 -skipfailures
+        # ── S-57 reading options ────────────────────────────────────────────
+        #
+        # SPLIT_MULTIPOINT is the one that matters. In S-57 the whole of a
+        # cell's soundings is a single multipoint feature with the depth in
+        # each vertex's Z. Without splitting, every sounding on the chart
+        # arrives as one feature with no depth attribute, which is useless.
+        # With it, one point per sounding, and ADD_SOUNDG_DEPTH lifts the Z
+        # into a DEPTH attribute the renderer can label.
+        #
+        # RETURN_PRIMITIVES off because the edge and node primitives are
+        # topology, not chart features, and they would otherwise swamp the
+        # output.
+        export OGR_S57_OPTIONS="SPLIT_MULTIPOINT=ON,ADD_SOUNDG_DEPTH=ON,RETURN_PRIMITIVES=OFF,RETURN_LINKAGES=OFF,LNAM_REFS=OFF"
 
-        echo "tiling"
+        echo "reading $src"
+        gdalinfo --version | head -1
+
+        # ── One tile layer per source layer ────────────────────────────────
+        #
+        # This is the whole point of the rewrite. An ENC cell holds up to a
+        # hundred S-57 object classes as separate OGR layers — COALNE for
+        # coastline, DEPARE for depth areas, SOUNDG for soundings, LIGHTS,
+        # BOYSPP, WRECKS and so on. Flattening them into one tile layer, as
+        # this used to, throws away the only information a renderer has for
+        # deciding what a feature should look like: a coastline and a cable
+        # area come out identical.
+        #
+        # Most of those classes are empty in any given cell, so empty layers
+        # are skipped rather than passed to tippecanoe, which would reject a
+        # zero-byte input.
+        layers=$(ogrinfo -q "$src" 2>/dev/null \
+          | sed -nE 's/^[0-9]+: ([A-Za-z0-9_]+).*/\1/p' | sort -u)
+
+        if [ -z "$layers" ]; then
+          echo "  (single-layer source)"
+          layers=""
+        fi
+
+        args=()
+        kept=0
+        skipped=0
+
+        if [ -n "$layers" ]; then
+          for layer in $layers; do
+            f="$work/$layer.geojsons"
+            if ! ogr2ogr -f GeoJSONSeq "$f" "$src" "$layer" \
+                 -t_srs EPSG:4326 -skipfailures 2>/dev/null; then
+              skipped=$((skipped + 1))
+              continue
+            fi
+            if [ ! -s "$f" ]; then
+              skipped=$((skipped + 1))
+              continue
+            fi
+            n=$(wc -l < "$f")
+            printf '  %-10s %s features\n' "$layer" "$n"
+            args+=( "--named-layer=$layer:$f" )
+            kept=$((kept + 1))
+          done
+        fi
+
+        # A source with no layer list — a bare .geojson — still has to work,
+        # since "any chart the user provides" includes the simple cases.
+        if [ "$kept" -eq 0 ]; then
+          f="$work/chart.geojsons"
+          ogr2ogr -f GeoJSONSeq "$f" "$src" -t_srs EPSG:4326 -skipfailures
+          if [ ! -s "$f" ]; then
+            echo "no features found in $src" >&2
+            exit 1
+          fi
+          printf '  %-10s %s features\n' chart "$(wc -l < "$f")"
+          args=( "--named-layer=chart:$f" )
+          kept=1
+        fi
+
+        echo "tiling $kept layer(s)''${skipped:+, $skipped empty or unreadable}"
         # -zg picks the zoom range from the data density; --drop-densest
         # keeps tiles under the 500 KB limit by thinning rather than failing.
         tippecanoe -o "$out" -f -zg \
           --drop-densest-as-needed \
           --extend-zooms-if-still-dropping \
-          -l chart "$work/chart.geojsons"
+          "''${args[@]}" 2>&1 | tail -1
 
         echo
         echo "  $out"
         ls -lh "$out" | awk '{print "  size:", $5}'
+        # Report what a renderer will actually find, rather than trusting
+        # that the layer names survived.
+        #
+        # Done in SQL rather than with a Python one-liner on purpose. A
+        # multi-line script here would need lines at column 0, and Nix's
+        # indented-string syntax strips the *common* leading whitespace of
+        # the whole script — so one column-0 line silently stops every other
+        # line being dedented, and the `rutter help` heredoc below then never
+        # finds its terminator. That cost a build to diagnose.
+        echo "  layers:"
+        sqlite3 -noheader "$out" \
+          "select '    ' || (je.value ->> 'id') || '  ' || \
+             coalesce((select group_concat(k.key, ', ') \
+                       from json_each(je.value -> 'fields') k), '(no attributes)') \
+           from metadata, json_each(metadata.value -> 'vector_layers') je \
+           where metadata.name = 'json' order by 1;"
+        ;;
+
+      noaa)
+        shift
+        # ── NOAA ENC charts ────────────────────────────────────────────────
+        #
+        # NOAA publishes Electronic Navigational Charts for US waters free
+        # and without registration, which makes them the only official,
+        # freely-redistributable chart source this project can default to.
+        # Most other hydrographic offices charge.
+        #
+        # Cells are at a predictable URL; the product catalogue carries every
+        # cell's name and coverage, which is what makes `--near` possible.
+        base=https://www.charts.noaa.gov/ENCs
+        work=build/noaa
+        mkdir -p "$work"
+
+        # The national catalogue is ~20 MB. NOAA also publishes per-region
+        # and per-state ones that are a fraction of that and enough if you
+        # sail one coast — 12Region covers southern California,
+        # CA_ENCProdCat_19115.xml the whole state.
+        catalog=''${RUTTER_NOAA_CATALOG:-ENCProdCat_19115.xml}
+
+        fetch_catalog() {
+          if [ ! -s "$work/$catalog" ]; then
+            echo "fetching $catalog (cached in $work)"
+            if ! curl -fsSL --retry 3 -o "$work/$catalog" "$base/$catalog"; then
+              echo "could not fetch $base/$catalog" >&2
+              rm -f "$work/$catalog"
+              return 1
+            fi
+          fi
+        }
+
+        case "''${1:-}" in
+          --near)
+            if [ $# -lt 2 ]; then
+              echo "usage: rutter noaa --near <lat>,<lon>" >&2
+              exit 64
+            fi
+            pos=$2; shift 2
+            lat=''${pos%%,*}; lon=''${pos##*,}
+            if [ "$lat" = "$pos" ] || [ -z "$lon" ]; then
+              echo "expected --near <lat>,<lon>, got '$pos'" >&2
+              exit 64
+            fi
+
+            fetch_catalog || exit 1
+
+            echo "cells covering $lat,$lon, most detailed first:"
+            cells=$(python3 ${./scripts/noaa-catalog.py} near "$lat" "$lon" < "$work/$catalog") || exit 1
+            echo "$cells" | sed 's/^/  /'
+            set -- $cells
+            ;;
+          --box)
+            if [ $# -lt 2 ]; then
+              echo "usage: rutter noaa --box <south>,<west>,<north>,<east>" >&2
+              exit 64
+            fi
+            box=$2; shift 2
+            IFS=, read -r bs bw bn be <<<"$box" || true
+            if [ -z "''${be:-}" ]; then
+              echo "expected --box <south>,<west>,<north>,<east>, got '$box'" >&2
+              exit 64
+            fi
+            fetch_catalog || exit 1
+
+            echo "cells overlapping $box, most detailed first:"
+            cells=$(python3 ${./scripts/noaa-catalog.py} box "$bs" "$bw" "$bn" "$be" < "$work/$catalog") || exit 1
+            echo "$cells" | sed 's/^/  /'
+            set -- $cells
+            ;;
+          --list)
+            shift
+            fetch_catalog || exit 1
+            exec python3 ${./scripts/noaa-catalog.py} list < "$work/$catalog"
+            ;;
+        esac
+
+        if [ $# -eq 0 ]; then
+          echo "usage: rutter noaa <CELL>... | --near <lat>,<lon>" >&2
+          echo "                   | --box <s>,<w>,<n>,<e> | --list" >&2
+          echo >&2
+          echo "  rutter noaa US5CA72M                San Diego Bay, 1:12,000" >&2
+          echo "  rutter noaa --near 32.71,-117.17     cells covering a position" >&2
+          echo "  rutter noaa --box 32.5,-118.7,33.6,-117.0" >&2
+          echo "                                      San Diego to Catalina" >&2
+          echo "  rutter noaa --list                  every cell in the catalogue" >&2
+          echo >&2
+          echo "RUTTER_NOAA_CATALOG picks a smaller catalogue than the" >&2
+          echo "national one: 12Region_ENCProdCat_19115.xml for southern" >&2
+          echo "California, CA_ENCProdCat_19115.xml for the whole state." >&2
+          echo >&2
+          echo "Cells are US waters only. Elsewhere, convert your own charts" >&2
+          echo "with 'rutter charts <source> <out.mbtiles>'." >&2
+          exit 64
+        fi
+
+        # Accumulate every cell's layers into one GeoPackage, then tile once.
+        #
+        # Per-cell MBTiles would mean the app could only ever show one cell
+        # at a time, and merging tiles afterwards needs tile-join and care
+        # over layer collisions. Merging at the *source* level is simpler and
+        # lets the existing `rutter charts` do the rest unchanged.
+        export OGR_S57_OPTIONS="SPLIT_MULTIPOINT=ON,ADD_SOUNDG_DEPTH=ON,RETURN_PRIMITIVES=OFF,RETURN_LINKAGES=OFF,LNAM_REFS=OFF"
+
+        # Per-invocation merge file, not a fixed name.
+        #
+        # Two `rutter noaa` runs at once would otherwise have two ogr2ogr
+        # processes appending to the same GeoPackage, which is a SQLite
+        # write-lock fight at best and a corrupt chart at worst. Found the
+        # hard way by running a second fetch while the first was still going.
+        merged="$work/merged.$$.gpkg"
+        rm -f "$merged"
+        # shellcheck disable=SC2064
+        trap "rm -f '$merged' '$merged-journal'" EXIT
+
+        for cell in "$@"; do
+          zip="$work/$cell.zip"
+          if [ ! -s "$zip" ]; then
+            echo "fetching $cell"
+            if ! curl -fsSL --retry 3 -o "$zip" "$base/$cell.zip"; then
+              echo "  could not fetch $cell — check the name against 'rutter noaa --list'" >&2
+              rm -f "$zip"
+              continue
+            fi
+          fi
+
+          rm -rf "$work/$cell.d"
+          mkdir -p "$work/$cell.d"
+          unzip -qo "$zip" -d "$work/$cell.d"
+
+          # The .000 is the base cell; .001 and up are incremental updates,
+          # which GDAL applies automatically when they sit beside it.
+          base_file=$(find "$work/$cell.d" -name '*.000' | head -1)
+          if [ -z "$base_file" ]; then
+            echo "  $cell has no .000 cell file" >&2
+            continue
+          fi
+
+          echo "  merging $(basename "$base_file")"
+          # One call, all layers.
+          #
+          # The obvious-looking alternative — enumerate layers and convert
+          # each — reopens and reparses the whole S-57 cell once per layer,
+          # and a real 1:12,000 harbour cell has dozens. That took minutes
+          # per cell before this was collapsed into a single pass.
+          ogr2ogr -f GPKG -update -append "$merged" "$base_file" \
+            -t_srs EPSG:4326 -skipfailures 2>/dev/null || true
+        done
+
+        if [ ! -s "$merged" ]; then
+          echo "nothing was fetched" >&2
+          exit 1
+        fi
+
+        out=''${RUTTER_CHART_OUT:-build/charts/noaa.mbtiles}
+        mkdir -p "$(dirname "$out")"
+        echo
+        "$0" charts "$merged" "$out"
+        echo
+        echo "Load it with: rutter run --charts $out"
+        ;;
+
+      imagery)
+        shift
+        # ── Aerial imagery ────────────────────────────────────────────────
+        #
+        # USGS's ImageryOnly basemap: NAIP orthoimagery at 1 m for the
+        # conterminous US, 10 m SPOT for Alaska. Federal work, so public
+        # domain — no key, no token, and no terms forbidding a cached copy,
+        # which matters because the whole point is to have it offline.
+        #
+        # The credit line (USDA/USGS) is written into the file's metadata and
+        # shown by the app, because that is the courtesy owed even when the
+        # licence does not demand it.
+        #
+        # Commercial basemaps were not used on purpose: Google and Bing
+        # forbid caching outright, and Esri's World Imagery permits it only
+        # under terms that a boat with no signal cannot rely on.
+        tiles=https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile
+
+        zoom=''${RUTTER_IMAGERY_ZOOM:-14}
+        out=build/charts/imagery.mbtiles
+        box=""
+
+        # The shallowest level to fetch as well as --zoom.
+        #
+        # Fetching only the deepest level makes the imagery vanish the moment
+        # you zoom out: the viewport then covers thousands of tiles at the one
+        # zoom that exists, the reader's tile budget says no, and you get sea
+        # colour with a line in the debug log. A pyramid is the fix, and it is
+        # close to free — each level up is a quarter of the tiles, so
+        # everything above the deepest adds about a third. Cheaper than
+        # resampling locally, and the pixels are USGS's rather than ours.
+        #
+        # Six is low enough to cover a whole-coast view; the levels near it
+        # are a handful of tiles each.
+        min_zoom=''${RUTTER_IMAGERY_MIN_ZOOM:-6}
+
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --box)      box=$2; shift 2 ;;
+            --chart)    chart=$2; shift 2 ;;
+            --zoom)     zoom=$2; shift 2 ;;
+            --min-zoom) min_zoom=$2; shift 2 ;;
+            --out)      out=$2; shift 2 ;;
+            *) echo "rutter imagery: unknown option '$1'" >&2; exit 64 ;;
+          esac
+        done
+
+        if [ "$min_zoom" -gt "$zoom" ]; then
+          echo "--min-zoom $min_zoom is deeper than --zoom $zoom" >&2
+          exit 64
+        fi
+
+        # Taking the box from a chart is the common case: imagery is only
+        # useful where there is a chart to put it under.
+        if [ -z "$box" ] && [ -n "''${chart:-}" ]; then
+          if [ ! -f "$chart" ]; then
+            echo "no such chart: $chart" >&2
+            exit 1
+          fi
+          bounds=$(sqlite3 -noheader "$chart"             "select value from metadata where name = 'bounds';")
+          if [ -z "$bounds" ]; then
+            echo "$chart declares no bounds; pass --box instead" >&2
+            exit 1
+          fi
+          # MBTiles bounds are west,south,east,north; --box is s,w,n,e.
+          IFS=, read -r bw bs be bn <<<"$bounds"
+          box="$bs,$bw,$bn,$be"
+          echo "using $chart's bounds: $box"
+        fi
+
+        if [ -z "$box" ]; then
+          echo "usage: rutter imagery --box <s>,<w>,<n>,<e> [--zoom N] [--min-zoom N] [--out FILE]" >&2
+          echo "       rutter imagery --chart <file.mbtiles> [--zoom N] [--min-zoom N]" >&2
+          echo >&2
+          echo "  rutter imagery --chart build/charts/noaa.mbtiles" >&2
+          echo "  rutter imagery --box 32.5,-118.7,33.6,-117.0 --zoom 12" >&2
+          echo >&2
+          echo "Zoom 14 is roughly 10 m per pixel; 16 is 2.5 m. The tile" >&2
+          echo "count quadruples per level, so check it before a big area." >&2
+          echo >&2
+          echo "--zoom is the deepest level; everything from --min-zoom" >&2
+          echo "(default 6) up to it is fetched too, so the imagery survives" >&2
+          echo "zooming out. Those extra levels add about a third." >&2
+          echo >&2
+          echo "Imagery is USGS/USDA NAIP — public domain, US only." >&2
+          exit 64
+        fi
+
+        IFS=, read -r s w n e <<<"$box"
+        if [ -z "''${e:-}" ]; then
+          echo "expected --box <south>,<west>,<north>,<east>, got '$box'" >&2
+          exit 64
+        fi
+
+        count=0
+        for z in $(seq "$min_zoom" "$zoom"); do
+          at=$(python3 ${./scripts/tile-range.py} --count "$s" "$w" "$n" "$e" "$z")
+          echo "  zoom $z: $at tiles"
+          count=$((count + at))
+        done
+        echo "$count tiles across zoom $min_zoom..$zoom"
+
+        cap=''${RUTTER_IMAGERY_MAX_TILES:-2000}
+        if [ "$count" -gt "$cap" ]; then
+          echo >&2
+          echo "That is more than the $cap-tile limit. Either lower --zoom" >&2
+          echo "(each level down is a quarter as many), raise --min-zoom," >&2
+          echo "or raise the limit" >&2
+          echo "with RUTTER_IMAGERY_MAX_TILES if you mean it — at roughly" >&2
+          echo "30 KB a tile, $count tiles is about $((count * 30 / 1024)) MB." >&2
+          exit 1
+        fi
+
+        work=$(mktemp -d)
+        trap 'rm -rf "$work"' EXIT
+        mkdir -p "$(dirname "$out")"
+        rm -f "$out"
+
+        # MBTiles is a SQLite file with an agreed schema. Writing it directly
+        # rather than through a tool keeps the dependency list as it is, and
+        # the schema is four lines.
+        sqlite3 "$out"           "CREATE TABLE metadata (name text, value text);
+           CREATE UNIQUE INDEX metadata_name on metadata (name);
+           CREATE TABLE tiles (zoom_level integer, tile_column integer,
+                               tile_row integer, tile_data blob);
+           CREATE UNIQUE INDEX tile_index on tiles
+                               (zoom_level, tile_column, tile_row);"
+
+        got=0
+        missing=0
+        : > "$work/tiles.txt"
+        # Deepest first, so an interrupted fetch still leaves the detail
+        # you were after rather than only the overviews.
+        for z in $(seq "$zoom" -1 "$min_zoom"); do
+          python3 ${./scripts/tile-range.py} "$s" "$w" "$n" "$e" "$z"             >> "$work/tiles.txt"
+        done
+
+        while read -r z x y row; do
+          f="$work/$z-$x-$y.jpg"
+          # ArcGIS serves tiles as /tile/{z}/{y}/{x} — row before column,
+          # which is the reverse of the {z}/{x}/{y} every other scheme uses.
+          # Getting it backwards returns valid-looking imagery of the wrong
+          # place, which is the worst kind of wrong.
+          if curl -fsSL --retry 2 --max-time 30 -o "$f" "$tiles/$z/$y/$x"              && [ -s "$f" ]; then
+            sqlite3 "$out"               "INSERT OR REPLACE INTO tiles VALUES ($z, $x, $row, readfile('$f'));"
+            got=$((got + 1))
+            printf '  %s/%s tiles' "$got" "$count"
+          else
+            missing=$((missing + 1))
+          fi
+          rm -f "$f"
+        done < "$work/tiles.txt"
+        printf '
+'
+
+        if [ "$got" -eq 0 ]; then
+          echo "nothing was downloaded — is the area inside the US?" >&2
+          rm -f "$out"
+          exit 1
+        fi
+
+        # `format` is what tells a reader these are raster tiles, not vector.
+        sqlite3 "$out"           "INSERT OR REPLACE INTO metadata VALUES ('name', 'USGS imagery');
+           INSERT OR REPLACE INTO metadata VALUES ('format', 'jpg');
+           INSERT OR REPLACE INTO metadata VALUES ('type', 'baselayer');
+           INSERT OR REPLACE INTO metadata VALUES ('minzoom', '$min_zoom');
+           INSERT OR REPLACE INTO metadata VALUES ('maxzoom', '$zoom');
+           INSERT OR REPLACE INTO metadata VALUES ('bounds', '$w,$s,$e,$n');
+           INSERT OR REPLACE INTO metadata VALUES ('attribution',
+             'Imagery: USGS National Map / USDA NAIP (public domain)');"
+
+        echo
+        echo "  $out"
+        ls -lh "$out" | awk '{print "  size:", $5}'
+        echo "  tiles: $got''${missing:+, $missing unavailable}"
+        echo
+        if [ "$out" = build/charts/imagery.mbtiles ]; then
+          echo 'rutter run picks this up on its own.'
+        else
+          echo "Load it with: rutter run --charts <chart> --imagery $out"
+        fi
         ;;
 
       fmt)
@@ -818,31 +1246,41 @@ let
         ;;
 
       help | --help | -h)
-        cat <<'EOF'
-    rutter — charts, weather and tides
-
-      doctor     print the toolchain and what is still missing  <- start here
-      test       cargo test on core and charts (fast; the real test suite)
-      test-all   cargo test on the whole workspace (slow; builds wgpu)
-      run        open the Linux app; --charts <file.mbtiles> to load a chart
-      build      cargo build, whole workspace
-      android    cross-compile the shared library for $RUTTER_ABI
-      apk        build a signed, installable APK (no Gradle)
-      install    adb install the APK
-      run-android  launch it on the device
-      logcat     follow the device log, filtered to what matters
-      uninstall  remove it from the device
-      charts     <source> <out.mbtiles> — turn chart data into tiles
-      fmt        cargo fmt
-      lint       cargo clippy
-      adb        pass through to the SDK's adb
-      clean      remove target/ and build/
-
-    Environment:
-      RUTTER_ABI   android ABI to build (default ${defaultAbi})
-                   one of: ${lib.concatStringsSep ", " (builtins.attrNames androidAbis)}
-      RUTTER_ROOT  project root (default: the current directory)
-    EOF
+        # printf rather than a heredoc. A heredoc's terminator must sit at
+        # column 0 in the *generated* script, which depends on how much
+        # common indentation Nix strips from this whole string — so adding
+        # one unindented line anywhere above silently breaks it. printf has
+        # no such coupling.
+        printf '%s\n' \
+          'rutter — charts, weather and tides' \
+          "" \
+          '  doctor       the toolchain and what is still missing  <- start here' \
+          '  test         cargo test on core and charts (fast; the real suite)' \
+          '  test-all     cargo test on the whole workspace (slow; builds wgpu)' \
+          '  run          open the Linux app; --charts <f.mbtiles> to load a chart' \
+          '  build        cargo build, whole workspace' \
+          '  android      cross-compile the shared library for $RUTTER_ABI' \
+          '  apk          build a signed, installable APK (no Gradle)' \
+          '  install      adb install the APK' \
+          '  run-android  launch it on the device' \
+          '  logcat       follow the device log, filtered to what matters' \
+          '  uninstall    remove it from the device' \
+          '  charts       <source> <out.mbtiles> — turn chart data into tiles' \
+          '  noaa         fetch NOAA ENC charts (US waters) and tile them' \
+          '  imagery      fetch USGS aerial imagery for a chart or a box' \
+          '  fmt          cargo fmt' \
+          '  lint         cargo clippy' \
+          '  adb          pass through to the SDK'"'"'s adb' \
+          '  clean        remove target/ and build/' \
+          "" \
+          'Chart sources — `charts` takes anything GDAL reads:' \
+          '  an ENC .000 cell or ENC_ROOT directory, a Shapefile, GeoPackage,' \
+          '  GeoJSON, or an existing MBTiles passed straight to `run`.' \
+          "" \
+          'Environment:' \
+          '  RUTTER_ABI   android ABI to build (default ${defaultAbi})' \
+          '               one of: ${lib.concatStringsSep ", " (builtins.attrNames androidAbis)}' \
+          '  RUTTER_ROOT  project root (default: the current directory)'
         ;;
 
       *)
@@ -880,6 +1318,8 @@ let
       # anything.
       pkgs.zip
       pkgs.unzip
+      # `rutter noaa` fetches chart cells and the product catalogue.
+      pkgs.curl
     ] ++ linuxRuntimeLibs;
 
     JAVA_HOME = "${pkgs.jdk_headless}";

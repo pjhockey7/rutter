@@ -12,9 +12,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# 2021 rather than 2024: the Android NDK's bundled toolchain lags, and nothing
-# here needs a 2024 feature. Revisit when the Android side is settled.
-rust-version = "1.82"
+# Raised from 1.82 to take egui 0.37, which is the first release on wgpu 30.
+#
+# The old floor was justified by "the Android NDK's bundled toolchain lags",
+# which was simply wrong: nothing here compiles with the NDK's Rust. The Rust
+# comes from rust-overlay (currently 1.99), and the NDK only supplies clang
+# for linking and for the C in SQLite. There was never a reason to hold back.
+rust-version = "1.95"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
@@ -31,6 +35,23 @@ log = "0.4"
 env_logger = "0.11"
 android-activity = "0.6"
 android_logger = "0.14"
+
+# egui for the interface. Chosen because it renders into an existing wgpu
+# render pass rather than owning the window, which is what an overlay on a
+# chart needs — and because it is pure Rust, so it cross-compiles to the
+# Android ABIs like everything else here.
+#
+# The versions are coupled: egui-wgpu must be built against the same wgpu as
+# the renderer, or the two link separate copies and nothing matches. 0.37 is
+# the first egui release on wgpu 30.
+# `default_fonts` must be asked for explicitly. egui 0.37 changed `default`
+# to the empty set — it included the fonts up to 0.31 — so a plain
+# `egui = "0.37"` compiles with no font data at all and every glyph renders
+# as an empty box. The symptom looks like a broken texture upload and is
+# nothing of the kind.
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+egui-winit = "0.37"
 
 [workspace.lints.rust]
 # The core is the part that has to be right; unsafe belongs only in the

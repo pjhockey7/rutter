@@ -326,3 +326,251 @@ mod tests {
         assert!(metres_per_pixel(60.0, 12) < metres_per_pixel(0.0, 12));
     }
 }
+
+// ── Chart feature styling ───────────────────────────────────────────────────
+
+/// What kind of chart feature a piece of geometry is.
+///
+/// This lives in `core` because it is the shared vocabulary between the crate
+/// that *reads* charts and the crate that *draws* them, and neither should
+/// have to depend on the other. `rutter-charts` maps S-57 object classes onto
+/// these; `rutter-render` maps these onto colours and widths.
+///
+/// It is deliberately coarse. S-57 defines over 170 object classes and a real
+/// chart renderer distinguishes most of them, but a dozen categories is the
+/// difference between "a jumble of identical lines" and "a chart you can
+/// read", and the rest is refinement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ChartStyle {
+    /// Coastline — the single most important line on any chart.
+    Coastline,
+    /// Land areas, drawn behind everything else.
+    Land,
+    /// Depth areas: the bands between contours.
+    DepthArea,
+    /// Depth contours, including the safety contour.
+    DepthContour,
+    /// Spot soundings.
+    Sounding,
+    /// Buoys of any category.
+    Buoy,
+    /// Fixed marks: beacons, daymarks, towers.
+    Beacon,
+    /// Lights and light sectors.
+    Light,
+    /// Wrecks, rocks, obstructions — the things that end a passage.
+    Danger,
+    /// Administrative and advisory areas: anchorages, restricted zones,
+    /// traffic separation.
+    Area,
+    /// Anything unclassified.
+    #[default]
+    Other,
+}
+
+impl ChartStyle {
+    /// Draw order, low to high. Land and depth areas belong underneath the
+    /// marks and dangers that sit on top of them.
+    ///
+    /// Returned as a small integer rather than relying on enum order, so the
+    /// variants can be reordered or added to without silently changing what
+    /// is drawn over what.
+    pub fn depth_order(self) -> u8 {
+        match self {
+            Self::Land => 0,
+            Self::DepthArea => 1,
+            Self::Area => 2,
+            Self::DepthContour => 3,
+            Self::Coastline => 4,
+            Self::Sounding => 5,
+            Self::Buoy | Self::Beacon | Self::Light => 6,
+            Self::Danger => 7,
+            Self::Other => 2,
+        }
+    }
+
+    /// Whether this feature is a point mark rather than linework.
+    pub fn is_mark(self) -> bool {
+        matches!(
+            self,
+            Self::Sounding | Self::Buoy | Self::Beacon | Self::Light | Self::Danger
+        )
+    }
+}
+
+/// A polyline with its feature type. Polygon rings arrive as these too —
+/// filling needs a triangulator, which is not written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyledLine {
+    pub style: ChartStyle,
+    pub points: Vec<WorldXY>,
+}
+
+/// A point feature with its type and, where the chart gave one, its value —
+/// a sounding's depth, a light's height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StyledPoint {
+    pub style: ChartStyle,
+    pub at: WorldXY,
+    pub value: Option<f64>,
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    #[test]
+    fn land_and_depths_draw_under_marks() {
+        for under in [ChartStyle::Land, ChartStyle::DepthArea] {
+            for over in [
+                ChartStyle::Coastline,
+                ChartStyle::Sounding,
+                ChartStyle::Buoy,
+                ChartStyle::Danger,
+            ] {
+                assert!(
+                    under.depth_order() < over.depth_order(),
+                    "{under:?} should draw under {over:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dangers_draw_on_top_of_everything() {
+        let danger = ChartStyle::Danger.depth_order();
+        for other in [
+            ChartStyle::Land,
+            ChartStyle::DepthArea,
+            ChartStyle::DepthContour,
+            ChartStyle::Coastline,
+            ChartStyle::Sounding,
+            ChartStyle::Buoy,
+            ChartStyle::Beacon,
+            ChartStyle::Light,
+            ChartStyle::Area,
+            ChartStyle::Other,
+        ] {
+            assert!(
+                danger >= other.depth_order(),
+                "a danger must not be hidden under {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marks_are_points_and_linework_is_not() {
+        for s in [
+            ChartStyle::Sounding,
+            ChartStyle::Buoy,
+            ChartStyle::Beacon,
+            ChartStyle::Light,
+            ChartStyle::Danger,
+        ] {
+            assert!(s.is_mark(), "{s:?} should be a mark");
+        }
+        for s in [
+            ChartStyle::Coastline,
+            ChartStyle::Land,
+            ChartStyle::DepthArea,
+            ChartStyle::DepthContour,
+        ] {
+            assert!(!s.is_mark(), "{s:?} should not be a mark");
+        }
+    }
+
+    #[test]
+    fn the_default_is_unclassified() {
+        assert_eq!(ChartStyle::default(), ChartStyle::Other);
+    }
+}
+
+// ── Raster imagery ──────────────────────────────────────────────────────────
+
+/// One decoded raster tile, ready for upload as a texture.
+///
+/// In `core` for the same reason [`StyledLine`] is: it is the vocabulary
+/// shared between the crate that reads imagery and the crate that draws it,
+/// and neither should have to depend on the other. `rutter-charts` produces
+/// these from JPEG or PNG; `rutter-render` turns them into textures.
+///
+/// Always RGBA8, because that is what every GPU backend accepts without
+/// negotiation — the few bytes wasted on an opaque alpha channel are not
+/// worth a format-capability dance.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TileImage {
+    pub id: TileId,
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` bytes, row-major from the top-left.
+    pub rgba: Vec<u8>,
+}
+
+impl TileImage {
+    /// Whether the buffer length matches the stated dimensions.
+    ///
+    /// Worth checking before handing this to a GPU: a mismatch there is a
+    /// validation error or, worse, a read past the end of the buffer.
+    pub fn is_consistent(&self) -> bool {
+        self.rgba.len() == self.width as usize * self.height as usize * 4
+    }
+}
+
+impl core::fmt::Debug for TileImage {
+    /// Hand-written so a tile does not print a quarter of a megabyte of
+    /// pixels into a log line.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TileImage")
+            .field("id", &self.id)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bytes", &self.rgba.len())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn consistency_checks_the_buffer_length() {
+        let good = TileImage {
+            id: TileId::default(),
+            width: 2,
+            height: 2,
+            rgba: vec![0; 2 * 2 * 4],
+        };
+        assert!(good.is_consistent());
+
+        let short = TileImage {
+            rgba: vec![0; 3],
+            ..good.clone()
+        };
+        assert!(!short.is_consistent(), "a short buffer must be caught");
+    }
+
+    #[test]
+    fn debug_does_not_print_the_pixels() {
+        let tile = TileImage {
+            id: TileId {
+                z: 13,
+                x: 1428,
+                y: 3308,
+            },
+            width: 256,
+            height: 256,
+            rgba: vec![7; 256 * 256 * 4],
+        };
+        let text = format!("{tile:?}");
+        assert!(
+            text.contains("262144"),
+            "should report the byte count: {text}"
+        );
+        assert!(
+            text.len() < 200,
+            "Debug output is far too long: {}",
+            text.len()
+        );
+    }
+}
