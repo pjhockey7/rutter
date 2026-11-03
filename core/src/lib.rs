@@ -27,8 +27,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod chart;
+pub mod depth;
 pub mod geo;
 pub mod tide;
+pub mod triangulate;
 pub mod weather;
 
 pub use geo::LatLon;
@@ -99,6 +101,43 @@ impl View {
             ..*self
         }
     }
+
+    /// Pixels on screen per unit of world coordinate.
+    ///
+    /// World coordinates run 0..1 across the whole Web Mercator square, so
+    /// this is the width in pixels of that square at the current zoom.
+    fn pixels_per_world(&self) -> f64 {
+        256.0 * 2f64.powf(self.zoom)
+    }
+
+    /// Where a position falls on the viewport, in pixels from the top-left.
+    ///
+    /// Positions off-screen simply come back negative or past the edge.
+    /// Clipping is the caller's business: a marker a few pixels outside
+    /// still needs drawing if its label or its touch target reaches in.
+    pub fn screen_of(&self, at: LatLon) -> (f64, f64) {
+        let scale = self.pixels_per_world();
+        let centre = chart::project(self.centre);
+        let world = chart::project(at);
+        (
+            f64::from(self.width_px) / 2.0 + (world.x - centre.x) * scale,
+            f64::from(self.height_px) / 2.0 + (world.y - centre.y) * scale,
+        )
+    }
+
+    /// The position under a point on the viewport. The inverse of
+    /// [`Self::screen_of`].
+    ///
+    /// Needed for tapping the chart — "what is here?" — and for zooming
+    /// about the cursor rather than the centre.
+    pub fn position_at(&self, x: f64, y: f64) -> LatLon {
+        let scale = self.pixels_per_world();
+        let centre = chart::project(self.centre);
+        chart::unproject(chart::WorldXY {
+            x: (centre.x + (x - f64::from(self.width_px) / 2.0) / scale).clamp(0.0, 1.0),
+            y: (centre.y + (y - f64::from(self.height_px) / 2.0) / scale).clamp(0.0, 1.0),
+        })
+    }
 }
 
 impl Default for View {
@@ -113,6 +152,69 @@ impl Default for View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_centre_projects_to_the_middle_of_the_viewport() {
+        let v = View::new(LatLon::new(32.68, -117.23), 12.0, 1280, 800);
+        let (x, y) = v.screen_of(v.centre);
+        assert!((x - 640.0).abs() < 1e-6, "x = {x}");
+        assert!((y - 400.0).abs() < 1e-6, "y = {y}");
+    }
+
+    #[test]
+    fn screen_and_position_round_trip() {
+        // The pair has to be an exact inverse or a tapped feature is not the
+        // one under the finger. Checked across the viewport, not just at the
+        // centre, because a sign or a half-width error shows only off-axis.
+        let v = View::new(LatLon::new(32.68, -117.23), 14.0, 1280, 800);
+        for &(x, y) in &[
+            (0.0, 0.0),
+            (640.0, 400.0),
+            (1280.0, 800.0),
+            (100.0, 700.0),
+            (1200.0, 50.0),
+        ] {
+            let back = v.screen_of(v.position_at(x, y));
+            assert!(
+                (back.0 - x).abs() < 1e-6 && (back.1 - y).abs() < 1e-6,
+                "({x}, {y}) came back as {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn north_is_up_and_east_is_right() {
+        // The one error this catches is a flipped y, which looks plausible
+        // on a square viewport and puts every marker in the wrong place.
+        let v = View::new(LatLon::new(32.68, -117.23), 12.0, 1280, 800);
+        let (_, north_y) = v.screen_of(LatLon::new(32.78, -117.23));
+        let (east_x, _) = v.screen_of(LatLon::new(32.68, -117.13));
+        assert!(
+            north_y < 400.0,
+            "north should be above centre, got {north_y}"
+        );
+        assert!(
+            east_x > 640.0,
+            "east should be right of centre, got {east_x}"
+        );
+    }
+
+    #[test]
+    fn the_viewport_corners_agree_with_bounds() {
+        // `bounds` and `screen_of` are two descriptions of the same
+        // viewport, written at different times. They have to agree.
+        let v = View::new(LatLon::new(32.68, -117.23), 13.0, 1024, 768);
+        let (nw, se) = v.bounds();
+
+        let (x, y) = v.screen_of(nw);
+        assert!(x.abs() < 1e-6 && y.abs() < 1e-6, "nw maps to ({x}, {y})");
+
+        let (x, y) = v.screen_of(se);
+        assert!(
+            (x - 1024.0).abs() < 1e-6 && (y - 768.0).abs() < 1e-6,
+            "se maps to ({x}, {y})"
+        );
+    }
 
     #[test]
     fn zoom_is_clamped_both_ways() {

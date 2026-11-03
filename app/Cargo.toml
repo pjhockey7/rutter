@@ -1,0 +1,23 @@
+[package]
+name = "rutter-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "rutter's application logic, independent of any platform"
+
+[dependencies]
+rutter-core.workspace = true
+rutter-charts.workspace = true
+rutter-tides.workspace = true
+rutter-render.workspace = true
+
+# The panel's own types come from rutter-render; this crate drives them, so
+# it needs egui to hand over a `Ui`. Not egui-winit: translating native
+# events is the one part of the interface that is genuinely per-platform.
+egui.workspace = true
+
+log.workspace = true
+
+[lints]
+workspace = true

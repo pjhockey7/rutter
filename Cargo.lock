@@ -2387,12 +2387,26 @@ version = "0.1.0"
 dependencies = [
  "android-activity",
  "android_logger",
+ "egui",
  "log",
  "pollster",
+ "rutter-app",
+ "rutter-charts",
+ "rutter-render",
+ "rutter-tides",
+ "winit",
+]
+
+[[package]]
+name = "rutter-app"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "log",
  "rutter-charts",
  "rutter-core",
  "rutter-render",
- "winit",
+ "rutter-tides",
 ]
 
 [[package]]
@@ -2419,9 +2433,10 @@ dependencies = [
  "env_logger",
  "log",
  "pollster",
+ "rutter-app",
  "rutter-charts",
- "rutter-core",
  "rutter-render",
+ "rutter-tides",
  "winit",
 ]
 
@@ -2435,6 +2450,15 @@ dependencies = [
  "log",
  "rutter-core",
  "wgpu",
+]
+
+[[package]]
+name = "rutter-tides"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rusqlite",
+ "rutter-core",
 ]
 
 [[package]]

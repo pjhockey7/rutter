@@ -13,6 +13,7 @@
 //! activity whose chart loading works quite differently.
 
 use rutter_core::chart::ChartStyle;
+use rutter_core::depth::{Clearance, Draft, Tally};
 
 /// What a chart layer looks like to the interface.
 ///
@@ -49,6 +50,112 @@ pub enum Action {
     SetImagery(bool),
     /// How strongly the imagery shows through, 0..1.
     SetImageryOpacity(f32),
+    /// Show or hide the tide stations.
+    SetTides(bool),
+    /// Predict for this station instead of the nearest one.
+    SelectTideStation(String),
+    /// Switch the under-keel check on or off.
+    SetDraftCheck(bool),
+    /// Change the boat's draft and the margin wanted under it.
+    SetDraft(Draft),
+}
+
+/// One high or low water, ready to print.
+///
+/// The strings are built by the platform rather than here. This crate has no
+/// clock and no timezone database, and giving it one so that a panel could
+/// format a time would be the wrong place for both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TideReading {
+    /// "High" or "Low".
+    pub label: String,
+    /// Clock time, with whatever zone the platform chose to name.
+    pub when: String,
+    /// How far off, as "in 2h 11m". Timezone-free, and the part you act on.
+    pub away: String,
+    /// Height above chart datum, formatted with its unit.
+    pub height: String,
+    /// Drives the colour. A high and a low should be tellable apart
+    /// without reading the word.
+    pub high: bool,
+}
+
+/// A tide station drawn over the chart.
+///
+/// Positions are in screen pixels, projected by the platform: it owns the
+/// [`rutter_core::View`], and duplicating the projection here would be a
+/// second place for it to go wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TideMarker {
+    pub x: f32,
+    pub y: f32,
+    pub id: String,
+    pub label: String,
+    /// The station currently being predicted for.
+    pub selected: bool,
+}
+
+/// What the panel knows about tides.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TideState {
+    /// Whether a station database is loaded at all. With none the controls
+    /// show disabled rather than vanishing, so it is clear the feature
+    /// exists and what is missing.
+    pub available: bool,
+    pub visible: bool,
+    /// Stations in the database.
+    pub stations: usize,
+    /// Name of the station being predicted for.
+    pub station: Option<String>,
+    /// The water now, formatted.
+    pub now: Option<String>,
+    /// The next few turning points.
+    pub next: Vec<TideReading>,
+    /// Heights across the plotted window, metres, evenly spaced.
+    pub curve: Vec<f32>,
+    /// Where "now" falls across that window, 0..1.
+    pub now_at: f32,
+    /// Stations to draw over the chart.
+    pub markers: Vec<TideMarker>,
+    pub attribution: Option<String>,
+}
+
+/// What the panel knows about the under-keel check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DraftState {
+    /// Whether the check can run at all: it needs both a chart to judge and
+    /// a tide to judge it against.
+    pub available: bool,
+    pub enabled: bool,
+    pub draft: Draft,
+    /// What the last drawn chart judged.
+    pub tally: Tally,
+    /// The tide now and at the window's low water, metres above datum, for
+    /// the explanation line. The panel does the subtraction so the reader
+    /// does not have to.
+    pub tide_now_m: f64,
+    pub tide_low_m: f64,
+    /// How far ahead the low water was looked for, hours.
+    pub window_hours: u32,
+    /// Areas in view that could not be shaded because their polygon could
+    /// not be tiled exactly. Shown when non-zero, because a shading layer
+    /// with silent gaps is worse than one that admits them.
+    pub unfilled: usize,
+}
+
+impl Default for DraftState {
+    fn default() -> Self {
+        Self {
+            available: false,
+            enabled: false,
+            draft: Draft::default(),
+            tally: Tally::default(),
+            tide_now_m: 0.0,
+            tide_low_m: 0.0,
+            window_hours: 12,
+            unfilled: 0,
+        }
+    }
 }
 
 /// What the panel knows about the imagery underlay.
@@ -144,9 +251,17 @@ impl Ui {
         root: &mut egui::Ui,
         layers: &[LayerEntry],
         imagery: &ImageryState,
+        tides: &TideState,
+        draft: &DraftState,
         status: &str,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
+
+        // Station markers first, in a background layer so the panels draw
+        // over them rather than the other way round.
+        if tides.visible {
+            actions.extend(Self::paint_tide_markers(root, tides));
+        }
 
         // An always-visible strip, so there is something to click when the
         // panel is closed and somewhere for the position readout to live.
@@ -245,6 +360,10 @@ impl Ui {
                 }
 
                 ui.separator();
+                actions.extend(Self::tide_section(ui, tides));
+                ui.separator();
+                actions.extend(Self::draft_section(ui, draft));
+                ui.separator();
 
                 if layers.is_empty() {
                     ui.label("No chart loaded.");
@@ -335,6 +454,410 @@ impl Ui {
                     }
                 });
             });
+
+        actions
+    }
+
+    /// The under-keel check: the boat, and what the chart says about it.
+    ///
+    /// This is the control that turns the tide from a number into an answer.
+    /// Everything above it describes the water; this asks whether the boat
+    /// fits in it.
+    fn draft_section(ui: &mut egui::Ui, state: &DraftState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = state.enabled;
+            let toggle = ui.add_enabled(
+                state.available,
+                egui::Checkbox::new(&mut on, "Under-keel check"),
+            );
+            if toggle.clicked() {
+                actions.push(Action::SetDraftCheck(on));
+            }
+            if !state.available {
+                toggle.on_hover_text(
+                    "Needs both a chart with depths and a tide station. \
+                     Fetch stations with `rutter tides --near <lat>,<lon>`.",
+                );
+            }
+        });
+
+        if !state.available || !state.enabled {
+            return actions;
+        }
+
+        // Both numbers are drag-values rather than text fields: on a phone
+        // in a cockpit, dragging a number is possible and typing is not.
+        let mut draft = state.draft;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("draft");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut draft.draft_m)
+                        .speed(0.05)
+                        .range(0.0..=20.0)
+                        .suffix(" m"),
+                )
+                .changed();
+            ui.label("+ margin");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut draft.safety_m)
+                        .speed(0.05)
+                        .range(0.0..=10.0)
+                        .suffix(" m"),
+                )
+                .on_hover_text(
+                    "Water you want left under the keel. Worth at least \
+                     0.3 m here: the tide prediction is astronomical only \
+                     and takes no account of pressure or wind.",
+                )
+                .changed();
+        });
+        if changed {
+            actions.push(Action::SetDraft(draft));
+        }
+
+        ui.label(
+            egui::RichText::new(format!("needs {:.2} m of water", draft.needed_m()))
+                .weak()
+                .small(),
+        );
+
+        // The arithmetic, spelled out. The whole feature is one subtraction,
+        // and showing it is what makes the colours trustworthy rather than
+        // magic.
+        let needed = draft.needed_m();
+        ui.label(
+            egui::RichText::new(format!(
+                "clears soundings ≥ {:.2} m now, ≥ {:.2} m within {} h",
+                needed - state.tide_now_m,
+                needed - state.tide_low_m,
+                state.window_hours
+            ))
+            .weak()
+            .small(),
+        );
+
+        // On a rising tide the window's low water *is* now, so nothing can
+        // get shallower and the amber count is legitimately zero. Without
+        // saying so, a zero reads as a broken check rather than as good
+        // news — which is the wrong way round for the one number here that
+        // means "you have time".
+        if state.tide_low_m >= state.tide_now_m - 0.005 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "tide is rising — nothing gets shallower for {} h",
+                    state.window_hours
+                ))
+                .weak()
+                .small(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "tide falls {:.2} m before its low",
+                    state.tide_now_m - state.tide_low_m
+                ))
+                .weak()
+                .small(),
+            );
+        }
+
+        let t = state.tally;
+        if t.total() == 0 {
+            ui.label(
+                egui::RichText::new("nothing with a charted depth in view")
+                    .weak()
+                    .small(),
+            );
+            return actions;
+        }
+
+        for (count, verdict, label) in [
+            (t.foul, Clearance::Foul, "no water now"),
+            (
+                t.tight_at_low,
+                Clearance::TightAtLow,
+                "dries out within the window",
+            ),
+            (t.clear, Clearance::Clear, "clear"),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                let [r, g, b, _] = crate::colour_for_clearance(verdict);
+                ui.painter().rect_filled(
+                    rect,
+                    2.0,
+                    egui::Color32::from_rgb(
+                        (r * 255.0) as u8,
+                        (g * 255.0) as u8,
+                        (b * 255.0) as u8,
+                    ),
+                );
+                ui.label(format!("{count}"));
+                ui.label(egui::RichText::new(label).weak().small());
+            });
+        }
+
+        if !t.any_concern() {
+            ui.label(
+                egui::RichText::new("everything in view clears through the window")
+                    .weak()
+                    .small(),
+            );
+        }
+
+        if state.unfilled > 0 {
+            // Not a warning colour, but not hidden either: the shading is
+            // incomplete and the navigator should know which way to read a
+            // gap. The outline and the soundings are still drawn there.
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} area{} outlined but not shaded",
+                    state.unfilled,
+                    if state.unfilled == 1 { "" } else { "s" }
+                ))
+                .weak()
+                .small(),
+            )
+            .on_hover_text(
+                "These polygons could not be divided into triangles exactly,                  so they carry no fill. Their boundary and their soundings                  are still drawn — read an unshaded patch as unknown rather                  than as clear water.",
+            );
+        }
+
+        actions
+    }
+
+    /// Colour for a high or a low water.
+    ///
+    /// Rising water is the safe direction and falling is the one that puts
+    /// you on the bottom, so a low reads as the warning.
+    fn tide_colour(high: bool) -> egui::Color32 {
+        if high {
+            egui::Color32::from_rgb(0x6c, 0xc6, 0xff)
+        } else {
+            egui::Color32::from_rgb(0xff, 0xb3, 0x4d)
+        }
+    }
+
+    /// The tide block in the panel: station, water now, next turning points,
+    /// and a plot of the window around now.
+    fn tide_section(ui: &mut egui::Ui, tides: &TideState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = tides.visible;
+            let toggle = ui.add_enabled(tides.available, egui::Checkbox::new(&mut on, "Tides"));
+            if toggle.clicked() {
+                actions.push(Action::SetTides(on));
+            }
+            if tides.available {
+                ui.label(
+                    egui::RichText::new(format!("{} stations", tides.stations))
+                        .weak()
+                        .small(),
+                );
+            } else {
+                toggle.on_hover_text(
+                    "No tide stations loaded. Fetch some with \
+                     `rutter tides --near <lat>,<lon>`.",
+                );
+            }
+        });
+
+        if !tides.available || !tides.visible {
+            return actions;
+        }
+
+        if let Some(station) = &tides.station {
+            ui.label(egui::RichText::new(station).strong());
+        }
+        if let Some(now) = &tides.now {
+            ui.horizontal(|ui| {
+                ui.label(format!("now  {now}"));
+                // Say what the number is measured from, every time it is
+                // shown. Without this the natural reading is "the water is
+                // 0.21 m deep", when it means "0.21 m more than the chart
+                // says" — and when the figure goes negative, which it does
+                // on a spring low, it means 0.11 m *less*. That is the
+                // difference between a sounding you clear and one you do
+                // not, so the label is not decoration.
+                ui.label(egui::RichText::new("above datum").weak().small())
+                    .on_hover_text(
+                        "Heights are above chart datum (MLLW), the same zero the \
+                     chart's soundings use. Depth at a spot = charted \
+                     sounding + this figure. A negative figure means less \
+                     water than the chart prints.\n\nAstronomical tide only \
+                     — no allowance for barometric pressure or wind, which \
+                     can shift the real level by 0.2-0.3 m.",
+                    );
+            });
+        }
+
+        if !tides.curve.is_empty() {
+            Self::plot_tide(ui, tides);
+        }
+
+        for reading in &tides.next {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&reading.label)
+                        .color(Self::tide_colour(reading.high))
+                        .strong(),
+                );
+                ui.label(&reading.when);
+                ui.label(egui::RichText::new(&reading.height).strong());
+                ui.label(egui::RichText::new(&reading.away).weak().small());
+            });
+        }
+
+        if let Some(credit) = &tides.attribution {
+            ui.label(egui::RichText::new(credit).weak().small());
+        }
+
+        actions
+    }
+
+    /// The tide curve, drawn with the painter rather than a plotting crate.
+    ///
+    /// It is a polyline, a baseline at chart datum and a cursor at now —
+    /// not worth a dependency, and a dependency would have to cross-compile
+    /// to four Android ABIs to earn its place.
+    fn plot_tide(ui: &mut egui::Ui, tides: &TideState) {
+        const HEIGHT: f32 = 56.0;
+
+        let width = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+
+        let lowest = tides.curve.iter().copied().fold(f32::MAX, f32::min);
+        let highest = tides.curve.iter().copied().fold(f32::MIN, f32::max);
+        // A flat curve would divide by zero. It should not happen with real
+        // constituents, but a station reduced to one tiny term could.
+        let span = (highest - lowest).max(0.01);
+
+        let plot = rect.shrink2(egui::vec2(0.0, 6.0));
+        let at = |i: usize, metres: f32| {
+            let x = if tides.curve.len() > 1 {
+                i as f32 / (tides.curve.len() - 1) as f32
+            } else {
+                0.5
+            };
+            egui::pos2(
+                plot.left() + x * plot.width(),
+                // Screen y grows downward, water upward.
+                plot.bottom() - ((metres - lowest) / span) * plot.height(),
+            )
+        };
+
+        painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+
+        // Chart datum, if it falls inside the window: the line below which
+        // a sounding no longer has the depth printed on it.
+        if lowest < 0.0 && highest > 0.0 {
+            let y = at(0, 0.0).y;
+            painter.line_segment(
+                [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+                egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+            );
+        }
+
+        let points: Vec<egui::Pos2> = tides
+            .curve
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| at(i, m))
+            .collect();
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(1.5, Self::tide_colour(true)),
+        ));
+
+        // Where we are on it.
+        let x = plot.left() + tides.now_at.clamp(0.0, 1.0) * plot.width();
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0, ui.visuals().strong_text_color()),
+        );
+
+        painter.text(
+            rect.left_bottom() + egui::vec2(3.0, -1.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{lowest:.1}"),
+            egui::FontId::proportional(9.0),
+            ui.visuals().weak_text_color(),
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(3.0, 1.0),
+            egui::Align2::LEFT_TOP,
+            format!("{highest:.1} m"),
+            egui::FontId::proportional(9.0),
+            ui.visuals().weak_text_color(),
+        );
+    }
+
+    /// Station markers over the chart, and clicks on them.
+    fn paint_tide_markers(root: &mut egui::Ui, tides: &TideState) -> Vec<Action> {
+        const RADIUS: f32 = 5.0;
+        // Generous next to the 5 px dot: this has to be hittable with a
+        // thumb on a phone, not just a mouse.
+        const TOUCH: f32 = 14.0;
+
+        let mut actions = Vec::new();
+        if tides.markers.is_empty() {
+            return actions;
+        }
+
+        let painter = root.painter();
+        let fill = Self::tide_colour(true);
+
+        for marker in &tides.markers {
+            let centre = egui::pos2(marker.x, marker.y);
+            if !painter.clip_rect().expand(TOUCH).contains(centre) {
+                continue;
+            }
+
+            // A ring rather than a disc, so the chart under it still reads.
+            painter.circle_stroke(
+                centre,
+                RADIUS,
+                egui::Stroke::new(if marker.selected { 2.5 } else { 1.5 }, fill),
+            );
+            if marker.selected {
+                painter.circle_filled(centre, RADIUS - 2.0, fill);
+                painter.text(
+                    centre + egui::vec2(RADIUS + 4.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    &marker.label,
+                    egui::FontId::proportional(11.0),
+                    fill,
+                );
+            }
+
+            let hit = egui::Rect::from_center_size(centre, egui::Vec2::splat(TOUCH * 2.0));
+            let response = root.interact(
+                hit,
+                // `unique` means "not scoped by the parent widget", not
+                // "different every frame": it hashes the source, so the same
+                // station keeps the same id across frames and egui can track
+                // the click.
+                egui::Id::unique(("tide-marker", &marker.id)),
+                egui::Sense::click(),
+            );
+            if response.clicked() {
+                actions.push(Action::SelectTideStation(marker.id.clone()));
+            }
+            if response.hovered() && !marker.selected {
+                response.on_hover_text(&marker.label);
+            }
+        }
 
         actions
     }
@@ -538,11 +1061,254 @@ mod font_tests {
             attribution: Some("Imagery: USGS National Map".to_owned()),
         };
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            ui_state.show(ui, &entries, &imagery, "32°40.80'N  117°13.80'W   z12.0");
+            ui_state.show(
+                ui,
+                &entries,
+                &imagery,
+                &populated_tides(),
+                &populated_draft(),
+                "32°40.80'N  117°13.80'W   z12.0",
+            );
         });
         let mut textures = output.textures_delta;
 
         assert!(!textures.set.is_empty(), "the panel produced no font atlas");
         textures.clear();
+    }
+
+    /// A tide state with everything filled in, for the panel tests.
+    fn populated_tides() -> TideState {
+        TideState {
+            available: true,
+            visible: true,
+            stations: 11,
+            station: Some("SAN DIEGO (Broadway)".to_owned()),
+            now: Some("+1.24 m".to_owned()),
+            next: vec![
+                TideReading {
+                    label: "High".to_owned(),
+                    when: "15:25Z".to_owned(),
+                    away: "in 2h 11m".to_owned(),
+                    height: "1.95 m".to_owned(),
+                    high: true,
+                },
+                TideReading {
+                    label: "Low".to_owned(),
+                    when: "22:18Z".to_owned(),
+                    away: "in 9h 04m".to_owned(),
+                    height: "-0.39 m".to_owned(),
+                    high: false,
+                },
+            ],
+            // A plausible mixed semidiurnal shape, including water below
+            // chart datum so the datum line is exercised.
+            curve: (0..120i16)
+                .map(|i| {
+                    let t = f32::from(i) * 0.05;
+                    0.9 + 0.9 * t.sin() + 0.3 * (2.0 * t).cos()
+                })
+                .collect(),
+            now_at: 0.125,
+            markers: vec![
+                TideMarker {
+                    x: 320.0,
+                    y: 240.0,
+                    id: "9410170".to_owned(),
+                    label: "SAN DIEGO (Broadway)".to_owned(),
+                    selected: true,
+                },
+                TideMarker {
+                    x: 80.0,
+                    y: 400.0,
+                    id: "9410079".to_owned(),
+                    label: "Avalon, Santa Catalina Island".to_owned(),
+                    selected: false,
+                },
+            ],
+            attribution: Some("Tides: NOAA CO-OPS (public domain)".to_owned()),
+        }
+    }
+
+    /// A draft state with the check on and something to report.
+    fn populated_draft() -> DraftState {
+        DraftState {
+            available: true,
+            enabled: true,
+            draft: Draft {
+                draft_m: 1.5,
+                safety_m: 0.5,
+            },
+            tally: Tally {
+                clear: 112,
+                tight_at_low: 9,
+                foul: 37,
+            },
+            tide_now_m: 0.209,
+            tide_low_m: -0.112,
+            window_hours: 12,
+            unfilled: 2,
+        }
+    }
+
+    /// Run one frame of the panel and hand back the tessellated output.
+    fn one_frame(tides: &TideState) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut ui_state = Ui {
+            open: true,
+            ..Ui::default()
+        };
+        let entries = vec![LayerEntry {
+            name: "COALNE".to_owned(),
+            style: ChartStyle::Coastline,
+            visible: true,
+            count: Some(139),
+        }];
+        let imagery = ImageryState::default();
+
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui_state.show(ui, &entries, &imagery, tides, &populated_draft(), "status");
+        })
+    }
+
+    #[test]
+    fn the_tide_panel_draws_without_panicking() {
+        // The curve plot does its own arithmetic — normalising heights,
+        // finding the datum line — and a division by a zero span or an
+        // empty slice would take the whole app down mid-frame rather than
+        // showing a bad graph.
+        let mut output = one_frame(&populated_tides());
+        assert!(!output.textures_delta.set.is_empty());
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_flat_or_empty_tide_curve_does_not_divide_by_zero() {
+        // A station reduced to one tiny constituent, or none at all.
+        for curve in [vec![], vec![0.5; 40], vec![f32::MIN_POSITIVE; 40]] {
+            let tides = TideState {
+                curve,
+                ..populated_tides()
+            };
+            let mut output = one_frame(&tides);
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn a_single_point_curve_is_drawn_not_skipped() {
+        // `len() - 1` as a divisor is zero here, which is the obvious way
+        // to write the x step and the obvious way to crash.
+        let tides = TideState {
+            curve: vec![1.0],
+            ..populated_tides()
+        };
+        let mut output = one_frame(&tides);
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn markers_far_off_screen_are_skipped() {
+        // A station a thousand screens away still arrives in the list when
+        // the viewport is wide; painting it is wasted and egui will have
+        // allocated an interaction id for it.
+        let tides = TideState {
+            markers: vec![TideMarker {
+                x: 1.0e6,
+                y: -1.0e6,
+                id: "far".to_owned(),
+                label: "Far away".to_owned(),
+                selected: false,
+            }],
+            ..populated_tides()
+        };
+        let mut output = one_frame(&tides);
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn tides_with_no_database_still_show_the_control() {
+        // Hiding the control when nothing is loaded makes the feature
+        // invisible; showing it disabled says what is missing.
+        let tides = TideState::default();
+        let mut output = one_frame(&tides);
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn the_three_clearance_colours_are_distinct() {
+        // Red/green alone is a poor signal; these also drive the mark size
+        // in the renderer. But they must at least differ, or the amber
+        // "fine now, not later" state is invisible.
+        let clear = crate::colour_for_clearance(Clearance::Clear);
+        let tight = crate::colour_for_clearance(Clearance::TightAtLow);
+        let foul = crate::colour_for_clearance(Clearance::Foul);
+        assert_ne!(clear, tight);
+        assert_ne!(tight, foul);
+        assert_ne!(clear, foul);
+    }
+
+    #[test]
+    fn the_draft_panel_renders_in_every_state() {
+        // Each of these took a different path through the section, and one
+        // of them — the rising-tide line — exists only to explain a zero.
+        let states = [
+            DraftState::default(),
+            DraftState {
+                available: true,
+                enabled: false,
+                ..populated_draft()
+            },
+            populated_draft(),
+            // Rising tide: the window's low is now, so nothing worsens.
+            DraftState {
+                tide_low_m: 0.209,
+                tally: Tally {
+                    clear: 100,
+                    tight_at_low: 0,
+                    foul: 5,
+                },
+                ..populated_draft()
+            },
+            // Nothing judged at all, which is the "attributes lost" case.
+            DraftState {
+                tally: Tally::default(),
+                ..populated_draft()
+            },
+            // Everything clear.
+            DraftState {
+                tally: Tally {
+                    clear: 500,
+                    tight_at_low: 0,
+                    foul: 0,
+                },
+                ..populated_draft()
+            },
+        ];
+
+        for state in states {
+            let ctx = egui::Context::default();
+            let mut ui_state = Ui {
+                open: true,
+                ..Ui::default()
+            };
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui_state.show(
+                    ui,
+                    &[],
+                    &ImageryState::default(),
+                    &TideState::default(),
+                    &state,
+                    "status",
+                );
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn a_high_and_a_low_are_different_colours() {
+        // The words "High" and "Low" are four characters apart on a small
+        // screen in the rain. The colour is the real signal.
+        assert_ne!(Ui::tide_colour(true), Ui::tide_colour(false));
     }
 }

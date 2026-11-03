@@ -404,6 +404,30 @@ impl ChartStyle {
 pub struct StyledLine {
     pub style: ChartStyle,
     pub points: Vec<WorldXY>,
+    /// The depth this line is about, where the chart gave one: a contour's
+    /// own value, or a depth area's shallowest.
+    ///
+    /// Lines carry a value for the same reason points do, and it matters
+    /// more here: soundings are scattered dots, while depth areas tile the
+    /// whole chart. Colouring an area's outline by whether the boat clears
+    /// it turns a handful of flagged dots into a readable picture of where
+    /// the water is.
+    pub value: Option<f64>,
+}
+
+/// A filled region: a polygon's triangles, with what it is and how deep.
+///
+/// Separate from [`StyledLine`] rather than replacing it, because a chart
+/// draws both: the fill gives the area its colour and the ring gives it its
+/// boundary. Dropping the outlines in favour of fills would lose the
+/// coastline, which is the strongest line on any chart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyledArea {
+    pub style: ChartStyle,
+    /// The area's shallowest depth, for a depth area. See [`StyledLine`].
+    pub value: Option<f64>,
+    /// Triangles covering the region, holes already excluded.
+    pub triangles: Vec<[WorldXY; 3]>,
 }
 
 /// A point feature with its type and, where the chart gave one, its value —

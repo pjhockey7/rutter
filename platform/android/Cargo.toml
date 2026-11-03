@@ -14,9 +14,14 @@ name = "rutter"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rutter-core.workspace = true
+rutter-app.workspace = true
 rutter-charts.workspace = true
 rutter-render.workspace = true
+rutter-tides.workspace = true
+
+# egui, but not egui-winit: raw touches are translated by hand here. See the
+# note on EguiState.
+egui.workspace = true
 # No wgpu dependency — see platform/linux/Cargo.toml.
 pollster.workspace = true
 log.workspace = true

@@ -950,3 +950,38 @@ fn imagery_survives_zooming_out() {
         );
     }
 }
+
+#[test]
+fn imagery_survives_zooming_in_past_the_deepest_level() {
+    use rutter_charts::ImagerySource;
+    use rutter_core::View;
+
+    let Some(path) = imagery_path() else {
+        eprintln!("skipping: no build/charts/imagery.mbtiles");
+        return;
+    };
+
+    let mut source = ImagerySource::open(&path).expect("open");
+    let deepest = source.metadata().max_zoom;
+
+    // The other half of the same problem. Past the deepest stored level
+    // there is nothing more to fetch, so the right behaviour is to keep
+    // drawing the deepest tiles magnified — blurry, but a blurry photograph
+    // of the right place beats no photograph. The clamp is what makes that
+    // happen, and dropping it would blank the imagery exactly when you have
+    // zoomed in to look at something.
+    for past in 1..=3 {
+        let zoom = f64::from(deepest + past);
+        let view = View::new(LatLon::new(32.69, -117.20), zoom, 1280, 800);
+        let tiles = source.collect(&view);
+
+        assert!(
+            !tiles.is_empty(),
+            "zoom {zoom} ({past} past the deepest level {deepest}) drew no imagery"
+        );
+        assert!(
+            tiles.iter().all(|t| t.id.z == deepest),
+            "tiles past the deepest level should come from it, magnified"
+        );
+    }
+}

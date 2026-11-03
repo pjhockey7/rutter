@@ -1,0 +1,28 @@
+[package]
+name = "rutter-tides"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tide station database, read from the file `rutter tides` builds"
+
+[dependencies]
+rutter-core.workspace = true
+
+# Same bundled SQLite as rutter-charts, and for the same reason: Android
+# ships a libsqlite3 the NDK does not expose, so linking a system one would
+# make the build depend on the host distribution.
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+# A station with a constituent this build does not know is logged and
+# skipped rather than fatal.
+log.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Integration tests see only the public API and dev-dependencies, not this
+# crate's own dependencies — and they need to build fixture databases,
+# including ones that are deliberately not tide databases.
+rusqlite = { version = "0.41", features = ["bundled"] }

@@ -39,7 +39,8 @@ pub mod mvt;
 pub use imagery::ImagerySource;
 pub use mbtiles::{MbTiles, Metadata};
 
-use rutter_core::chart::{self, ChartStyle, StyledLine, StyledPoint, TileId, WorldXY};
+use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId, WorldXY};
+use rutter_core::triangulate::triangulate;
 use rutter_core::View;
 
 /// Classify an S-57 object class — or any other layer name — into a style.
@@ -90,6 +91,16 @@ fn value_attribute(style: ChartStyle) -> &'static [&'static str] {
         ChartStyle::Sounding => &["DEPTH", "depth"],
         ChartStyle::Danger => &["VALSOU", "valsou", "DEPTH", "depth"],
         ChartStyle::Light => &["HEIGHT", "height"],
+        // DRVAL1 is a depth area's *shallowest* depth, which is the one
+        // that decides whether a boat crosses it. DRVAL2, the deepest, is
+        // not read: knowing an area bottoms out at 91 m does not help when
+        // part of it is 1.8 m.
+        //
+        // Drying areas carry DRVAL1 negative — ground that uncovers is
+        // above chart datum — and the clearance arithmetic wants exactly
+        // that sign, so it is passed through unchanged.
+        ChartStyle::DepthArea => &["DRVAL1", "drval1"],
+        ChartStyle::DepthContour => &["VALDCO", "valdco"],
         _ => &[],
     }
 }
@@ -104,6 +115,21 @@ fn value_attribute(style: ChartStyle) -> &'static [&'static str] {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChartTile {
     pub id: TileId,
+    /// Areas whose polygon could not be tiled exactly, so carry no fill.
+    ///
+    /// Reported rather than swallowed. The triangulator refuses a ring it
+    /// cannot cover precisely — a self-overlapping one, which tile clipping
+    /// occasionally produces — and the result is a shoal that is outlined
+    /// but not shaded. With the under-keel check on that is an unshaded
+    /// hazard, so the count has to reach the navigator instead of a log.
+    pub unfilled: usize,
+    /// Filled regions — depth areas, land — as triangles.
+    ///
+    /// Triangulated here, at decode time, rather than in the renderer: it
+    /// is pure geometry, so it belongs on the portable side, and doing it
+    /// per tile means the result is cached with the tile instead of being
+    /// recomputed on every pan.
+    pub areas: Vec<StyledArea>,
     /// Polylines: linestrings as they came, plus one entry per polygon ring.
     /// Each carries the style of the layer it came from, which is the only
     /// reason the multi-layer pipeline exists.
@@ -122,6 +148,8 @@ impl ChartTile {
     pub fn from_mvt(id: TileId, tile: &mvt::Tile, layers: &[&str]) -> Self {
         let mut out = Self {
             id,
+            unfilled: 0,
+            areas: Vec::new(),
             lines: Vec::new(),
             points: Vec::new(),
         };
@@ -167,20 +195,65 @@ impl ChartTile {
                                 out.lines.push(StyledLine {
                                     style,
                                     points: line.iter().copied().map(to_world).collect(),
+                                    value,
                                 });
                             }
                         }
                     }
                     mvt::Geometry::Polygons(polygons) => {
                         for polygon in polygons {
+                            // Outlines first: a chart is read by its
+                            // boundaries, and the fill is the tint behind
+                            // them.
                             for ring in polygon.rings() {
                                 if ring.len() >= 2 {
                                     out.lines.push(StyledLine {
                                         style,
                                         points: ring.iter().copied().map(to_world).collect(),
+                                        value,
                                     });
                                 }
                             }
+
+                            // Then the fill, for the classes that are read
+                            // as regions. An advisory area or a traffic
+                            // scheme is a boundary with a label, and
+                            // flooding it with colour would bury the chart
+                            // under it.
+                            if !matches!(style, ChartStyle::Land | ChartStyle::DepthArea) {
+                                continue;
+                            }
+
+                            let exterior: Vec<WorldXY> =
+                                polygon.exterior.iter().copied().map(to_world).collect();
+                            let holes: Vec<Vec<WorldXY>> = polygon
+                                .holes
+                                .iter()
+                                .map(|h| h.iter().copied().map(to_world).collect())
+                                .collect();
+
+                            let triangles = triangulate(&exterior, &holes);
+                            if triangles.is_empty() {
+                                // The triangulator refuses a polygon it
+                                // cannot tile exactly rather than filling
+                                // over a hole. The outline is still drawn,
+                                // so the area does not vanish — it just
+                                // goes untinted.
+                                log::debug!(
+                                    "{}: {} could not be filled ({} points, {} holes)",
+                                    id.z,
+                                    layer.name,
+                                    exterior.len(),
+                                    holes.len()
+                                );
+                                out.unfilled += 1;
+                                continue;
+                            }
+                            out.areas.push(StyledArea {
+                                style,
+                                value,
+                                triangles,
+                            });
                         }
                     }
                     mvt::Geometry::Unknown => {}
@@ -191,6 +264,7 @@ impl ChartTile {
         // Draw order: land and depth areas under the marks that sit on them.
         // A stable sort, so features within one style keep the order the
         // chart gave them.
+        out.areas.sort_by_key(|a| a.style.depth_order());
         out.lines.sort_by_key(|l| l.style.depth_order());
         out.points.sort_by_key(|p| p.style.depth_order());
 
@@ -199,7 +273,7 @@ impl ChartTile {
 
     /// Whether there is anything to draw.
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty() && self.points.is_empty()
+        self.areas.is_empty() && self.lines.is_empty() && self.points.is_empty()
     }
 
     /// Total vertices across every polyline, for sizing a GPU buffer.
@@ -382,6 +456,8 @@ impl ChartSource {
 
         let mut out = Collected {
             tiles,
+            areas: Vec::new(),
+            unfilled: 0,
             lines: Vec::new(),
             points: Vec::new(),
             failed: Vec::new(),
@@ -411,6 +487,8 @@ impl ChartSource {
         for id in ids {
             match self.tile(id) {
                 Ok(tile) => {
+                    out.areas.extend(tile.areas.iter().cloned());
+                    out.unfilled += tile.unfilled;
                     out.lines.extend(tile.lines.iter().cloned());
                     out.points.extend(tile.points.iter().copied());
                 }
@@ -422,6 +500,7 @@ impl ChartSource {
         // concatenating them interleaves the styles again — and the next
         // tile's depth area drawn over this tile's soundings is exactly the
         // kind of wrongness that reads as a renderer bug.
+        out.areas.sort_by_key(|a| a.style.depth_order());
         out.lines.sort_by_key(|l| l.style.depth_order());
         out.points.sort_by_key(|p| p.style.depth_order());
 
@@ -436,6 +515,9 @@ pub struct Collected {
     /// against the previous call to decide whether a reupload is needed —
     /// most of a drag stays within the same tiles.
     pub tiles: Vec<TileId>,
+    pub areas: Vec<StyledArea>,
+    /// Areas across this view that carry no fill. See [`ChartTile::unfilled`].
+    pub unfilled: usize,
     pub lines: Vec<StyledLine>,
     pub points: Vec<StyledPoint>,
     /// Tiles that would not decode, with the reason. Empty in the normal
@@ -448,7 +530,7 @@ pub struct Collected {
 
 impl Collected {
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty() && self.points.is_empty()
+        self.areas.is_empty() && self.lines.is_empty() && self.points.is_empty()
     }
 
     /// Which feature types this viewport actually contains, in draw order.

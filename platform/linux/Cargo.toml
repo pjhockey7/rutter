@@ -11,9 +11,10 @@ name = "rutter"
 path = "src/main.rs"
 
 [dependencies]
-rutter-core.workspace = true
+rutter-app.workspace = true
 rutter-charts.workspace = true
 rutter-render.workspace = true
+rutter-tides.workspace = true
 
 # egui's winit glue: translates window events into egui input and applies
 # egui's requests (cursor shape, clipboard) back to the window. The drawing

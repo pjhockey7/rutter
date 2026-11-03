@@ -30,9 +30,12 @@
 
 pub mod ui;
 
-pub use ui::{Action, ImageryState, LayerEntry, Ui};
+pub use ui::{
+    Action, DraftState, ImageryState, LayerEntry, TideMarker, TideReading, TideState, Ui,
+};
 
-use rutter_core::chart::{self, ChartStyle, StyledLine, StyledPoint, TileId};
+use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};
+use rutter_core::depth::{self, Clearance, Draft, Tally, TideWindow};
 use rutter_core::View;
 
 /// Sea. Everything is drawn over this.
@@ -77,6 +80,85 @@ fn colour_for(style: ChartStyle) -> [f32; 4] {
         ChartStyle::Area => [0.70, 0.45, 0.70, 1.0],
         ChartStyle::Other => [0.55, 0.62, 0.68, 1.0],
     }
+}
+
+/// Colour for a clearance verdict, when a draft check is switched on.
+///
+/// These deliberately override the chart palette rather than blending with
+/// it. A sounding that the boat cannot pass should not look like a sounding
+/// drawn slightly differently; it should look like a warning, and it should
+/// be the loudest thing on that part of the chart.
+pub(crate) fn colour_for_clearance(clearance: Clearance) -> [f32; 4] {
+    match clearance {
+        // Green rather than the usual sounding blue: with the check on, the
+        // navigator is asking a yes/no question and wants the yes marked.
+        Clearance::Clear => [0.35, 0.85, 0.45, 1.0],
+        // Amber for "fine now, not later" — the state the chart alone
+        // cannot show, and the reason this feature exists.
+        Clearance::TightAtLow => [1.0, 0.72, 0.15, 1.0],
+        // The same red as a charted danger, because that is what it is.
+        Clearance::Foul => [1.0, 0.25, 0.25, 1.0],
+    }
+}
+
+/// Fill colour for an area, by what it is and how deep.
+///
+/// Returns `None` for a class that should not be flooded with colour.
+///
+/// Alpha matters as much as hue here. A chart fill has to tint without
+/// obscuring: the aerial imagery sits underneath, and burying it would undo
+/// the imagery layer. These are deliberately light.
+fn fill_colour_for(style: ChartStyle, value: Option<f64>) -> Option<[f32; 4]> {
+    match style {
+        // Land: the buff of a paper chart, strong enough to read as solid
+        // ground because nothing useful is underneath it.
+        ChartStyle::Land => Some([0.78, 0.71, 0.53, 0.85]),
+        ChartStyle::DepthArea => {
+            // Banded like a paper chart: the shallower the water, the paler
+            // and more conspicuous the tint. The bands are S-57's own
+            // common ones — 2, 5 and 10 m — rather than invented.
+            let depth = value.unwrap_or(f64::MAX);
+            Some(if depth < 0.0 {
+                // Drying: green on every chart in the world.
+                [0.55, 0.62, 0.40, 0.55]
+            } else if depth < 2.0 {
+                [0.62, 0.78, 0.86, 0.55]
+            } else if depth < 5.0 {
+                [0.44, 0.63, 0.76, 0.45]
+            } else if depth < 10.0 {
+                [0.28, 0.47, 0.63, 0.35]
+            } else {
+                // Deep water is the background, so barely tinted at all.
+                [0.14, 0.30, 0.45, 0.25]
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Fill colour for a clearance verdict.
+///
+/// `Clear` returns `None` on purpose. With the check on, the answer wanted
+/// is "where can I not go", and shading the safe water as well would bury
+/// that in green. Leaving it unshaded keeps the chart and the imagery
+/// readable everywhere the question does not apply.
+fn clearance_fill_for(clearance: Clearance) -> Option<[f32; 4]> {
+    match clearance {
+        Clearance::Clear => None,
+        Clearance::TightAtLow => Some([1.0, 0.72, 0.15, 0.40]),
+        Clearance::Foul => Some([1.0, 0.25, 0.25, 0.45]),
+    }
+}
+
+/// Everything needed to judge a charted depth: the boat and the tide.
+///
+/// Held as one value so that switching the check on and off is one
+/// assignment, and so that a stale tide cannot be paired with a fresh
+/// draft.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DraftCheck {
+    pub draft: Draft,
+    pub tide: TideWindow,
 }
 
 /// Half-size of a point mark, as a multiple of the computed base arm.
@@ -179,6 +261,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    /// Same vertices and shader as `pipeline`, triangles instead of lines.
+    fill_pipeline: wgpu::RenderPipeline,
     bind_layout: wgpu::BindGroupLayout,
     /// egui's wgpu backend, which owns its own pipelines and font atlas and
     /// draws into the chart's render pass.
@@ -189,6 +273,11 @@ pub struct Renderer {
     grid: Layer,
     /// Real chart geometry. Uploaded on change, then left alone.
     charts: Layer,
+    /// Filled areas, under the linework. Its own buffer because it is
+    /// drawn by a different pipeline and sized quite differently: a tile's
+    /// fills are thousands of triangles where its outlines are hundreds of
+    /// segments.
+    fills: Layer,
 
     /// Aerial imagery, drawn under everything else.
     imagery_pipeline: wgpu::RenderPipeline,
@@ -208,6 +297,12 @@ pub struct Renderer {
     imagery_sampler: wgpu::Sampler,
     /// Scratch, kept between frames so a redraw does not allocate.
     scratch: Vec<Vertex>,
+
+    /// The boat and the tide, when the navigator has asked the question.
+    /// `None` means draw the chart in its own colours.
+    draft_check: Option<DraftCheck>,
+    /// What the last chart upload judged, for the panel to report.
+    tally: Tally,
 }
 
 #[derive(Debug)]
@@ -439,6 +534,54 @@ impl Renderer {
             cache: None,
         });
 
+        // Filled areas: the same vertices, the same shader, the same bind
+        // group — only the topology differs. A second pipeline rather than
+        // a second shader, because a triangle and a line want exactly the
+        // same "offset from a reference point, plus a colour" treatment.
+        //
+        // No culling. Ear clipping gives consistent winding, but relying on
+        // that would mean a whole depth area silently vanishing if a ring's
+        // orientation were ever misread, and a chart that loses its shallow
+        // water without saying so is the wrong failure.
+        let fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("chart fills"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2,
+                        1 => Float32x4,
+                    ],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let fills = Layer::new(&device, &bind_layout, "fills", GRID_CAPACITY);
+
         // ── Imagery pipeline ───────────────────────────────────────────
         //
         // A second pipeline rather than a branch in the first: textured
@@ -586,10 +729,12 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            fill_pipeline,
             bind_layout,
             egui,
             grid,
             charts,
+            fills,
             imagery_pipeline,
             imagery_texture_layout,
             imagery_uniform,
@@ -601,6 +746,11 @@ impl Renderer {
             imagery_opacity: DEFAULT_IMAGERY_OPACITY,
             imagery_sampler,
             scratch: Vec::with_capacity(4096),
+            // Off until the navigator supplies a draft. Defaulting it on
+            // with a guessed draft would paint confident red over a chart
+            // nobody asked a question about.
+            draft_check: None,
+            tally: Tally::default(),
         })
     }
 
@@ -695,12 +845,26 @@ impl Renderer {
             egui_prepared = Some(descriptor);
         }
 
+        // Set by the Suboptimal arm below, and acted on only after the
+        // frame has been presented. Reconfiguring while a surface output is
+        // still alive is a validation error in wgpu 30 — "the SurfaceOutput
+        // returned by get_current_texture must be dropped before
+        // re-configuring" — and since errors are fatal by default it is a
+        // panic, not a warning.
+        //
+        // This crashed on X11 and not on Wayland, which is why it survived:
+        // X11 guesses a scale factor and resizes the window immediately
+        // after creating it, so the very first acquisition comes back
+        // Suboptimal. Wayland sizes the surface before the first frame and
+        // never takes this path.
+        let mut reconfigure_after_presenting = false;
+
         let frame = match self.surface.get_current_texture() {
             Acquired::Success(f) => f,
             // Suboptimal still gives a usable texture; draw into it and fix
             // the configuration for next time rather than dropping a frame.
             Acquired::Suboptimal(f) => {
-                self.reconfigure();
+                reconfigure_after_presenting = true;
                 f
             }
             Acquired::Timeout | Acquired::Occluded => return Frame::Skipped,
@@ -749,6 +913,16 @@ impl Renderer {
                 }
             }
 
+            // Fills under everything the line pipeline draws, so the
+            // linework reads on top of its own area's tint rather than
+            // being painted over by it.
+            if self.fills.count > 0 {
+                pass.set_pipeline(&self.fill_pipeline);
+                pass.set_bind_group(0, &self.fills.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.fills.vertices.slice(..));
+                pass.draw(0..self.fills.count, 0..1);
+            }
+
             pass.set_pipeline(&self.pipeline);
 
             // Grid first, chart over it: the grid is scaffolding and should
@@ -776,8 +950,17 @@ impl Renderer {
         }
 
         self.queue.submit(Some(encoder.finish()));
-        // Presenting is the queue's job in wgpu 30, not the texture's.
+        // Presenting is the queue's job in wgpu 30, not the texture's. It
+        // also consumes the surface output, which is what makes it safe to
+        // reconfigure immediately afterwards.
         self.queue.present(frame);
+
+        if reconfigure_after_presenting {
+            self.reconfigure();
+            // The frame was drawn, but at the old configuration, so the
+            // caller is asked for another one.
+            return Frame::Reconfigured;
+        }
         Frame::Drawn
     }
 
@@ -794,7 +977,7 @@ impl Renderer {
         ]
     }
 
-    /// Refresh both layers' uniforms, and the grid's vertices.
+    /// Refresh every layer's uniform, and the grid's vertices.
     ///
     /// The chart's vertices are deliberately absent: they were uploaded when
     /// the tile set changed and are still correct, because they are measured
@@ -803,7 +986,10 @@ impl Renderer {
         let scale = self.scale_for(view);
         let centre = chart::project(view.centre);
 
-        for layer in [&self.grid, &self.charts] {
+        // The fills share the chart's origin, but they have their own
+        // uniform buffer and so need their own write — a fill layer left
+        // on a stale origin slides off its own coastline as you pan.
+        for layer in [&self.grid, &self.charts, &self.fills] {
             // The subtraction happens in f64 and only the small difference
             // becomes f32. Projecting to f32 first would throw away the
             // precision this whole arrangement exists to keep.
@@ -872,7 +1058,49 @@ impl Renderer {
     /// rather than from the current view. That is what lets a pan leave this
     /// buffer untouched: tying the origin to the view would invalidate every
     /// vertex the moment the view moved.
-    pub fn set_chart(&mut self, lines: &[StyledLine], points: &[StyledPoint]) {
+    /// Switch the draft check on, or off with `None`.
+    ///
+    /// Does not itself redraw: the caller clears its loaded-tile list so the
+    /// geometry is rebuilt, the same way a layer toggle works. Colours live
+    /// in the vertex buffer, so changing a verdict means re-uploading it.
+    pub fn set_draft_check(&mut self, check: Option<DraftCheck>) {
+        self.draft_check = check;
+    }
+
+    pub fn draft_check(&self) -> Option<DraftCheck> {
+        self.draft_check
+    }
+
+    /// What the last `set_chart` judged.
+    pub fn clearance_tally(&self) -> Tally {
+        self.tally
+    }
+
+    /// The verdict for one feature, or `None` if the check does not apply.
+    ///
+    /// It applies only to styles whose value really is a depth below chart
+    /// datum. A light's HEIGHT is a height above it and a buoy has no depth
+    /// at all, so running them through the same arithmetic would paint
+    /// confident nonsense.
+    fn clearance_of(&self, style: ChartStyle, value: Option<f64>) -> Option<Clearance> {
+        let check = self.draft_check?;
+        let charted = value?;
+        matches!(
+            style,
+            ChartStyle::Sounding
+                | ChartStyle::Danger
+                | ChartStyle::DepthArea
+                | ChartStyle::DepthContour
+        )
+        .then(|| depth::assess(&check.draft, charted, &check.tide))
+    }
+
+    pub fn set_chart(
+        &mut self,
+        areas: &[StyledArea],
+        lines: &[StyledLine],
+        points: &[StyledPoint],
+    ) {
         let mut vertices: Vec<Vertex> = Vec::new();
 
         let origin = centroid(lines, points);
@@ -883,8 +1111,47 @@ impl Renderer {
         // land and depth areas arrive before the marks that sit on them.
         // Preserving it here is the whole reason this takes a slice rather
         // than something unordered.
+        // Judged once per feature, not per vertex: the verdict is a
+        // property of the feature's depth, and a polyline can be hundreds
+        // of vertices.
+        let mut tally = Tally::default();
+
+        // Fills go in their own buffer but share this origin, so one pan
+        // updates both uniforms consistently. Getting that wrong would
+        // slide the shading off its own coastline.
+        let mut fill_vertices: Vec<Vertex> = Vec::new();
+        for area in areas {
+            let colour = match self.clearance_of(area.style, area.value) {
+                // With the check on, a depth area is shaded by verdict and
+                // nothing else: its own depth band is exactly the
+                // information the verdict already folds in.
+                Some(verdict) => clearance_fill_for(verdict),
+                None => fill_colour_for(area.style, area.value),
+            };
+            let Some(colour) = colour else {
+                continue;
+            };
+            for triangle in &area.triangles {
+                for corner in triangle {
+                    fill_vertices.push(Vertex {
+                        offset: offset(*corner),
+                        colour,
+                    });
+                }
+            }
+        }
+
         for line in lines {
-            let colour = colour_for(line.style);
+            let colour = match self.clearance_of(line.style, line.value) {
+                Some(verdict) => {
+                    // Depth areas are the picture; contours are the same
+                    // information as a boundary. Both are counted so the
+                    // panel's tally is of features judged, not of dots.
+                    tally.count(verdict);
+                    colour_for_clearance(verdict)
+                }
+                None => colour_for(line.style),
+            };
             // A polyline of n points is n-1 separate segments under
             // LineList. A line strip topology would halve this, but it
             // cannot express several disconnected polylines in one draw.
@@ -908,8 +1175,26 @@ impl Renderer {
         let arm = point_arm(lines, points);
         for p in points {
             let c = offset(p.at);
-            let colour = colour_for(p.style);
-            let a = arm * mark_scale(p.style);
+            let (colour, emphasis) = match self.clearance_of(p.style, p.value) {
+                Some(verdict) => {
+                    tally.count(verdict);
+                    // Modest now that the area fills carry the signal. The
+                    // crosses were enlarged to 2.2x when they were the only
+                    // way to see a verdict; with the water itself shaded
+                    // they only need to be findable, not shouty — and a
+                    // sounding is still the more precise statement, since
+                    // one 1.2 m spot inside a 1.8-3.6 m band is invisible
+                    // in the band's own colour.
+                    let emphasis = match verdict {
+                        Clearance::Clear => 1.0,
+                        Clearance::TightAtLow => 1.2,
+                        Clearance::Foul => 1.5,
+                    };
+                    (colour_for_clearance(verdict), emphasis)
+                }
+                None => (colour_for(p.style), 1.0),
+            };
+            let a = arm * mark_scale(p.style) * emphasis;
             for (dx, dy) in [(a, 0.0), (0.0, a)] {
                 vertices.push(Vertex {
                     offset: [c[0] - dx, c[1] - dy],
@@ -924,6 +1209,24 @@ impl Renderer {
 
         self.charts.origin = origin;
         self.charts.count = vertices.len() as u32;
+        self.tally = tally;
+
+        self.fills.origin = origin;
+        self.fills.count = fill_vertices.len() as u32;
+        if !fill_vertices.is_empty() {
+            if fill_vertices.len() as u64 > self.fills.capacity {
+                let capacity = (fill_vertices.len() as u64).next_power_of_two();
+                log::debug!("growing fill buffer to {capacity} vertices");
+                self.fills = Layer::new(&self.device, &self.bind_layout, "fills", capacity);
+                self.fills.origin = origin;
+                self.fills.count = fill_vertices.len() as u32;
+            }
+            self.queue.write_buffer(
+                &self.fills.vertices,
+                0,
+                bytemuck::cast_slice(&fill_vertices),
+            );
+        }
 
         if vertices.is_empty() {
             return;
@@ -1109,6 +1412,11 @@ impl Renderer {
 
     pub fn imagery_opacity(&self) -> f32 {
         self.imagery_opacity
+    }
+
+    /// Triangles currently held in the fill buffer.
+    pub fn fill_triangle_count(&self) -> u32 {
+        self.fills.count / 3
     }
 
     /// Vertices currently held in the chart buffer.
@@ -1312,6 +1620,7 @@ mod tests {
         StyledLine {
             style: ChartStyle::Coastline,
             points,
+            value: None,
         }
     }
 

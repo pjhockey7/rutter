@@ -142,7 +142,31 @@ let
 
   defaultAbi = "arm64-v8a";
 
-  rustTargets = lib.mapAttrsToList (_: a: a.rust) androidAbis;
+  androidRustTargets = lib.mapAttrsToList (_: a: a.rust) androidAbis;
+
+  # ── A portable Linux binary ────────────────────────────────────────────────
+  #
+  # The binary this shell builds normally is NixOS-only, and not in the
+  # "missing a library" sense: its ELF interpreter is a /nix/store path, so on
+  # Ubuntu it does not start at all. That makes the Linux target a developer
+  # artifact rather than something anyone can be handed.
+  #
+  # Static musl was the obvious fix and it does not work, which is worth
+  # recording so it is not retried. The binary builds, is 18 MB, has no ELF
+  # interpreter at all, and reads charts and tide stations happily — and then
+  # cannot open a window: "The wayland library could not be loaded". musl's
+  # static dlopen is a stub that always fails, and wgpu reaches the GPU by
+  # dlopen("libvulkan.so.1"). A graphics program cannot be fully static,
+  # because the driver belongs to whoever is running it.
+  #
+  # So `rutter dist` links old glibc stubs through zig instead. The musl
+  # target stays available because it is the right answer for a *headless*
+  # tool — chart and tide fetching is HTTP plus SQLite and dlopens nothing,
+  # so those can ship as one static file with no glibc floor at all.
+  muslTarget = "x86_64-unknown-linux-musl";
+  muslCc = pkgs.pkgsCross.musl64.stdenv.cc;
+
+  rustTargets = androidRustTargets ++ [ muslTarget ];
 
   # Rust from rust-overlay rather than nixpkgs, for one reason: the targets
   # override. nixpkgs' rustc ships std for the build host only, so a
@@ -404,9 +428,14 @@ let
   # tests' fixture. Copying it into android/assets/ as well would mean two
   # copies of the same bytes tracked in the repository, free to drift. This
   # builds the directory aapt2 wants from the one real copy.
+  #
+  # Only the fixture, and under the name the app looks for. The real charts
+  # are fetched into build/, which is not a derivation input — a Nix build
+  # has to be reproducible from the repository alone, so `nix-build` gives
+  # the fixture and `rutter apk` gives whatever has actually been fetched.
   androidAssets = pkgs.runCommand "rutter-android-assets" { } ''
     mkdir -p "$out"
-    cp ${./charts/tests/data/coast.mbtiles} "$out/coast.mbtiles"
+    cp ${./charts/tests/data/coast.mbtiles} "$out/noaa.mbtiles"
   '';
 
   # ── Unsigned APK ───────────────────────────────────────────────────────────
@@ -491,7 +520,7 @@ let
         echo
 
         echo "── Rust targets ───────────────────────────────────────────────"
-        for t in ${lib.concatStringsSep " " rustTargets}; do
+        for t in ${lib.concatStringsSep " " androidRustTargets}; do
           if rustc --print target-libdir --target "$t" >/dev/null 2>&1; then
             printf '  %-28s ok\n' "$t"
           else
@@ -501,7 +530,7 @@ let
         echo
 
         echo "── NDK compilers ──────────────────────────────────────────────"
-        for t in ${lib.concatStringsSep " " rustTargets}; do
+        for t in ${lib.concatStringsSep " " androidRustTargets}; do
           var="CC_$(echo "$t" | tr '-' '_')"
           cc="''${!var:-}"
           if [ -n "$cc" ] && [ -x "$cc" ]; then
@@ -586,6 +615,61 @@ let
         exec cargo build --workspace "$@"
         ;;
 
+      dist)
+        shift
+        # ── A Linux binary other people can run ───────────────────────────
+        #
+        # What `cargo build` produces here is NixOS-only, and not in the
+        # "missing a library" sense: its ELF interpreter is a /nix/store
+        # path, so on Ubuntu it does not start at all — `execvp: No such
+        # file or directory`, with the file sitting right there.
+        #
+        # The fix is to link against *old glibc stubs* through zig, which
+        # gives one ordinary dynamically-linked binary that runs on anything
+        # from CentOS 7 onward. Dynamic, not static: a fully static musl
+        # build also works and is tempting, but musl's static dlopen is a
+        # stub that always fails, and wgpu reaches the GPU driver by
+        # dlopen("libvulkan.so.1"). A graphics program cannot be statically
+        # linked, because the driver lives on the user's machine.
+        glibc=''${RUTTER_DIST_GLIBC:-2.17}
+        target="x86_64-unknown-linux-gnu.$glibc"
+        out=build/dist/rutter
+
+        echo "building for $target"
+        cargo zigbuild --release --target "$target" --package rutter-linux
+        mkdir -p build/dist
+        cp target/x86_64-unknown-linux-gnu/release/rutter "$out"
+
+        # The checks are the reason this is a subcommand rather than a note
+        # in the README. Both failure modes are silent: the binary builds,
+        # runs here, and refuses to start on the machine it was built for.
+        interp=$(readelf -p .interp "$out" 2>/dev/null | grep -o "/[^ ]*ld-linux[^ ]*" || true)
+        case "$interp" in
+          "")
+            echo "FAILED: no ELF interpreter — is this a static build?" >&2
+            exit 1 ;;
+          /nix/store/*)
+            echo "FAILED: interpreter is $interp" >&2
+            echo "That binary only runs on this machine." >&2
+            exit 1 ;;
+        esac
+
+        wanted=$(readelf -V "$out" 2>/dev/null           | grep -oE "GLIBC_[0-9]+\.[0-9]+" | sort -uV | tail -1)
+        echo
+        echo "  $out"
+        ls -lh "$out" | awk '{print "  size:", $5}'
+        echo "  interpreter: $interp"
+        echo "  needs up to: $wanted"
+        readelf -d "$out" 2>/dev/null | grep -oE "\[lib[^]]*\]"           | tr -d "[]" | paste -sd" " - | awk '{print "  links:", $0}'
+        if readelf -d "$out" 2>/dev/null | grep -qE "RPATH|RUNPATH"; then
+          echo "  WARNING: carries an RPATH, which may point into /nix/store" >&2
+        fi
+        echo
+        echo "Runs on any x86-64 Linux with glibc >= $glibc. The GPU driver,"
+        echo "Wayland or X11, and Vulkan are loaded from the system at run"
+        echo "time, so they are the user's to provide — as with any native app."
+        ;;
+
       android)
         shift
         target=$(abi_to_rust "$abi")
@@ -628,13 +712,43 @@ let
         mkdir -p "$out/lib/$abi"
         cp "build/android/$abi/librutter.so" "$out/lib/$abi/librutter.so"
 
-        # Assets, assembled from the one copy of the chart rather than a
-        # second one checked in beside the manifest. Same reason as the
-        # androidAssets derivation.
+        # ── Assets ──────────────────────────────────────────────────────────
+        #
+        # Whatever real data has been fetched, falling back to the unit
+        # tests' tiny fixture so that an APK can always be built on a fresh
+        # clone. The names here must match the constants in
+        # platform/android/src/lib.rs.
+        #
+        # Imagery is the big one — a harbour at zoom 16 is tens of megabytes
+        # — and it is bundled anyway: a chartplotter with no aerial
+        # photography on the one device that goes on the boat is the wrong
+        # trade. RUTTER_APK_SKIP_IMAGERY leaves it out when iterating on the
+        # app itself, where a 40 MB install over wifi every time is just a
+        # wait.
         assets=build/assets
         rm -rf "$assets"
         mkdir -p "$assets"
-        cp charts/tests/data/coast.mbtiles "$assets/coast.mbtiles"
+
+        bundled=""
+        if [ -f build/charts/noaa.mbtiles ]; then
+          cp build/charts/noaa.mbtiles "$assets/noaa.mbtiles"
+          bundled="$bundled noaa.mbtiles"
+        else
+          # The fixture, under the name the app looks for, so a clone with
+          # no fetched data still shows a chart rather than empty sea.
+          cp charts/tests/data/coast.mbtiles "$assets/noaa.mbtiles"
+          bundled="$bundled noaa.mbtiles(fixture)"
+        fi
+        if [ -f build/charts/tides.sqlite ]; then
+          cp build/charts/tides.sqlite "$assets/tides.sqlite"
+          bundled="$bundled tides.sqlite"
+        fi
+        if [ -f build/charts/imagery.mbtiles ] && [ -z "''${RUTTER_APK_SKIP_IMAGERY:-}" ]; then
+          cp build/charts/imagery.mbtiles "$assets/imagery.mbtiles"
+          bundled="$bundled imagery.mbtiles"
+        fi
+        echo "assets:$bundled"
+        du -sh "$assets" | awk '{print "  assets total:", $1}'
 
         bt=${sdkRoot}/build-tools/${buildTools}
         jar=${sdkRoot}/platforms/android-${compileSdk}/android.jar
@@ -1042,6 +1156,76 @@ let
         echo "Load it with: rutter run --charts $out"
         ;;
 
+      tides)
+        shift
+        # ── Tide stations ─────────────────────────────────────────────────
+        #
+        # NOAA CO-OPS publishes each harmonic station's constituents — 37
+        # amplitudes and phases, a few hundred bytes — and they do not
+        # expire. That is the difference between this and the weather: once
+        # fetched, the tide is predictable for years with no signal, which
+        # is what a boat actually needs.
+        #
+        # Public domain, no key. See core/src/tide.rs for the prediction and
+        # core/tests/tide_noaa.rs for the check against NOAA's own answers.
+        out=build/charts/tides.sqlite
+        box=""
+        near=""
+        radius=''${RUTTER_TIDES_RADIUS:-60}
+
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --box)    box=$2; shift 2 ;;
+            --near)   near=$2; shift 2 ;;
+            --radius) radius=$2; shift 2 ;;
+            --out)    out=$2; shift 2 ;;
+            *) echo "rutter tides: unknown option '$1'" >&2; exit 64 ;;
+          esac
+        done
+
+        # --near is the common case: you know roughly where you are, not the
+        # corners of a box. A degree of latitude is 60 nautical miles, and
+        # longitude shrinks with the cosine — close enough for picking which
+        # stations to fetch.
+        if [ -z "$box" ] && [ -n "$near" ]; then
+          IFS=, read -r nlat nlon <<<"$near"
+          if [ -z "''${nlon:-}" ]; then
+            echo "expected --near <lat>,<lon>, got '$near'" >&2
+            exit 64
+          fi
+          box=$(python3 -c "
+import math, sys
+lat, lon, nm = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+dlat = nm / 60.0
+dlon = nm / (60.0 * max(math.cos(math.radians(lat)), 0.01))
+print('%.4f,%.4f,%.4f,%.4f' % (lat - dlat, lon - dlon, lat + dlat, lon + dlon))
+" "$nlat" "$nlon" "$radius")
+          echo "within $radius nm of $nlat,$nlon: box $box"
+        fi
+
+        if [ -z "$box" ]; then
+          echo "usage: rutter tides --near <lat>,<lon> [--radius NM] [--out FILE]" >&2
+          echo "       rutter tides --box <s>,<w>,<n>,<e> [--out FILE]" >&2
+          echo >&2
+          echo "  rutter tides --near 32.68,-117.23" >&2
+          echo "  rutter tides --box 32.5,-118.7,33.7,-117.0" >&2
+          echo >&2
+          echo "Tide constituents are from NOAA CO-OPS — public domain, US" >&2
+          echo "waters. They do not expire: fetch once, predict offline." >&2
+          exit 64
+        fi
+
+        mkdir -p "$(dirname "$out")"
+        rm -f "$out"
+        python3 ${./scripts/tide-stations.py} --box "$box" --out "$out"
+        echo
+        if [ "$out" = build/charts/tides.sqlite ]; then
+          echo 'rutter run picks this up on its own.'
+        else
+          echo "Load it with: rutter run --tides $out"
+        fi
+        ;;
+
       imagery)
         shift
         # ── Aerial imagery ────────────────────────────────────────────────
@@ -1179,23 +1363,50 @@ let
           python3 ${./scripts/tile-range.py} "$s" "$w" "$n" "$e" "$z"             >> "$work/tiles.txt"
         done
 
+        # Downloads run in parallel inside curl rather than one tile at a
+        # time. The serial version spent minutes on a 1400-tile fetch: one
+        # connection setup and one sqlite3 process per tile. Curl's own
+        # fan-out keeps it to a single process with a shared connection
+        # pool, and a config file avoids quoting a shell snippet through
+        # xargs.
+        #
+        # ArcGIS serves tiles as /tile/{z}/{y}/{x} — row before column,
+        # which is the reverse of the {z}/{x}/{y} every other scheme uses.
+        # Getting it backwards returns valid-looking imagery of the wrong
+        # place, which is the worst kind of wrong.
+        jobs=''${RUTTER_IMAGERY_JOBS:-8}
+        : > "$work/curl.conf"
         while read -r z x y row; do
-          f="$work/$z-$x-$y.jpg"
-          # ArcGIS serves tiles as /tile/{z}/{y}/{x} — row before column,
-          # which is the reverse of the {z}/{x}/{y} every other scheme uses.
-          # Getting it backwards returns valid-looking imagery of the wrong
-          # place, which is the worst kind of wrong.
-          if curl -fsSL --retry 2 --max-time 30 -o "$f" "$tiles/$z/$y/$x"              && [ -s "$f" ]; then
-            sqlite3 "$out"               "INSERT OR REPLACE INTO tiles VALUES ($z, $x, $row, readfile('$f'));"
-            got=$((got + 1))
-            printf '  %s/%s tiles' "$got" "$count"
-          else
-            missing=$((missing + 1))
-          fi
-          rm -f "$f"
+          printf 'url = "%s/%s/%s/%s"\noutput = "%s/%s-%s-%s.jpg"\n' "$tiles" "$z" "$y" "$x" "$work" "$z" "$x" "$y" >> "$work/curl.conf"
         done < "$work/tiles.txt"
-        printf '
-'
+
+        echo "downloading $count tiles, $jobs at a time"
+        # --remove-on-error so a failed transfer leaves no truncated file for
+        # the insert pass to mistake for a tile. A non-zero exit is expected
+        # whenever any tile is unserved, so it is not treated as fatal — the
+        # count below is what decides.
+        fetch=( -fSL --retry 2 --max-time 30 --remove-on-error )
+        fetch+=( --parallel --parallel-max "$jobs" --progress-bar )
+        fetch+=( -K "$work/curl.conf" )
+        curl "''${fetch[@]}" || true
+
+        # One transaction in one process, rather than a process per tile.
+        # A missing file is a hole, not a failure: an area can simply have no
+        # imagery at that level.
+        {
+          echo 'BEGIN;'
+          while read -r z x y row; do
+            f="$work/$z-$x-$y.jpg"
+            if [ -s "$f" ]; then
+              printf "INSERT OR REPLACE INTO tiles VALUES (%s, %s, %s, readfile('%s'));\n" "$z" "$x" "$row" "$f"
+              got=$((got + 1))
+            else
+              missing=$((missing + 1))
+            fi
+          done < "$work/tiles.txt"
+          echo 'COMMIT;'
+        } > "$work/insert.sql"
+        sqlite3 "$out" < "$work/insert.sql"
 
         if [ "$got" -eq 0 ]; then
           echo "nothing was downloaded — is the area inside the US?" >&2
@@ -1259,6 +1470,7 @@ let
           '  test-all     cargo test on the whole workspace (slow; builds wgpu)' \
           '  run          open the Linux app; --charts <f.mbtiles> to load a chart' \
           '  build        cargo build, whole workspace' \
+          '  dist         a portable Linux binary (old glibc via zig)' \
           '  android      cross-compile the shared library for $RUTTER_ABI' \
           '  apk          build a signed, installable APK (no Gradle)' \
           '  install      adb install the APK' \
@@ -1268,6 +1480,7 @@ let
           '  charts       <source> <out.mbtiles> — turn chart data into tiles' \
           '  noaa         fetch NOAA ENC charts (US waters) and tile them' \
           '  imagery      fetch USGS aerial imagery for a chart or a box' \
+          '  tides        fetch NOAA tide-station constituents near a position' \
           '  fmt          cargo fmt' \
           '  lint         cargo clippy' \
           '  adb          pass through to the SDK'"'"'s adb' \
@@ -1297,6 +1510,12 @@ let
     packages = [
       rutter
       rustToolchain
+      muslCc
+      # `rutter dist` links against old glibc stubs through zig, which is
+      # what makes one binary run on distributions older than this machine's
+      # glibc. cargo-zigbuild is the wrapper that teaches cargo to do it.
+      pkgs.zig
+      pkgs.cargo-zigbuild
       androidComposition.androidsdk
       androidComposition.platform-tools
       pkgs.git
@@ -1321,6 +1540,14 @@ let
       # `rutter noaa` fetches chart cells and the product catalogue.
       pkgs.curl
     ] ++ linuxRuntimeLibs;
+
+    # The musl cross compiler, for the vendored SQLite in a `rutter dist`
+    # build. cargo reads both of these names: the first to link, the second
+    # for cc-rs when it compiles C.
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER =
+      "${muslCc}/bin/${muslCc.targetPrefix}cc";
+    CC_x86_64_unknown_linux_musl = "${muslCc}/bin/${muslCc.targetPrefix}cc";
+    AR_x86_64_unknown_linux_musl = "${muslCc.bintools}/bin/${muslCc.targetPrefix}ar";
 
     JAVA_HOME = "${pkgs.jdk_headless}";
     ANDROID_HOME = sdkRoot;

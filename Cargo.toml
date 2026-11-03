@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
 	"core",
+	"app",
 	"charts",
+	"tides",
 	"render",
 	"platform/linux",
 	"platform/android",
@@ -24,7 +26,9 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 rutter-core = { path = "core" }
 rutter-charts = { path = "charts" }
+rutter-tides = { path = "tides" }
 rutter-render = { path = "render" }
+rutter-app = { path = "app" }
 
 wgpu = "30.0"
 winit = "0.30"
