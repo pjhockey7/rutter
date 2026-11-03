@@ -1,0 +1,6 @@
+{"type":"FeatureCollection","features":[
+{"type":"Feature","properties":{"layer":"COALNE","name":"test coast"},"geometry":{"type":"LineString","coordinates":[[-5.10,50.10],[-5.05,50.12],[-5.00,50.11],[-4.95,50.14]]}},
+{"type":"Feature","properties":{"layer":"DEPARE","drval1":5,"drval2":10},"geometry":{"type":"Polygon","coordinates":[[[-5.08,50.08],[-5.02,50.08],[-5.02,50.05],[-5.08,50.05],[-5.08,50.08]]]}},
+{"type":"Feature","properties":{"layer":"SOUNDG","depth":7.3},"geometry":{"type":"Point","coordinates":[-5.06,50.065]}},
+{"type":"Feature","properties":{"layer":"SOUNDG","depth":12.1},"geometry":{"type":"Point","coordinates":[-5.03,50.07]}}
+]}

@@ -46,6 +46,10 @@ fn android_main(app: AndroidApp) {
 
     log::info!("rutter starting");
 
+    // Charts must come off the asset store before the event loop takes the
+    // AndroidApp.
+    let charts = open_bundled_chart(&app);
+
     let event_loop = match EventLoop::builder().with_android_app(app).build() {
         Ok(el) => el,
         Err(e) => {
@@ -54,9 +58,86 @@ fn android_main(app: AndroidApp) {
         }
     };
 
-    let mut state = App::default();
+    let mut state = App {
+        charts,
+        ..App::default()
+    };
     if let Err(e) = event_loop.run_app(&mut state) {
         log::error!("event loop ended: {e}");
+    }
+}
+
+/// Copy the chart bundled in the APK to internal storage, then open it.
+///
+/// The copy is not avoidable. An asset is a zip entry inside the APK, and
+/// SQLite needs a real file it can seek within — so the first run pays for
+/// one copy and every run after it finds the file already there.
+///
+/// Returns `None` on any failure. A missing or unreadable chart should leave
+/// the app drawing an empty grid, not refuse to start: on a boat, an app that
+/// opens with no chart is still a compass, and one that will not open is
+/// nothing.
+#[cfg(target_os = "android")]
+fn open_bundled_chart(app: &AndroidApp) -> Option<ChartSource> {
+    use std::ffi::CString;
+    use std::io::Read;
+
+    const ASSET: &str = "coast.mbtiles";
+
+    let dir = app.internal_data_path()?;
+    let path = dir.join(ASSET);
+
+    if !path.exists() {
+        log::info!("extracting {ASSET} to {}", path.display());
+
+        let name = CString::new(ASSET).ok()?;
+        let mut asset = app.asset_manager().open(&name)?;
+
+        let mut bytes = Vec::new();
+        if let Err(e) = asset.read_to_end(&mut bytes) {
+            log::error!("reading asset {ASSET}: {e}");
+            return None;
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::error!("creating {}: {e}", dir.display());
+            return None;
+        }
+
+        // Write via a temporary name and rename, so a run interrupted
+        // mid-copy does not leave a truncated database that then looks
+        // present and fails to open on every launch afterwards.
+        let partial = path.with_extension("partial");
+        if let Err(e) = std::fs::write(&partial, &bytes) {
+            log::error!("writing {}: {e}", partial.display());
+            return None;
+        }
+        if let Err(e) = std::fs::rename(&partial, &path) {
+            log::error!("renaming into place: {e}");
+            return None;
+        }
+        log::info!("extracted {} bytes", bytes.len());
+    }
+
+    match ChartSource::open(&path, &[]) {
+        Ok(source) => {
+            let meta = source.metadata();
+            log::info!(
+                "charts: {} zoom {}..{}",
+                if meta.name.is_empty() {
+                    ASSET
+                } else {
+                    &meta.name
+                },
+                meta.min_zoom,
+                meta.max_zoom
+            );
+            Some(source)
+        }
+        Err(e) => {
+            log::error!("opening {}: {e}", path.display());
+            None
+        }
     }
 }
 
@@ -66,7 +147,9 @@ fn android_main(app: AndroidApp) {
 
 use std::sync::Arc;
 
-use rutter_core::{chart, View};
+use rutter_charts::ChartSource;
+use rutter_core::chart::TileId;
+use rutter_core::{chart, LatLon, View};
 use rutter_render::{Frame, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, TouchPhase, WindowEvent};
@@ -80,6 +163,11 @@ struct App {
     view: View,
     /// Where the active finger was last seen, for one-finger panning.
     finger: Option<(f64, f64)>,
+    charts: Option<ChartSource>,
+    /// The tile set the renderer's chart buffer was built from. Panning
+    /// within one tile — most of a drag — must not re-decode geometry that
+    /// is already on the GPU.
+    loaded: Vec<TileId>,
 }
 
 impl App {
@@ -89,6 +177,46 @@ impl App {
         w.x = (w.x - dx / pixels_per_world).clamp(0.0, 1.0);
         w.y = (w.y - dy / pixels_per_world).clamp(0.0, 1.0);
         self.view.centre = chart::unproject(w);
+    }
+
+    /// Reload chart geometry if the visible tile set has changed.
+    ///
+    /// Deliberately the same shape as the Linux shim's, and deliberately
+    /// thin: the work of picking tiles and gathering geometry is in
+    /// `rutter-charts`, where it is written once and tested without a device.
+    fn refresh_charts(&mut self) {
+        let Some(source) = self.charts.as_mut() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+
+        let got = source.collect(&self.view);
+        if got.tiles == self.loaded {
+            return;
+        }
+
+        if let Some(wanted) = got.over_budget {
+            log::debug!("charts: {wanted} tiles wanted, over budget — not drawing");
+            renderer.clear_chart();
+            self.loaded = got.tiles;
+            return;
+        }
+
+        for (id, why) in &got.failed {
+            log::warn!("{id:?}: {why}");
+        }
+
+        renderer.set_chart(&got.line_slices(), &got.points);
+        log::debug!(
+            "charts: {} tiles, {} polylines, {} points",
+            got.tiles.len(),
+            got.lines.len(),
+            got.points.len()
+        );
+
+        self.loaded = got.tiles;
     }
 }
 
@@ -105,6 +233,18 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         self.view.width_px = size.width.max(1);
         self.view.height_px = size.height.max(1);
+
+        // Open on the chart, so the first launch shows data rather than
+        // empty sea somewhere else. Only on the first resume: coming back
+        // from the background should return to where the user was.
+        if self.loaded.is_empty() {
+            if let Some(source) = &self.charts {
+                if let Some(b) = source.metadata().bounds {
+                    self.view.centre = LatLon::new((b[1] + b[3]) / 2.0, (b[0] + b[2]) / 2.0);
+                    self.view.zoom = f64::from(source.metadata().max_zoom);
+                }
+            }
+        }
 
         match pollster::block_on(Renderer::new(window.clone(), size.width, size.height)) {
             Ok(r) => self.renderer = Some(r),
@@ -125,6 +265,10 @@ impl ApplicationHandler for App {
         self.renderer = None;
         self.window = None;
         self.finger = None;
+        // Same reason as above: the uploaded geometry went with the renderer.
+        // The ChartSource and its decoded-tile cache survive, so coming back
+        // costs an upload but not a re-decode.
+        self.loaded.clear();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -166,6 +310,8 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                self.refresh_charts();
+
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
@@ -182,6 +328,9 @@ impl ApplicationHandler for App {
                         log::info!("surface lost; waiting for resume");
                         self.renderer = None;
                         self.window = None;
+                        // The chart buffer died with the renderer, so the
+                        // record of what was uploaded is now a lie.
+                        self.loaded.clear();
                     }
                 }
             }

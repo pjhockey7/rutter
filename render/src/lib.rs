@@ -11,11 +11,22 @@
 //! without a screen belongs in `rutter-core`, which is why the projection
 //! and tile maths are not here.
 //!
-//! What it draws today is the chart *grid*: the boundaries of the tiles the
-//! view needs, plus a mark at the centre. That is not a chart, but it is the
-//! whole pipeline — core computes geography, the renderer puts it on a GPU
-//! surface, and panning and zooming are visibly correct or visibly not.
-//! Tile imagery goes on top of this without changing its shape.
+//! It draws two things, in two vertex buffers, for a reason worth stating.
+//!
+//! The *grid* — visible tile boundaries and a centre mark — is rebuilt every
+//! frame, because it depends on the viewport and is a few hundred lines.
+//!
+//! The *chart* — real coastlines, depth contours and soundings — is uploaded
+//! once per change of visible tile set and left alone. Its vertices are
+//! stored relative to a reference point fixed at upload time, so a pan
+//! changes one uniform rather than re-sending every coastline. That split is
+//! the difference between a drag that costs four bytes and one that costs a
+//! megabyte a frame.
+//!
+//! This crate depends on `rutter-core` and nothing else of the project's:
+//! chart geometry arrives as plain slices of world coordinates, so reading
+//! MBTiles — and linking SQLite — stays in `rutter-charts`, where a renderer
+//! does not have to care about it.
 
 use rutter_core::chart::{self, TileId};
 use rutter_core::View;
@@ -34,10 +45,16 @@ const GRID_COLOUR: [f32; 4] = [0.25, 0.42, 0.55, 1.0];
 /// The mark at the view centre — where the boat would be.
 const MARK_COLOUR: [f32; 4] = [0.95, 0.75, 0.15, 1.0];
 
+/// Chart linework: coastlines, depth area boundaries, contours.
+const CHART_COLOUR: [f32; 4] = [0.82, 0.90, 0.95, 1.0];
+
+/// Point features — soundings, buoys, beacons.
+const SOUNDING_COLOUR: [f32; 4] = [0.60, 0.85, 0.70, 1.0];
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
-    /// Offset from the view centre, in normalised world units.
+    /// Offset from this buffer's reference point, in normalised world units.
     offset: [f32; 2],
     colour: [f32; 4],
 }
@@ -46,16 +63,35 @@ struct Vertex {
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ViewUniform {
     scale: [f32; 2],
-    pixels_per_world: f32,
-    _pad: f32,
+    /// This buffer's reference point relative to the view centre.
+    origin: [f32; 2],
 }
 
-/// How many vertices the geometry buffer can hold before it is reallocated.
+/// Vertices the grid buffer holds. Fixed, because the grid is bounded: a
+/// viewport covers a few hundred tiles at most, eight vertices each for four
+/// edges. 64k is generous and costs 1.5 MB.
+const GRID_CAPACITY: u64 = 65_536;
+
+/// One buffer's worth of geometry: the vertices and the point they are
+/// measured from.
 ///
-/// A phone screen at any zoom needs a few hundred tiles at most, each
-/// contributing eight vertices for four edges. 64k is generous and costs
-/// 1.5 MB.
-const VERTEX_CAPACITY: u64 = 65_536;
+/// Pairing the two is the invariant that matters. Vertices are f32 offsets
+/// and only mean anything against their own origin, so a buffer whose origin
+/// is forgotten draws in the wrong place — subtly, and worse the further the
+/// view has moved.
+#[derive(Debug)]
+struct Layer {
+    vertices: wgpu::Buffer,
+    /// Capacity in vertices, so growth is a decision rather than a surprise.
+    capacity: u64,
+    count: u32,
+    /// The reference point these offsets are measured from, in f64 because
+    /// the subtraction against the view centre must not lose precision
+    /// before it reaches f32.
+    origin: chart::WorldXY,
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
 
 #[derive(Debug)]
 pub struct Renderer {
@@ -64,10 +100,11 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
-    uniform: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    vertices: wgpu::Buffer,
-    vertex_count: u32,
+    bind_layout: wgpu::BindGroupLayout,
+    /// Tile boundaries and the centre mark. Rebuilt every frame.
+    grid: Layer,
+    /// Real chart geometry. Uploaded on change, then left alone.
+    charts: Layer,
     /// Scratch, kept between frames so a redraw does not allocate.
     scratch: Vec<Vertex>,
 }
@@ -210,13 +247,6 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("chart.wgsl").into()),
         });
 
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("view"),
-            size: std::mem::size_of::<ViewUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("view"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -228,15 +258,6 @@ impl Renderer {
                     min_binding_size: None,
                 },
                 count: None,
-            }],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("view"),
-            layout: &bind_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
             }],
         });
 
@@ -288,12 +309,9 @@ impl Renderer {
             cache: None,
         });
 
-        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("geometry"),
-            size: VERTEX_CAPACITY * std::mem::size_of::<Vertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let grid = Layer::new(&device, &bind_layout, "grid", GRID_CAPACITY);
+        // The chart layer starts empty; `set_chart` sizes it to the data.
+        let charts = Layer::new(&device, &bind_layout, "charts", 1);
 
         Ok(Self {
             surface,
@@ -301,10 +319,9 @@ impl Renderer {
             queue,
             config,
             pipeline,
-            uniform,
-            bind_group,
-            vertices,
-            vertex_count: 0,
+            bind_layout,
+            grid,
+            charts,
             scratch: Vec::with_capacity(4096),
         })
     }
@@ -392,11 +409,17 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if self.vertex_count > 0 {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.vertices.slice(..));
-                pass.draw(0..self.vertex_count, 0..1);
+            pass.set_pipeline(&self.pipeline);
+
+            // Grid first, chart over it: the grid is scaffolding and should
+            // not sit on top of the coastline it is there to locate.
+            for layer in [&self.grid, &self.charts] {
+                if layer.count == 0 {
+                    continue;
+                }
+                pass.set_bind_group(0, &layer.bind_group, &[]);
+                pass.set_vertex_buffer(0, layer.vertices.slice(..));
+                pass.draw(0..layer.count, 0..1);
             }
         }
 
@@ -406,34 +429,133 @@ impl Renderer {
         Frame::Drawn
     }
 
-    /// World units visible per pixel, and the clip-space scale that follows.
-    fn uniform_for(&self, view: &View) -> ViewUniform {
+    /// Clip units per world unit, for this viewport and zoom.
+    fn scale_for(&self, view: &View) -> [f32; 2] {
         // 256 pixels per tile, 2^zoom tiles across the world: this is the
         // definition of slippy-map zoom, and the fractional part is what
         // makes a pinch gesture smooth rather than stepped.
         let pixels_per_world = 256.0 * 2f64.powf(view.zoom);
 
-        ViewUniform {
-            scale: [
-                (2.0 * pixels_per_world / self.config.width.max(1) as f64) as f32,
-                (2.0 * pixels_per_world / self.config.height.max(1) as f64) as f32,
-            ],
-            pixels_per_world: pixels_per_world as f32,
-            _pad: 0.0,
+        [
+            (2.0 * pixels_per_world / self.config.width.max(1) as f64) as f32,
+            (2.0 * pixels_per_world / self.config.height.max(1) as f64) as f32,
+        ]
+    }
+
+    /// Refresh both layers' uniforms, and the grid's vertices.
+    ///
+    /// The chart's vertices are deliberately absent: they were uploaded when
+    /// the tile set changed and are still correct, because they are measured
+    /// from the chart layer's own origin rather than from the view.
+    fn upload(&mut self, view: &View) {
+        let scale = self.scale_for(view);
+        let centre = chart::project(view.centre);
+
+        for layer in [&self.grid, &self.charts] {
+            // The subtraction happens in f64 and only the small difference
+            // becomes f32. Projecting to f32 first would throw away the
+            // precision this whole arrangement exists to keep.
+            let uniform = ViewUniform {
+                scale,
+                origin: [
+                    (layer.origin.x - centre.x) as f32,
+                    (layer.origin.y - centre.y) as f32,
+                ],
+            };
+            self.queue
+                .write_buffer(&layer.uniform, 0, bytemuck::bytes_of(&uniform));
+        }
+
+        if self.grid.count > 0 {
+            self.queue
+                .write_buffer(&self.grid.vertices, 0, bytemuck::cast_slice(&self.scratch));
         }
     }
 
-    fn upload(&mut self, view: &View) {
-        self.queue.write_buffer(
-            &self.uniform,
-            0,
-            bytemuck::bytes_of(&self.uniform_for(view)),
-        );
+    /// Replace the chart geometry.
+    ///
+    /// Call this when the set of visible tiles changes, not every frame.
+    /// `lines` is a polyline per entry and `points` are standalone features;
+    /// both are in normalised world coordinates, which is all this crate
+    /// needs to know about where chart data came from.
+    ///
+    /// The reference point is taken from the geometry's own bounding box
+    /// rather than from the current view. That is what lets a pan leave this
+    /// buffer untouched: tying the origin to the view would invalidate every
+    /// vertex the moment the view moved.
+    pub fn set_chart(&mut self, lines: &[&[chart::WorldXY]], points: &[chart::WorldXY]) {
+        let mut vertices: Vec<Vertex> = Vec::new();
 
-        if self.vertex_count > 0 {
-            self.queue
-                .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&self.scratch));
+        let origin = centroid(lines, points);
+
+        let offset = |p: chart::WorldXY| [(p.x - origin.x) as f32, (p.y - origin.y) as f32];
+
+        for line in lines {
+            // A polyline of n points is n-1 separate segments under
+            // LineList. A line strip topology would halve this, but it
+            // cannot express several disconnected polylines in one draw.
+            for pair in line.windows(2) {
+                vertices.push(Vertex {
+                    offset: offset(pair[0]),
+                    colour: CHART_COLOUR,
+                });
+                vertices.push(Vertex {
+                    offset: offset(pair[1]),
+                    colour: CHART_COLOUR,
+                });
+            }
         }
+
+        // Soundings as small crosses, in world units scaled so they stay a
+        // constant size on screen is not possible here — this buffer does
+        // not know the zoom. Size them in world units relative to the data's
+        // own extent instead, which keeps them visible at the zoom the chart
+        // was loaded for.
+        let arm = point_arm(lines, points);
+        for &p in points {
+            let c = offset(p);
+            for (dx, dy) in [(arm, 0.0), (0.0, arm)] {
+                vertices.push(Vertex {
+                    offset: [c[0] - dx, c[1] - dy],
+                    colour: SOUNDING_COLOUR,
+                });
+                vertices.push(Vertex {
+                    offset: [c[0] + dx, c[1] + dy],
+                    colour: SOUNDING_COLOUR,
+                });
+            }
+        }
+
+        self.charts.origin = origin;
+        self.charts.count = vertices.len() as u32;
+
+        if vertices.is_empty() {
+            return;
+        }
+
+        // Grow rather than truncate. Chart density is not something this
+        // crate can bound: one tile of a busy harbour carries more linework
+        // than a hundred tiles of open sea.
+        if vertices.len() as u64 > self.charts.capacity {
+            let capacity = (vertices.len() as u64).next_power_of_two();
+            log::debug!("growing chart buffer to {capacity} vertices");
+            self.charts = Layer::new(&self.device, &self.bind_layout, "charts", capacity);
+            self.charts.origin = origin;
+            self.charts.count = vertices.len() as u32;
+        }
+
+        self.queue
+            .write_buffer(&self.charts.vertices, 0, bytemuck::cast_slice(&vertices));
+    }
+
+    /// Drop the chart geometry.
+    pub fn clear_chart(&mut self) {
+        self.charts.count = 0;
+    }
+
+    /// Vertices currently held in the chart buffer.
+    pub fn chart_vertex_count(&self) -> u32 {
+        self.charts.count
     }
 
     /// Turn the view's tile list into line segments.
@@ -466,7 +588,7 @@ impl Renderer {
         for tile in view.visible_tiles() {
             // Leave room for the four edges plus the two centre-mark strokes
             // added after the loop.
-            if out.len() as u64 + 12 > VERTEX_CAPACITY {
+            if out.len() as u64 + 12 > GRID_CAPACITY {
                 // Rather than reallocate mid-frame, stop. A view needing this
                 // many tiles is a bug in the zoom clamp, and a partial grid
                 // makes that visible instead of merely slow.
@@ -506,7 +628,182 @@ impl Renderer {
             MARK_COLOUR,
         );
 
-        self.vertex_count = out.len() as u32;
+        // The grid is rebuilt from the view every frame, so the view centre
+        // is exactly its reference point and its uniform origin is zero.
+        self.grid.origin = centre;
+        self.grid.count = out.len() as u32;
         self.scratch = out;
+    }
+}
+
+impl Layer {
+    fn new(
+        device: &wgpu::Device,
+        bind_layout: &wgpu::BindGroupLayout,
+        name: &str,
+        capacity: u64,
+    ) -> Self {
+        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(name),
+            size: capacity.max(1) * std::mem::size_of::<Vertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(name),
+            size: std::mem::size_of::<ViewUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(name),
+            layout: bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+
+        Self {
+            vertices,
+            capacity: capacity.max(1),
+            count: 0,
+            origin: chart::WorldXY { x: 0.0, y: 0.0 },
+            uniform,
+            bind_group,
+        }
+    }
+}
+
+/// Mean of every vertex, used as a layer's reference point.
+///
+/// The mean rather than the bounding-box centre: it is cheaper, it needs no
+/// special case for empty input, and the only property that matters is being
+/// *near* the data so the f32 offsets stay small.
+fn centroid(lines: &[&[chart::WorldXY]], points: &[chart::WorldXY]) -> chart::WorldXY {
+    let mut sum = (0.0f64, 0.0f64);
+    let mut n = 0u64;
+
+    for p in lines.iter().flat_map(|l| l.iter()).chain(points.iter()) {
+        sum.0 += p.x;
+        sum.1 += p.y;
+        n += 1;
+    }
+
+    if n == 0 {
+        return chart::WorldXY { x: 0.0, y: 0.0 };
+    }
+    chart::WorldXY {
+        x: sum.0 / n as f64,
+        y: sum.1 / n as f64,
+    }
+}
+
+/// Half-size of a sounding cross, in world units.
+///
+/// Derived from the data's own extent so the marks are proportionate to what
+/// is loaded: a harbour's worth of soundings gets small crosses, a whole
+/// coastline's gets larger ones. A fixed world-unit size would be invisible
+/// at one zoom and cover the screen at another, and this buffer cannot know
+/// the zoom — it is uploaded once and reused across many.
+fn point_arm(lines: &[&[chart::WorldXY]], points: &[chart::WorldXY]) -> f32 {
+    let mut min = (f64::MAX, f64::MAX);
+    let mut max = (f64::MIN, f64::MIN);
+
+    for p in lines.iter().flat_map(|l| l.iter()).chain(points.iter()) {
+        min.0 = min.0.min(p.x);
+        min.1 = min.1.min(p.y);
+        max.0 = max.0.max(p.x);
+        max.1 = max.1.max(p.y);
+    }
+
+    let span = (max.0 - min.0).max(max.1 - min.1);
+    if span.is_finite() && span > 0.0 {
+        (span / 200.0) as f32
+    } else {
+        // A single point, or none: fall back to something that is visible at
+        // a harbour zoom rather than to zero.
+        1.0e-6
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rutter_core::chart::WorldXY;
+
+    // Only the pure geometry helpers are tested here. Everything else in
+    // this crate needs a GPU and a surface, which is the reason the
+    // projection and tile maths live in rutter-core instead.
+
+    fn w(x: f64, y: f64) -> WorldXY {
+        WorldXY { x, y }
+    }
+
+    #[test]
+    fn centroid_of_nothing_is_the_origin() {
+        let c = centroid(&[], &[]);
+        assert_eq!((c.x, c.y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn centroid_averages_every_vertex() {
+        let line = [w(0.0, 0.0), w(1.0, 1.0)];
+        let c = centroid(&[&line], &[w(2.0, 2.0)]);
+        assert!((c.x - 1.0).abs() < 1e-12, "x was {}", c.x);
+        assert!((c.y - 1.0).abs() < 1e-12, "y was {}", c.y);
+    }
+
+    #[test]
+    fn centroid_counts_lines_and_points_alike() {
+        // Two points on one side, one on the other: the mean must lean.
+        let line = [w(0.0, 0.0), w(0.0, 0.0)];
+        let c = centroid(&[&line], &[w(0.3, 0.0)]);
+        assert!((c.x - 0.1).abs() < 1e-12, "x was {}", c.x);
+    }
+
+    #[test]
+    fn centroid_stays_near_the_data_far_from_the_origin() {
+        // The whole point of a reference point: offsets from it must be
+        // small even when the data sits in a corner of the world where f32
+        // has no precision left.
+        let line = [w(0.999_999_0, 0.999_999_0), w(0.999_999_5, 0.999_999_5)];
+        let c = centroid(&[&line], &[]);
+
+        for p in line {
+            let offset = ((p.x - c.x) as f32, (p.y - c.y) as f32);
+            assert!(offset.0.abs() < 1e-5, "offset {offset:?} is not small");
+            // And the offset must survive f32 without collapsing to zero,
+            // which is what happens if you store absolute coordinates.
+            assert_ne!(offset.0, 0.0);
+        }
+    }
+
+    #[test]
+    fn point_arm_scales_with_the_data_extent() {
+        let small = [w(0.5, 0.5), w(0.501, 0.501)];
+        let large = [w(0.0, 0.0), w(1.0, 1.0)];
+        assert!(
+            point_arm(&[&small], &[]) < point_arm(&[&large], &[]),
+            "a tighter chart should get smaller marks"
+        );
+    }
+
+    #[test]
+    fn point_arm_is_positive_for_degenerate_input() {
+        // A single point has no extent; the mark must still be drawable.
+        assert!(point_arm(&[], &[w(0.5, 0.5)]) > 0.0);
+        assert!(point_arm(&[], &[]) > 0.0);
+        // A vertical line has zero width but real height.
+        let vertical = [w(0.5, 0.4), w(0.5, 0.6)];
+        assert!(point_arm(&[&vertical], &[]) > 0.0);
+    }
+
+    #[test]
+    fn point_arm_is_finite() {
+        let line = [w(0.0, 0.0), w(1.0, 1.0)];
+        assert!(point_arm(&[&line], &[w(0.5, 0.5)]).is_finite());
     }
 }

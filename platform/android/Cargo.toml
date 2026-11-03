@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rutter-core.workspace = true
+rutter-charts.workspace = true
 rutter-render.workspace = true
 # No wgpu dependency — see platform/linux/Cargo.toml.
 pollster.workspace = true

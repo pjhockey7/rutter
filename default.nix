@@ -15,9 +15,11 @@
 # Laid out like firmware, because the goal is the same: one body of
 # application code landing on several boards.
 #
-#   core/              charts, weather, tides. Pure computation. No GPU, no
+#   core/              geography, weather, tides. Pure computation. No GPU, no
 #                      windowing, no filesystem, no clock. Portable by
-#                      construction, and the only crate with real tests.
+#                      construction, and no dependencies at all.
+#   charts/            MBTiles and vector tile decoding: SQLite, gunzip,
+#                      protobuf, geometry. Where the chart data comes from.
 #   render/            drawing, via wgpu — which is the whole reason this is
 #                      Rust. wgpu is the HAL: one renderer over Vulkan on
 #                      Android and Linux, Metal on iOS and macOS, DX12 on
@@ -47,11 +49,16 @@
 # Enter the dev shell:
 #   nix-shell                      # or: nix-shell --attr shells.default
 # Then everything is driven by one command:
-#   rutter doctor | test | run | android | charts | fmt | lint | clean
+#   rutter doctor | test | run | apk | install | logcat | charts | fmt | clean
 #
-# Status: the core builds and its tests pass; `rutter run` opens a window and
-# draws the chart grid; `rutter android` cross-compiles the shared library.
-# There is no APK yet — `rutter doctor` says so, and so does README.md.
+# And the Nix-built artifacts, which sit alongside the shell rather than
+# replacing it — see the comment above rutterSrc for why:
+#   nix-build --attr packages.linux | packages.androidLib | packages.apk
+#
+# Status: 113 tests pass across core and charts; `rutter run --charts
+# <file.mbtiles>` opens a window and draws real chart linework; `rutter apk`
+# builds a signed, installable APK with the chart bundled. Nothing has been
+# run on real hardware yet — `rutter doctor` says so, and so does README.md.
 
 { system ? builtins.currentSystem }:
 
@@ -209,6 +216,246 @@ let
     # lines before the first frame, for no gain.
   ];
 
+
+  # ── Nix-built artifacts ────────────────────────────────────────────────────
+  #
+  # These exist alongside the dev shell, not instead of it. Developing through
+  # nix-build would be miserable: a derivation is a pure function of its
+  # inputs, so one line changed in core/ rebuilds all 297 crates. Cargo's
+  # incremental build in the shell is the right tool for that.
+  #
+  # What these are for:
+  #
+  #   * Proving the build does not depend on anything in $HOME. If
+  #     `nix-build` passes, the build is genuinely reproducible from the
+  #     pinned inputs.
+  #   * Producing the artifacts to ship. An APK installed on a real boat's
+  #     phone should come from a hash-pinned build, not from whatever was in
+  #     ~/.cargo that afternoon.
+  #
+  # Cargo and Nix do not fight here, because each owns a different layer:
+  # Cargo.lock pins the crates and Nix *reads* it rather than duplicating it.
+  # With no git dependencies in the lockfile — and there are none — this needs
+  # no hand-maintained hashes at all, which is the usual reason people give up
+  # on nixifying Rust.
+
+  # Only the files that affect the build. Without this, `src = ./.` drags in
+  # target/ and build/ — gigabytes — and every rebuild of either invalidates
+  # the derivation.
+  rutterSrc = lib.cleanSourceWith {
+    name = "rutter-src";
+    src = ./.;
+    filter = path: _type:
+      let
+        relative = lib.removePrefix (toString ./. + "/") (toString path);
+        top = builtins.head (lib.splitString "/" relative);
+      in
+      builtins.elem top [
+        "Cargo.toml"
+        "Cargo.lock"
+        "core"
+        "charts"
+        "render"
+        "platform"
+        "android"
+      ];
+  };
+
+  # The same toolchain the shell uses, rather than nixpkgs' rustc. Two
+  # toolchains would mean the shell and the derivation could disagree about
+  # which Rust compiled a given artifact, which is exactly the drift this
+  # project pins inputs to avoid.
+  rustPlatform = pkgs.makeRustPlatform {
+    cargo = rustToolchain;
+    rustc = rustToolchain;
+  };
+
+  # ── Linux binary ───────────────────────────────────────────────────────────
+
+  rutterLinux = rustPlatform.buildRustPackage {
+    pname = "rutter";
+    version = "0.1.0";
+    src = rutterSrc;
+
+    # Reads Cargo.lock directly: no cargoHash to bump when a dependency
+    # changes, and no outputHashes because nothing comes from git.
+    cargoLock.lockFile = ./Cargo.lock;
+
+    cargoBuildFlags = [ "--package" "rutter-linux" ];
+
+    # core and charts only. render needs a GPU and a surface, and there is
+    # neither in a build sandbox.
+    cargoTestFlags = [ "--package" "rutter-core" "--package" "rutter-charts" ];
+
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+
+    # wgpu dlopens the Vulkan loader and winit dlopens the Wayland and X11
+    # client libraries. Because they are never DT_NEEDED, Nix's automatic
+    # runtime-dependency scan cannot see them and the binary would start and
+    # then fail at surface creation with an error that reads like a driver
+    # problem. The wrapper is not optional.
+    #
+    # Mesa is deliberately absent: NixOS exposes the real driver at
+    # /run/opengl-driver, which the loader finds on its own, and adding
+    # nixpkgs' mesa here puts a second copy of every implicit layer on the
+    # path.
+    postInstall = ''
+      wrapProgram $out/bin/rutter \
+        --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath linuxRuntimeLibs}"
+    '';
+
+    meta = {
+      description = "Marine navigation: charts, weather and tides";
+      mainProgram = "rutter";
+      platforms = lib.platforms.linux;
+    };
+  };
+
+  # ── Android shared library ─────────────────────────────────────────────────
+
+  rutterAndroidLib = rustPlatform.buildRustPackage ({
+    pname = "rutter-android-lib";
+    version = "0.1.0";
+    src = rutterSrc;
+    cargoLock.lockFile = ./Cargo.lock;
+
+    # `--target` on the command line, not CARGO_BUILD_TARGET in the
+    # environment: buildRustPackage's own setup hook exports
+    # CARGO_BUILD_TARGET for the host *after* a derivation attribute of that
+    # name is set, so setting it here is silently overridden and the build
+    # quietly produces a host library instead. The tell is x11 and wayland
+    # crates compiling for an Android build.
+    cargoBuildFlags = [
+      "--package"
+      "rutter-android"
+      "--target"
+      androidAbis.${defaultAbi}.rust
+    ];
+
+    # The tests would be aarch64 binaries; there is nothing here to run them
+    # on. They are covered by the Linux derivation's check phase, and the
+    # code under test is the same.
+    doCheck = false;
+
+    # buildRustPackage's install phase looks for bin/; this produces a
+    # cdylib, so place it where an APK build expects to find it.
+    installPhase = ''
+      runHook preInstall
+
+      so=target/${androidAbis.${defaultAbi}.rust}/release/librutter.so
+      if [ ! -f "$so" ]; then
+        echo "expected $so, which is not there." >&2
+        echo "Found instead:" >&2
+        find target -name 'librutter.so' -type f >&2 || true
+        exit 1
+      fi
+
+      # Confirm it is for the architecture claimed. A host build that landed
+      # in the right directory would otherwise install silently and only fail
+      # at `adb install`, which is a long way from the cause.
+      if ! ${pkgs.file}/bin/file -b "$so" | grep -q 'ARM aarch64'; then
+        echo "$so is not an aarch64 object:" >&2
+        ${pkgs.file}/bin/file -b "$so" >&2
+        exit 1
+      fi
+
+      mkdir -p "$out/lib/${defaultAbi}"
+      cp "$so" "$out/lib/${defaultAbi}/librutter.so"
+      chmod +w "$out/lib/${defaultAbi}/librutter.so"
+
+      # Strip explicitly, with the NDK's own tool.
+      #
+      # Two reasons this is not left to anyone else. Nix's fixup strip is the
+      # host binutils and has no business touching an aarch64 Android object,
+      # which is why dontStrip is set. And Cargo's `strip = true` in
+      # [profile.release] does not survive into this sandbox — the library
+      # comes out "with debug_info, not stripped" at 13.6 MB against the
+      # 7.1 MB the dev shell produces from the same profile. Doing it here is
+      # deterministic and needs no theory about why.
+      #
+      # --strip-unneeded rather than --strip-all: it keeps .dynsym, and
+      # android_main has to stay exported or the NDK's glue cannot find the
+      # entry point by name.
+      ${ndkBin}/llvm-strip --strip-unneeded "$out/lib/${defaultAbi}/librutter.so"
+
+      if ! ${ndkBin}/llvm-nm --dynamic "$out/lib/${defaultAbi}/librutter.so" \
+        | grep -q ' android_main$'; then
+        echo "android_main is not exported after stripping" >&2
+        exit 1
+      fi
+
+      runHook postInstall
+    '';
+
+    # Nothing here should be patched for the host: it is an aarch64 Android
+    # object and both of these would corrupt it.
+    dontPatchELF = true;
+    dontStrip = true;
+
+    meta = {
+      description = "rutter's Android shared library (${defaultAbi})";
+      platforms = lib.platforms.linux;
+    };
+  } // androidCargoEnv);
+
+  # The APK's assets, assembled rather than checked in twice.
+  #
+  # The chart lives at charts/tests/data/coast.mbtiles, where it is the unit
+  # tests' fixture. Copying it into android/assets/ as well would mean two
+  # copies of the same bytes tracked in the repository, free to drift. This
+  # builds the directory aapt2 wants from the one real copy.
+  androidAssets = pkgs.runCommand "rutter-android-assets" { } ''
+    mkdir -p "$out"
+    cp ${./charts/tests/data/coast.mbtiles} "$out/coast.mbtiles"
+  '';
+
+  # ── Unsigned APK ───────────────────────────────────────────────────────────
+  #
+  # Unsigned on purpose. Everything in /nix/store is world-readable, so a
+  # signing key must never become a derivation input — for a throwaway debug
+  # key that would be merely untidy, but it is the wrong habit to build into
+  # the project before there is a release key to protect.
+  #
+  # So: Nix produces the reproducible, aligned APK, and `rutter apk` signs it
+  # with a key that stays in build/ and is gitignored. Sign this one with:
+  #
+  #   apksigner sign --ks build/debug.keystore --out signed.apk \
+  #     result/rutter-${defaultAbi}-unsigned.apk
+  rutterApk = pkgs.runCommand "rutter-${defaultAbi}-unsigned.apk"
+    {
+      nativeBuildInputs = [ pkgs.zip ];
+      passthru = { inherit rutterAndroidLib; };
+    }
+    ''
+      bt=${sdkRoot}/build-tools/${buildTools}
+      jar=${sdkRoot}/platforms/android-${compileSdk}/android.jar
+
+      mkdir -p staging/lib/${defaultAbi}
+      cp ${rutterAndroidLib}/lib/${defaultAbi}/librutter.so \
+        staging/lib/${defaultAbi}/librutter.so
+      chmod +w staging/lib/${defaultAbi}/librutter.so
+
+      # No res/ and no classes.dex: the manifest declares hasCode="false" and
+      # the activity is the framework's android.app.NativeActivity.
+      "$bt/aapt2" link \
+        --manifest ${./android/AndroidManifest.xml} \
+        -I "$jar" \
+        -A ${androidAssets} \
+        --min-sdk-version ${minSdk} \
+        --target-sdk-version ${compileSdk} \
+        -o unaligned.apk \
+        --no-version-vectors
+
+      # -0 stores rather than deflates, which extractNativeLibs="false"
+      # requires: the loader maps the .so out of the APK in place.
+      ( cd staging && zip -q -0 -X ../unaligned.apk "lib/${defaultAbi}/librutter.so" )
+
+      # -P 16 aligns the stored .so to 16 KB pages, which Android 15+ needs.
+      # The ELF's own segment alignment is a separate thing, set by the
+      # linker flag in androidCargoEnv; both have to be right.
+      "$bt/zipalign" -f -P 16 4 unaligned.apk "$out"
+    '';
+
   # ── The driver ─────────────────────────────────────────────────────────────
 
   rutter = pkgs.writeShellScriptBin "rutter" ''
@@ -297,20 +544,26 @@ let
         echo
 
         echo "── Not done yet ───────────────────────────────────────────────"
-        echo '  APK packaging        no gradle/aapt2 path wired up; `rutter'
-        echo '                       android` builds the .so and stops there.'
+        echo '  On-device testing    `rutter apk` builds and signs one, but'
+        echo '                       it has not been run on real hardware.'
         echo '  iOS                  needs Xcode on macOS; cannot be built'
         echo '                       from this machine at all.'
-        echo '  Chart data           `rutter charts` is the pipeline; no'
-        echo '                       charts are vendored.'
+        echo '  Chart data           `rutter charts` is the pipeline; no real'
+        echo '                       charts are vendored. The 32 KB fixture'
+        echo '                       at charts/tests/data/ is invented data.'
+        echo '  Filled polygons      depth areas draw as outlines; filling'
+        echo '                       needs a triangulator.'
+        echo '  Raster tiles         recognised and refused with a message;'
+        echo '                       only vector tiles can be drawn.'
         ;;
 
       test)
         shift
-        # The core is where correctness lives, so it is what `test` means.
-        # --workspace would drag wgpu in, which takes minutes and tests
-        # nothing that is not better judged by looking at the window.
-        exec cargo test --package rutter-core "$@"
+        # core and charts are where correctness lives, so they are what
+        # `test` means. --workspace would drag wgpu in, which takes minutes
+        # and tests little that is not better judged by looking at the
+        # window.
+        exec cargo test --package rutter-core --package rutter-charts "$@"
         ;;
 
       test-all)
@@ -320,7 +573,12 @@ let
 
       run)
         shift
-        exec cargo run --package rutter-linux "$@"
+        # The `--` matters: without it cargo eats --charts as its own.
+        #
+        # With no arguments this draws only the tile grid. Pass a chart to
+        # see something:
+        #   rutter run --charts charts/tests/data/coast.mbtiles
+        exec cargo run --package rutter-linux -- "$@"
         ;;
 
       build)
@@ -355,9 +613,154 @@ let
           printf '  pages: %s\n' \
             "$(readelf -lW "$out/librutter.so" | awk '/LOAD/{print $NF; exit}')"
         fi
+        ;;
+
+      apk)
+        shift
+        target=$(abi_to_rust "$abi")
+
+        # Build the library first; `rutter android` already prints its size
+        # and verifies the ELF, so reuse it rather than duplicating.
+        "$0" android
+
+        out=build/apk
+        rm -rf "$out"
+        mkdir -p "$out/lib/$abi"
+        cp "build/android/$abi/librutter.so" "$out/lib/$abi/librutter.so"
+
+        # Assets, assembled from the one copy of the chart rather than a
+        # second one checked in beside the manifest. Same reason as the
+        # androidAssets derivation.
+        assets=build/assets
+        rm -rf "$assets"
+        mkdir -p "$assets"
+        cp charts/tests/data/coast.mbtiles "$assets/coast.mbtiles"
+
+        bt=${sdkRoot}/build-tools/${buildTools}
+        jar=${sdkRoot}/platforms/android-${compileSdk}/android.jar
+
+        # ── Resources and manifest ──────────────────────────────────────────
+        #
+        # No Gradle. Gradle under Nix means a wrapper that wants to download
+        # its own distribution, an Android Gradle Plugin that fetches a
+        # generic-linux aapt2 from Maven that cannot run here, and a JDK
+        # version dance — all of which cost a day in ../../opencpn. aapt2,
+        # zipalign and apksigner are three commands and do the whole job.
+        #
+        # There is no res/ directory and no classes.dex: the manifest sets
+        # android:hasCode="false" and the activity is the framework's
+        # android.app.NativeActivity, so the APK carries no bytecode at all.
+        echo "linking resources"
+        "$bt/aapt2" link \
+          --manifest android/AndroidManifest.xml \
+          -I "$jar" \
+          -A "$assets" \
+          --min-sdk-version ${minSdk} \
+          --target-sdk-version ${compileSdk} \
+          -o "$out/unaligned.apk" \
+          --no-version-vectors
+
+        # ── Native library ──────────────────────────────────────────────────
+        #
+        # -0 stores without compressing. Required: the manifest says
+        # extractNativeLibs="false", so the loader maps the .so straight out
+        # of the APK, which it can only do if the bytes are uncompressed and
+        # page-aligned.
+        echo "adding librutter.so"
+        ( cd "$out" && zip -q -0 -X unaligned.apk "lib/$abi/librutter.so" )
+
+        # ── Alignment ───────────────────────────────────────────────────────
+        #
+        # -P 16 aligns uncompressed .so files to 16 KB pages. Android 15+
+        # requires it, and the linker flag in this file only controls the
+        # ELF's own segment alignment — the APK's zip offsets are a separate
+        # thing that only zipalign can fix.
+        #
+        # Not `-p -P 16`: zipalign rejects the combination, because -p means
+        # the older 4 KB page alignment and -P names a size explicitly.
+        echo "aligning"
+        "$bt/zipalign" -f -P 16 4 "$out/unaligned.apk" "$out/aligned.apk"
+
+        # ── Signing ─────────────────────────────────────────────────────────
+        #
+        # A debug keystore, generated on first use. Android refuses to
+        # install an unsigned APK; this is the same self-signed key every
+        # Android SDK creates for debug builds, with the same well-known
+        # password, and it is gitignored because it is worth nothing.
+        ks=build/debug.keystore
+        if [ ! -f "$ks" ]; then
+          echo "generating a debug keystore"
+          # PKCS12 rather than the default JKS: keytool warns on every use of
+          # a JKS store and tells you to migrate, which is noise on a key
+          # that exists only to make the installer happy.
+          keytool -genkeypair \
+            -keystore "$ks" -storetype PKCS12 \
+            -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10950 \
+            -dname "CN=Android Debug, O=Android, C=US"
+        fi
+
+        apk=build/rutter-$abi-debug.apk
+        echo "signing"
+        "$bt/apksigner" sign \
+          --ks "$ks" --ks-pass pass:android --key-pass pass:android \
+          --ks-key-alias androiddebugkey \
+          --out "$apk" "$out/aligned.apk"
+
+        "$bt/apksigner" verify --print-certs "$apk" > /dev/null
         echo
-        echo "No APK yet — see 'rutter doctor'. The .so is the deliverable"
-        echo "for now, and it is what an APK would carry."
+        echo "  $apk"
+        ls -lh "$apk" | awk '{print "  size:", $5}'
+        # Prove the claims rather than trusting them: no bytecode, the .so
+        # stored rather than deflated, and the manifest's own view of itself.
+        echo "  dex entries: $(unzip -l "$apk" | grep -c '[.]dex$' || true)"
+        echo "  librutter.so: $(unzip -v "$apk" | awk '/librutter[.]so/{print $3, "bytes,", $4}')"
+        "$bt/aapt2" dump badging "$apk" 2>/dev/null \
+          | grep -E '^(package|sdkVersion|targetSdkVersion|native-code|launchable-activity)' \
+          | sed 's/^/  /'
+        echo
+        echo "Install it with: rutter install"
+        ;;
+
+      install)
+        shift
+        apk=build/rutter-$abi-debug.apk
+        if [ ! -f "$apk" ]; then
+          echo "no $apk — run 'rutter apk' first" >&2
+          exit 1
+        fi
+        if ! "$adb" get-state >/dev/null 2>&1; then
+          echo "no device. Enable wireless debugging on the phone, then:" >&2
+          echo "  rutter adb pair <host:port>   # with the pairing code" >&2
+          echo "  rutter adb connect <host:port>" >&2
+          exit 1
+        fi
+        # -r reinstalls over an existing copy, keeping its data; -d allows a
+        # downgrade, which matters while the version code is not bumped.
+        exec "$adb" install -r -d "$apk"
+        ;;
+
+      run-android)
+        shift
+        if ! "$adb" get-state >/dev/null 2>&1; then
+          echo "no device — see 'rutter install'" >&2
+          exit 1
+        fi
+        exec "$adb" shell am start -n com.pjhockey7.rutter/android.app.NativeActivity
+        ;;
+
+      logcat)
+        shift
+        # rutter's own log tag, plus the runtime messages that explain a
+        # crash the app itself never gets to report.
+        exec "$adb" logcat -v time \
+          rutter:V RustStdoutStderr:V AndroidRuntime:E DEBUG:V libc:F \
+          wgpu:V wgpu_hal:V Vulkan:V "*:S"
+        ;;
+
+      uninstall)
+        shift
+        exec "$adb" uninstall com.pjhockey7.rutter
         ;;
 
       charts)
@@ -419,11 +822,16 @@ let
     rutter — charts, weather and tides
 
       doctor     print the toolchain and what is still missing  <- start here
-      test       cargo test on the core (fast; this is the real test suite)
+      test       cargo test on core and charts (fast; the real test suite)
       test-all   cargo test on the whole workspace (slow; builds wgpu)
-      run        open the Linux app
+      run        open the Linux app; --charts <file.mbtiles> to load a chart
       build      cargo build, whole workspace
       android    cross-compile the shared library for $RUTTER_ABI
+      apk        build a signed, installable APK (no Gradle)
+      install    adb install the APK
+      run-android  launch it on the device
+      logcat     follow the device log, filtered to what matters
+      uninstall  remove it from the device
       charts     <source> <out.mbtiles> — turn chart data into tiles
       fmt        cargo fmt
       lint       cargo clippy
@@ -463,8 +871,18 @@ let
       # Diagnostics, for when the window is black.
       pkgs.vulkan-tools
       pkgs.binutils
+      # apksigner and keytool are Java programs. Headless: nothing here
+      # opens a window from the JVM, and the full JDK drags in a toolkit.
+      pkgs.jdk_headless
+      # `zip` adds the .so to the APK aapt2 produced. aapt2 can only package
+      # resources and the manifest; native libraries go in afterwards, and
+      # they must be STORED rather than deflated for page alignment to mean
+      # anything.
+      pkgs.zip
+      pkgs.unzip
     ] ++ linuxRuntimeLibs;
 
+    JAVA_HOME = "${pkgs.jdk_headless}";
     ANDROID_HOME = sdkRoot;
     ANDROID_SDK_ROOT = sdkRoot;
     ANDROID_NDK_ROOT = ndkRoot;
@@ -486,6 +904,19 @@ in
 {
   inherit pkgs androidComposition rustToolchain rutter sdkRoot ndkRoot;
   inherit minSdk compileSdk ndkVersion androidAbis defaultAbi;
+  inherit rutterSrc rustPlatform;
+
+  # Nix-built artifacts. See the comment above rutterSrc for why these exist
+  # alongside the dev shell rather than instead of it.
+  #
+  #   nix-build --attr packages.linux       → bin/rutter, wrapped
+  #   nix-build --attr packages.androidLib  → lib/<abi>/librutter.so
+  #   nix-build --attr packages.apk         → an unsigned, aligned APK
+  packages = {
+    linux = rutterLinux;
+    androidLib = rutterAndroidLib;
+    apk = rutterApk;
+  };
 
   shells.default = shell;
 

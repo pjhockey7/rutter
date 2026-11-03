@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  rutter's Android manifest.
+
+  There is no Java in this app and no classes.dex in the APK. That is the
+  point of `android:hasCode="false"` below: `android.app.NativeActivity` is a
+  framework class, so the system can launch a purely native app with no
+  application bytecode at all. The `android-activity` crate reimplements the
+  NDK's native_app_glue in Rust and `winit` drives it from there.
+
+  This is also what ../../opencpn could not do. Qt's Android port needs a Java
+  activity to call into, which is exactly the tree OpenCPN never published —
+  58 native calls, 37 of them to methods that do not exist anywhere public.
+  Avoiding Java entirely avoids that whole class of problem.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.pjhockey7.rutter"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <!--
+      minSdk 24 is chosen, not inherited: API 21 and 22 hide fseeko/ftello
+      under _FILE_OFFSET_BITS=64 and 23 and below hide nl_langinfo, each of
+      which cost a day in the opencpn attempt. 24 is also where Vulkan became
+      dependable, which wgpu cares about.
+    -->
+    <uses-sdk
+        android:minSdkVersion="24"
+        android:targetSdkVersion="35" />
+
+    <!--
+      Vulkan rather than GL ES. Not required=true: wgpu falls back to GL ES,
+      and refusing to install on a device without Vulkan would be a worse
+      failure than running slower on one.
+    -->
+    <uses-feature
+        android:name="android.hardware.vulkan.level"
+        android:version="0"
+        android:required="false" />
+
+    <application
+        android:label="rutter"
+        android:hasCode="false"
+        android:extractNativeLibs="false"
+        android:debuggable="true">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:label="rutter"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor"
+            android:resizeableActivity="true"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode">
+
+            <!--
+              Which library to load, without the `lib` prefix or the `.so`.
+              The cdylib in platform/android/Cargo.toml is named `rutter`, so
+              this resolves to librutter.so.
+            -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="rutter" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

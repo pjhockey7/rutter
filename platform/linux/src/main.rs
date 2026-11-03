@@ -11,6 +11,8 @@
 
 use std::sync::Arc;
 
+use rutter_charts::ChartSource;
+use rutter_core::chart::TileId;
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{Frame, Renderer};
 use winit::application::ApplicationHandler;
@@ -21,6 +23,14 @@ use winit::window::{Window, WindowId};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
+    let charts = match load_charts() {
+        Ok(c) => c,
+        Err(message) => {
+            eprintln!("rutter: {message}");
+            std::process::exit(1);
+        }
+    };
 
     let event_loop = match EventLoop::new() {
         Ok(el) => el,
@@ -34,11 +44,78 @@ fn main() {
     // redrawn, and the difference on a laptop is several watts.
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::default();
+    let mut app = App {
+        charts,
+        ..App::default()
+    };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rutter: {e}");
         std::process::exit(1);
     }
+}
+
+/// Read the command line and open a chart file if one was named.
+///
+/// Hand-parsed rather than with clap: there is one option, and a dependency
+/// that has to cross-compile to four Android ABIs should buy more than this.
+fn load_charts() -> Result<Option<ChartSource>, String> {
+    let mut args = std::env::args().skip(1);
+    let mut path = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--charts" | "-c" => {
+                path = Some(
+                    args.next()
+                        .ok_or("--charts needs a path to an .mbtiles file")?,
+                );
+            }
+            "--help" | "-h" => {
+                println!("usage: rutter [--charts <file.mbtiles>]");
+                println!();
+                println!("  drag or arrows  pan");
+                println!("  scroll or +/-   zoom");
+                println!("  0               home");
+                println!("  Escape          quit");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown option '{other}' — try --help")),
+        }
+    }
+
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    let source = ChartSource::open(&path, &[]).map_err(|e| format!("{path}: {e}"))?;
+    let meta = source.metadata();
+
+    if !meta.is_vector() {
+        return Err(format!(
+            "{path}: format '{}' is raster; only vector tiles can be drawn yet",
+            meta.format
+        ));
+    }
+
+    println!(
+        "charts: {} — zoom {}..{}{}",
+        if meta.name.is_empty() {
+            path.as_str()
+        } else {
+            meta.name.as_str()
+        },
+        meta.min_zoom,
+        meta.max_zoom,
+        match meta.bounds {
+            Some(b) => format!(
+                ", bounds {:.3},{:.3} to {:.3},{:.3}",
+                b[0], b[1], b[2], b[3]
+            ),
+            None => String::new(),
+        }
+    );
+
+    Ok(Some(source))
 }
 
 #[derive(Default)]
@@ -49,6 +126,14 @@ struct App {
     /// Cursor position, kept so a drag can be measured.
     cursor: Option<(f64, f64)>,
     dragging: bool,
+    charts: Option<ChartSource>,
+    /// The tile set the renderer's chart buffer was built from.
+    ///
+    /// Kept so that panning within one tile — most of a drag — does not
+    /// re-decode and re-upload geometry that has not changed. This is the
+    /// whole reason the renderer stores chart vertices against their own
+    /// origin rather than the view's.
+    loaded: Vec<TileId>,
 }
 
 impl App {
@@ -73,7 +158,58 @@ impl App {
         self.view.centre = chart::unproject(w);
     }
 
+    /// Reload chart geometry if the visible tile set has changed.
+    ///
+    /// The comparison is against the exact tile list, not the zoom or the
+    /// centre: a drag of ten pixels usually keeps the same tiles visible, and
+    /// re-decoding gzip and protobuf for geometry already on the GPU is the
+    /// kind of waste that shows up as a warm phone.
+    fn refresh_charts(&mut self) {
+        let Some(source) = self.charts.as_mut() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+
+        let got = source.collect(&self.view);
+
+        if got.tiles == self.loaded {
+            return;
+        }
+
+        if let Some(wanted) = got.over_budget {
+            // Zoomed far outside the chart's range. Clear rather than leave
+            // the previous zoom's geometry on screen pretending to be this
+            // one.
+            log::debug!("charts: {wanted} tiles wanted, over budget — not drawing");
+            renderer.clear_chart();
+            self.loaded = got.tiles;
+            return;
+        }
+
+        // One unreadable tile should not take the chart down: a corrupt blob
+        // in the middle of a file still leaves the rest navigable.
+        for (id, why) in &got.failed {
+            log::warn!("{id:?}: {why}");
+        }
+
+        renderer.set_chart(&got.line_slices(), &got.points);
+
+        log::debug!(
+            "charts: {} tiles, {} polylines, {} points, {} vertices",
+            got.tiles.len(),
+            got.lines.len(),
+            got.points.len(),
+            renderer.chart_vertex_count()
+        );
+
+        self.loaded = got.tiles;
+    }
+
     fn redraw(&mut self) {
+        self.refresh_charts();
+
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -93,6 +229,9 @@ impl App {
                 log::warn!("surface lost; rebuilding");
                 self.renderer = None;
                 self.window = None;
+                // The chart buffer died with the renderer, so the record of
+                // what was uploaded is now a lie.
+                self.loaded.clear();
             }
         }
     }
@@ -121,6 +260,16 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         self.view.width_px = size.width.max(1);
         self.view.height_px = size.height.max(1);
+
+        // Open on the chart rather than on the hard-coded default, so that
+        // passing --charts shows the data instead of empty sea next to it.
+        if let Some(source) = &self.charts {
+            let meta = source.metadata();
+            if let Some(b) = meta.bounds {
+                self.view.centre = LatLon::new((b[1] + b[3]) / 2.0, (b[0] + b[2]) / 2.0);
+                self.view.zoom = f64::from(meta.max_zoom);
+            }
+        }
 
         // pollster rather than tokio: this is the one await in the whole
         // program, and it happens once at startup.

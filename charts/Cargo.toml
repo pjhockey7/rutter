@@ -1,0 +1,30 @@
+[package]
+name = "rutter-charts"
+description = "MBTiles and vector tile decoding for chart data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rutter-core.workspace = true
+
+# SQLite, compiled from the vendored C sources rather than linked against a
+# system library. `bundled` is not laziness: Android ships its own libsqlite3
+# but does not expose it to the NDK, and linking a system SQLite would make
+# the build depend on the host distribution. The C compiles with the NDK
+# clang that default.nix already puts in CC_<triple>.
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+# Vector tiles in MBTiles are gzipped. `rust_backend` rather than the default
+# zlib C shim, so there is one less C library to cross-compile.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+# Integration tests in tests/ see only the public API and dev-dependencies,
+# not this crate's own dependencies — and one test builds a SQLite file that
+# is deliberately not MBTiles, to check it is rejected cleanly.
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+[lints]
+workspace = true

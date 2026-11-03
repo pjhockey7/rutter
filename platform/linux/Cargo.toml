@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 rutter-core.workspace = true
+rutter-charts.workspace = true
 rutter-render.workspace = true
 # No wgpu dependency: rutter-render's own Frame enum covers everything this
 # crate needs to know about the GPU, which is the point of having it.

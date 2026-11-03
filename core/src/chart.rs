@@ -53,7 +53,10 @@ pub fn unproject(w: WorldXY) -> LatLon {
 }
 
 /// A slippy-map tile address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Default` is zoom 0, tile (0,0) — the single tile covering the whole
+/// world, which is the only address valid at every zoom level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct TileId {
     pub z: u8,
     pub x: u32,
