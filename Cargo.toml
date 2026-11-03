@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+	"core",
+	"render",
+	"platform/linux",
+	"platform/android",
+]
+
+# Shared metadata, so a version bump is one edit rather than four.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# 2021 rather than 2024: the Android NDK's bundled toolchain lags, and nothing
+# here needs a 2024 feature. Revisit when the Android side is settled.
+rust-version = "1.82"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+rutter-core = { path = "core" }
+rutter-render = { path = "render" }
+
+wgpu = "30.0"
+winit = "0.30"
+raw-window-handle = "0.6"
+pollster = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+android-activity = "0.6"
+android_logger = "0.14"
+
+[workspace.lints.rust]
+# The core is the part that has to be right; unsafe belongs only in the
+# platform shims, and even there it should be visible in review.
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# Panicking is a crash on a phone in the rain with no stack trace. Prefer
+# Result and Option at the boundaries.
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Debug builds of a renderer are too slow to judge anything by, and release
+# builds take long enough to discourage running them. Optimise dependencies
+# even in debug: the app's own code stays fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Android APK size matters more than the last few percent of speed.
+strip = true

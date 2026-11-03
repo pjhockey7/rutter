@@ -1,0 +1,7 @@
+{"v":"1.3.0"
+,"i":{
+"nixpkgs":{"sn":"nixpkgs-src","kd":[1,{"ft":0,"ur":"https://github.com/NixOS/nixpkgs/archive/0bb2eedc20e4739f29e8045034f2828ad7054f8f.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-fiPJ88izTVucjeo2EQ3jk4aWmLg03I1D4vxnX2QjEgE="},"fv":"0bb2eedc20e4739f29e8045034f2828ad7054f8f","ps":[]}
+,"rust-overlay":{"sn":"rust-overlay-src","kd":[1,{"ft":0,"ur":"https://github.com/oxalica/rust-overlay/archive/6b29b8e8d3cc8ebda9342fbbcc7ac06eff58e2fb.tar.gz","ms":[]}],"ha":{"al":0,"vl":"sha256-5V08BokWHSUU962Kcr/uSTWyy+1NqB7pjuyqjqXTqQU="},"fv":"6b29b8e8d3cc8ebda9342fbbcc7ac06eff58e2fb","ps":[]}
+}
+,"p":{}
+}

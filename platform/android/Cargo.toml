@@ -1,0 +1,33 @@
+[package]
+name = "rutter-android"
+description = "Android board support: NativeActivity entry point"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: the APK loads this with System.loadLibrary, so it has to be a real
+# shared object. `rlib` alongside it so `cargo check` on the host still works
+# — without it, checking this crate off-Android is awkward.
+name = "rutter"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rutter-core.workspace = true
+rutter-render.workspace = true
+# No wgpu dependency — see platform/linux/Cargo.toml.
+pollster.workspace = true
+log.workspace = true
+
+winit = { workspace = true, features = ["android-native-activity", "rwh_06"] }
+
+# Android-only, so that `cargo check` on the laptop does not try to build the
+# NDK glue. cfg() rather than a feature flag: the condition is the target, and
+# a feature could be set wrongly.
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity.workspace = true
+android_logger.workspace = true
+
+[lints]
+workspace = true

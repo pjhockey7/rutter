@@ -1,0 +1,16 @@
+[package]
+name = "rutter-core"
+description = "Portable navigation core: charts, weather and tides"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No dependencies, on purpose. Every platform this project targets has to
+# build this crate, so the fewer things that can fail to cross-compile the
+# better. Anything that needs a dependency — GRIB2 decode, SQLite for
+# MBTiles — goes behind a feature or into a sibling crate.
+[dependencies]
+
+[lints]
+workspace = true

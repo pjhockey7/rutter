@@ -1,0 +1,42 @@
+// ┏┓╻+╻ ╱┏┳┓┏┓┏┳┓┏┓╻
+// ┃┃┃┃┗━┓╹┃╹┣┫┃┃┃┣┫┃   Read the manpage:
+// ╹┗┛╹╱ ╹ ╹ ╹╹╹ ╹╹╹┗┛  $ man nixtamal-manifest
+//
+// Schema 1.3.0. `archive` rather than `git` for both inputs, matching upkeep,
+// golflight and opencpn: one tarball per refresh instead of a clone.
+//
+// This project does not share a nixpkgs revision with any other repo here, so
+// refresh it on its own schedule. The two inputs are independent — refresh one
+// without the other — but rust-overlay reads nixpkgs' stdenv when applied, so
+// a very old nixpkgs against a very new rust-overlay can skew. If `rutter
+// doctor` starts reporting a missing Rust target after refreshing only one,
+// refresh both.
+version "1.3.0"
+inputs {
+	nixpkgs {
+		archive {
+			url "https://github.com/NixOS/nixpkgs/archive/{{fresh_value}}.tar.gz"
+		}
+		hash algorithm=SHA-256
+		fresh-cmd {
+			$ git ls-remote "https://github.com/NixOS/nixpkgs.git" --refs "refs/heads/nixos-unstable"
+			| cut -f1
+		}
+	}
+
+	// Rust toolchains as a nixpkgs overlay. Needed because the Rust in nixpkgs
+	// ships std for the build host only, and this project cross-compiles the
+	// core to aarch64-linux-android (and later the other three Android ABIs).
+	// rust-overlay's `targets = [ … ]` override pulls the matching rust-std
+	// components from static.rust-lang.org, hash-pinned by the overlay itself.
+	rust-overlay {
+		archive {
+			url "https://github.com/oxalica/rust-overlay/archive/{{fresh_value}}.tar.gz"
+		}
+		hash algorithm=SHA-256
+		fresh-cmd {
+			$ git ls-remote "https://github.com/oxalica/rust-overlay.git" --refs "refs/heads/master"
+			| cut -f1
+		}
+	}
+}

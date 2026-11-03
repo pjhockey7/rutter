@@ -1,0 +1,16 @@
+[package]
+name = "rutter-render"
+description = "Chart rendering over wgpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rutter-core.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "rutter-linux"
+description = "Linux board support: window, event loop, input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rutter"
+path = "src/main.rs"
+
+[dependencies]
+rutter-core.workspace = true
+rutter-render.workspace = true
+# No wgpu dependency: rutter-render's own Frame enum covers everything this
+# crate needs to know about the GPU, which is the point of having it.
+pollster.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+# Both display protocols. Wayland is the session this is developed on; X11 is
+# there for XWayland and for anyone on a plain X session, and costs only
+# binary size since winit dlopen()s whichever it finds at runtime.
+winit = { workspace = true, features = ["wayland", "x11", "rwh_06"] }
+
+[lints]
+workspace = true

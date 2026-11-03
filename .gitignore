@@ -1,0 +1,33 @@
+# --- Nix ---
+result
+result-*
+
+# --- Rust ---
+target/
+# Cargo.lock IS tracked. This workspace produces binaries, not a library for
+# others to depend on, so a reproducible dependency set is the whole point —
+# the same reason nix/tamal exists.
+
+# --- Build output ---
+# `rutter android` puts the per-ABI shared libraries here; all regenerable.
+build/
+*.apk
+*.aab
+*.keystore
+
+# --- Chart data ---
+# Charts are large, often licensed, and never ours to redistribute. `rutter
+# charts` writes here; the source data belongs outside the repo.
+charts/
+*.mbtiles
+*.000
+
+# --- Weather data ---
+# GRIB files are downloaded forecasts with a shelf life of hours.
+*.grb
+*.grb2
+*.grib2
+
+# --- Editor local history ---
+.history
+.history/
