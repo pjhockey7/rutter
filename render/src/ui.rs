@@ -70,6 +70,10 @@ pub enum Action {
     UseDeviceGps,
     /// Show or hide the tidal currents.
     SetCurrents(bool),
+    /// Show or hide the temperature wash.
+    SetTemperature(bool),
+    /// How strongly the temperature wash is painted, 0..1.
+    SetTemperatureOpacity(f32),
     /// Look at a time this many seconds from now. Zero is now.
     SetTimeOffset(i64),
     /// Back to now.
@@ -99,6 +103,26 @@ pub struct CurrentState {
     /// as harmonic ones, and a chart with two arrows on it looks broken
     /// until you know why.
     pub subordinate_nearby: usize,
+}
+
+/// What the panel knows about the air temperature.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TemperatureState {
+    /// Whether a forecast carrying temperature is loaded.
+    pub available: bool,
+    pub visible: bool,
+    pub opacity: f32,
+    /// The temperature where the boat is, or failing that at the middle of
+    /// the screen: "18.4 °C".
+    pub here: Option<String>,
+    /// Where that reading is from — "at the boat" or "at the centre" — so
+    /// a number on screen is never unattributed.
+    pub here_is: Option<String>,
+    /// The warmest and coldest in view, which is what says whether the
+    /// wash is showing a gradient or a single colour.
+    pub range: Option<String>,
+    /// How many lattice cells are being drawn, for the status line.
+    pub cells: usize,
 }
 
 /// What the panel knows about the time being shown.
@@ -319,6 +343,7 @@ pub struct PanelState {
     pub imagery: ImageryState,
     pub tides: TideState,
     pub currents: CurrentState,
+    pub temperature: TemperatureState,
     pub time: TimeState,
     pub draft: DraftState,
     pub wind: WindState,
@@ -414,6 +439,7 @@ impl Ui {
             imagery,
             tides,
             currents,
+            temperature,
             time,
             draft,
             wind,
@@ -554,6 +580,8 @@ impl Ui {
                 actions.extend(Self::current_section(ui, currents));
                 ui.separator();
                 actions.extend(Self::wind_section(ui, wind));
+                ui.separator();
+                actions.extend(Self::temperature_section(ui, temperature));
                 ui.separator();
                 actions.extend(Self::draft_section(ui, draft));
                 ui.separator();
@@ -955,6 +983,122 @@ impl Ui {
         }
 
         actions
+    }
+
+    /// The air temperature: a wash over the water and a number for here.
+    fn temperature_section(ui: &mut egui::Ui, state: &TemperatureState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = state.visible;
+            let toggle = ui.add_enabled(
+                state.available,
+                egui::Checkbox::new(&mut on, "Air temperature"),
+            );
+            if toggle.clicked() {
+                actions.push(Action::SetTemperature(on));
+            }
+            if !state.available {
+                toggle.on_hover_text(
+                    "No forecast loaded. Temperature comes in the same file \
+                     as the wind: `rutter weather --chart <file>`.",
+                );
+            }
+        });
+
+        if !state.available {
+            return actions;
+        }
+
+        // The reading is shown whether or not the wash is, because a
+        // number is useful even with the colour switched off — and it is
+        // always attributed, since "18 degrees" means different things at
+        // the boat and at the far corner of the screen.
+        if let Some(here) = &state.here {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(here).strong());
+                if let Some(where_from) = &state.here_is {
+                    ui.label(egui::RichText::new(where_from).weak().small());
+                }
+            });
+        }
+
+        if !state.visible {
+            return actions;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("wash").weak().small());
+            let mut opacity = state.opacity;
+            if ui
+                .add(
+                    egui::Slider::new(&mut opacity, 0.0..=1.0)
+                        .show_value(false)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                )
+                .changed()
+            {
+                actions.push(Action::SetTemperatureOpacity(opacity));
+            }
+        });
+
+        if let Some(range) = &state.range {
+            ui.label(egui::RichText::new(range).weak().small());
+        }
+
+        Self::temperature_legend(ui);
+
+        actions
+    }
+
+    /// The colour scale, drawn from the same table the wash uses.
+    ///
+    /// Built from `TEMPERATURE_STOPS` rather than restated, because a
+    /// legend that disagreed with the chart would be worse than no legend
+    /// — it would make a correct wash look wrong, or hide a wrong one.
+    fn temperature_legend(ui: &mut egui::Ui) {
+        /// Height of the bar, points.
+        const HEIGHT: f32 = 10.0;
+        /// Strips across the bar. Enough to look continuous at any width
+        /// the panel takes.
+        const STRIPS: usize = 64;
+
+        let stops = crate::TEMPERATURE_STOPS;
+        let coldest = stops[0].0;
+        let warmest = stops[stops.len() - 1].0;
+
+        let width = ui.available_width().max(1.0);
+        let (response, painter) =
+            ui.allocate_painter(egui::vec2(width, HEIGHT), egui::Sense::hover());
+        let rect = response.rect;
+
+        for i in 0..STRIPS {
+            let t = i as f32 / STRIPS as f32;
+            let celsius = coldest + (warmest - coldest) * t;
+            let [r, g, b, _] = crate::temperature_colour(celsius, 1.0);
+            let x = rect.left() + rect.width() * t;
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(x, rect.top()),
+                    // A hair wider than the step, so rounding cannot leave
+                    // a gap between strips.
+                    egui::vec2(rect.width() / STRIPS as f32 + 1.0, rect.height()),
+                ),
+                0.0,
+                egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{coldest:.0}°")).weak().small());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{warmest:.0}°C"))
+                        .weak()
+                        .small(),
+                );
+            });
+        });
     }
 
     fn wind_section(ui: &mut egui::Ui, wind: &WindState) -> Vec<Action> {
@@ -1627,6 +1771,7 @@ mod font_tests {
                     layers: entries.clone(),
                     vessel: populated_vessel(),
                     currents: populated_currents(),
+                    temperature: populated_temperature(),
                     time: populated_time(),
                     imagery: imagery.clone(),
                     tides: populated_tides(),
@@ -1756,6 +1901,19 @@ mod font_tests {
         }
     }
 
+    /// A temperature gradient across the view, for the drawing tests.
+    fn populated_temperature() -> TemperatureState {
+        TemperatureState {
+            available: true,
+            visible: true,
+            opacity: 0.3,
+            here: Some("18.4 °C".to_owned()),
+            here_is: Some("at the boat".to_owned()),
+            range: Some("16.2 to 19.8 °C in view".to_owned()),
+            cells: 1_150,
+        }
+    }
+
     fn populated_wind() -> WindState {
         WindState {
             available: true,
@@ -1810,6 +1968,7 @@ mod font_tests {
                     layers: entries.clone(),
                     vessel: populated_vessel(),
                     currents: populated_currents(),
+                    temperature: populated_temperature(),
                     time: populated_time(),
                     imagery: imagery.clone(),
                     tides: tides.clone(),
@@ -1830,6 +1989,66 @@ mod font_tests {
         let mut output = one_frame(&populated_tides());
         assert!(!output.textures_delta.set.is_empty());
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn the_temperature_scale_is_ordered_and_total() {
+        // Ordered, because `temperature_colour` walks the table assuming
+        // it ascends and divides by the gap between stops — a tie would
+        // divide by zero and a reversal would read the wrong stop.
+        let stops = crate::TEMPERATURE_STOPS;
+        for pair in stops.windows(2) {
+            assert!(
+                pair[1].0 > pair[0].0,
+                "stops are not ascending: {} then {}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+
+        // Total, because a temperature outside the table still has to get
+        // a colour. A hole in the wash would read as land.
+        for celsius in [-273.15_f32, -40.0, 0.0, 18.0, 50.0, 1000.0] {
+            let c = crate::temperature_colour(celsius, 0.5);
+            assert!(
+                c.iter().all(|v| (0.0..=1.0).contains(v)),
+                "{celsius} °C gave {c:?}"
+            );
+            assert!((c[3] - 0.5).abs() < 1e-6, "opacity was not honoured");
+        }
+
+        // Including NaN, which a GRIB file can carry as a missing value
+        // and which would otherwise propagate into a colour channel.
+        let c = crate::temperature_colour(f32::NAN, 1.0);
+        assert!(c.iter().all(|v| v.is_finite()), "NaN leaked into {c:?}");
+    }
+
+    #[test]
+    fn the_scale_is_monotonic_in_warmth() {
+        // Not a strict requirement of the colours, but of the *reading*:
+        // a scale that doubled back would make two different temperatures
+        // the same colour, and the legend would be a lie at that point.
+        let mut seen: Vec<[f32; 4]> = Vec::new();
+        let mut tenths = -100;
+        while tenths <= 400 {
+            let c = crate::temperature_colour(tenths as f32 / 10.0, 1.0);
+            if let Some(previous) = seen.last() {
+                // Consecutive samples must differ, or be at a clamped end.
+                let clamped = tenths as f32 / 10.0 <= crate::TEMPERATURE_STOPS[0].0
+                    || tenths as f32 / 10.0
+                        >= crate::TEMPERATURE_STOPS[crate::TEMPERATURE_STOPS.len() - 1].0;
+                if !clamped {
+                    assert_ne!(
+                        *previous,
+                        c,
+                        "the scale is flat around {} °C",
+                        tenths as f32 / 10.0
+                    );
+                }
+            }
+            seen.push(c);
+            tenths += 5;
+        }
     }
 
     #[test]

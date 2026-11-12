@@ -31,8 +31,8 @@
 pub mod ui;
 
 pub use ui::{
-    Action, CurrentState, DraftState, ImageryState, LayerEntry, PanelState, TideMarker,
-    TideReading, TideState, TimeState, Ui, VesselState, WindState,
+    Action, CurrentState, DraftState, ImageryState, LayerEntry, PanelState, TemperatureState,
+    TideMarker, TideReading, TideState, TimeState, Ui, VesselState, WindState,
 };
 
 use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};
@@ -135,6 +135,85 @@ fn fill_colour_for(style: ChartStyle, value: Option<f64>) -> Option<[f32; 4]> {
         }
         _ => None,
     }
+}
+
+/// One cell of a scalar field, as a quad with a colour at each corner.
+///
+/// The unit of the temperature wash. A quad rather than a triangle because
+/// that is the shape a lattice cell is, and per-corner colours rather than
+/// one because the GPU's interpolation across the cell is exactly the
+/// bilinear sampling the underlying grid already uses — so the wash is
+/// smooth for free, and refining the lattice costs nothing but vertices.
+///
+/// Corners in order: north-west, north-east, south-east, south-west.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldPatch {
+    pub corners: [chart::WorldXY; 4],
+    pub colours: [[f32; 4]; 4],
+}
+
+/// The temperature scale, in degrees Celsius and the colour for each.
+///
+/// Stops rather than a formula, so the scale is legible and adjustable
+/// without algebra, and so the panel's legend can be built from the same
+/// list the wash is. Interpolated between; clamped at the ends.
+///
+/// Chosen for air over coastal water, which is a much narrower band than
+/// air over land: blue below ten, green through the teens, yellow and red
+/// above twenty-five. Somewhere in the twenties should read as pleasant
+/// rather than as a warning, which rules out the usual meteorological
+/// red-for-hot scale starting too low.
+pub const TEMPERATURE_STOPS: [(f32, [f32; 3]); 7] = [
+    (-5.0, [0.48, 0.35, 0.78]),
+    (0.0, [0.27, 0.45, 0.85]),
+    (8.0, [0.25, 0.72, 0.85]),
+    (15.0, [0.35, 0.78, 0.45]),
+    (21.0, [0.92, 0.86, 0.35]),
+    (27.0, [0.95, 0.56, 0.22]),
+    (34.0, [0.88, 0.25, 0.25]),
+];
+
+/// The colour for a temperature, at a given opacity.
+///
+/// Public because the panel's legend has to use the same scale as the
+/// wash: a legend that disagreed with the chart would be worse than none.
+pub fn temperature_colour(celsius: f32, opacity: f32) -> [f32; 4] {
+    let alpha = opacity.clamp(0.0, 1.0);
+    // NaN reads as the coldest stop rather than propagating into a colour
+    // channel, where it would come out as a hole in the wash. A GRIB file
+    // can carry a missing value, and a hole that looked like land would be
+    // the wrong way to show it.
+    if celsius.is_nan() {
+        let [r, g, b] = TEMPERATURE_STOPS[0].1;
+        return [r, g, b, alpha];
+    }
+
+    let first = TEMPERATURE_STOPS[0];
+    let last = TEMPERATURE_STOPS[TEMPERATURE_STOPS.len() - 1];
+    if celsius <= first.0 {
+        return [first.1[0], first.1[1], first.1[2], alpha];
+    }
+    if celsius >= last.0 {
+        return [last.1[0], last.1[1], last.1[2], alpha];
+    }
+
+    for pair in TEMPERATURE_STOPS.windows(2) {
+        let (low, cold) = pair[0];
+        let (high, warm) = pair[1];
+        if celsius <= high {
+            // `high > low` holds for every pair in the table, so this
+            // cannot divide by zero — and a table edited into a tie would
+            // be caught by `the_temperature_scale_is_ordered`.
+            let t = (celsius - low) / (high - low);
+            return [
+                cold[0] + (warm[0] - cold[0]) * t,
+                cold[1] + (warm[1] - cold[1]) * t,
+                cold[2] + (warm[2] - cold[2]) * t,
+                alpha,
+            ];
+        }
+    }
+    [last.1[0], last.1[1], last.1[2], alpha]
 }
 
 /// Whether a style's value really is a depth below chart datum.
@@ -531,6 +610,13 @@ pub struct Renderer {
     overlay_vertices: wgpu::Buffer,
     overlay_capacity: u64,
     overlay_count: u32,
+    /// Solid overlay geometry — the boat's hull. Its own buffer because it
+    /// is drawn by a different pipeline, and tiny because only one mark
+    /// uses it.
+    overlay_fill_pipeline: wgpu::RenderPipeline,
+    overlay_fill_vertices: wgpu::Buffer,
+    overlay_fill_capacity: u64,
+    overlay_fill_count: u32,
     /// Reference point the overlay anchors are measured from.
     overlay_origin: chart::WorldXY,
     bind_layout: wgpu::BindGroupLayout,
@@ -548,6 +634,13 @@ pub struct Renderer {
     /// fills are thousands of triangles where its outlines are hundreds of
     /// segments.
     fills: Layer,
+    /// The temperature wash: a coloured lattice over the water.
+    ///
+    /// Its own layer rather than part of the chart's fills because it is a
+    /// different kind of thing with a different lifetime — the chart
+    /// changes when the tiles do, and this changes when the clock or the
+    /// time slider does.
+    temperature: Layer,
 
     /// Aerial imagery, drawn under everything else.
     imagery_pipeline: wgpu::RenderPipeline,
@@ -870,6 +963,7 @@ impl Renderer {
         });
 
         let fills = Layer::new(&device, &bind_layout, "fills", GRID_CAPACITY);
+        let temperature = Layer::new(&device, &bind_layout, "temperature", GRID_CAPACITY);
 
         // ── Overlay pipeline ───────────────────────────────────────────
         //
@@ -920,6 +1014,54 @@ impl Renderer {
                 immediate_size: 0,
             });
 
+        // The same shader, the same vertices, triangles instead of lines.
+        // Only the boat uses it: a station ring or a wind barb is notation
+        // and should stay as thin as a pencil line, while the boat is the
+        // one mark that must be found instantly on a busy chart — and a
+        // hollow outline a few pixels wide is exactly what gets lost
+        // against a sounding.
+        let overlay_fill_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("overlay fills"),
+                layout: Some(&overlay_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &overlay_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x2,
+                            1 => Float32x2,
+                            2 => Float32x4,
+                        ],
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &overlay_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    // No culling: a mark's triangles are wound however the
+                    // arithmetic happened to produce them, and a boat that
+                    // vanished when it turned south would be a memorable bug.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("overlay"),
             layout: Some(&overlay_pipeline_layout),
@@ -955,6 +1097,15 @@ impl Renderer {
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
+        });
+
+        // 256 vertices is far more than the handful a hull needs, and
+        // costs four kilobytes.
+        let overlay_fill_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay fills"),
+            size: std::mem::size_of::<OverlayVertex>() as u64 * 256,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let overlay_vertices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1118,12 +1269,17 @@ impl Renderer {
             overlay_vertices,
             overlay_capacity: 4096,
             overlay_count: 0,
+            overlay_fill_pipeline,
+            overlay_fill_vertices,
+            overlay_fill_capacity: 256,
+            overlay_fill_count: 0,
             overlay_origin: chart::WorldXY { x: 0.0, y: 0.0 },
             bind_layout,
             egui,
             grid,
             charts,
             fills,
+            temperature,
             imagery_pipeline,
             imagery_texture_layout,
             imagery_uniform,
@@ -1302,6 +1458,18 @@ impl Renderer {
                 }
             }
 
+            // The temperature wash above the photograph and below
+            // everything else. It is weather over the ground rather than a
+            // feature of it, and the chart's own linework has to stay
+            // readable through it — which is why it is drawn first of the
+            // translucent layers and why its opacity is adjustable.
+            if self.temperature.count > 0 {
+                pass.set_pipeline(&self.fill_pipeline);
+                pass.set_bind_group(0, &self.temperature.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.temperature.vertices.slice(..));
+                pass.draw(0..self.temperature.count, 0..1);
+            }
+
             // Fills under everything the line pipeline draws, so the
             // linework reads on top of its own area's tint rather than
             // being painted over by it.
@@ -1328,6 +1496,15 @@ impl Renderer {
             // Notation over the chart, under the interface: a station ring
             // belongs on top of the water it marks and underneath the panel
             // that explains it.
+            // Solid marks first, their outlines over the top: the hull is
+            // filled and then edged, which is what makes it read as a
+            // shape rather than as a smudge.
+            if self.overlay_fill_count > 0 {
+                pass.set_pipeline(&self.overlay_fill_pipeline);
+                pass.set_bind_group(0, &self.overlay_bind, &[]);
+                pass.set_vertex_buffer(0, self.overlay_fill_vertices.slice(..));
+                pass.draw(0..self.overlay_fill_count, 0..1);
+            }
             if self.overlay_count > 0 {
                 pass.set_pipeline(&self.overlay_pipeline);
                 pass.set_bind_group(0, &self.overlay_bind, &[]);
@@ -1401,7 +1578,7 @@ impl Renderer {
         // The fills share the chart's origin, but they have their own
         // uniform buffer and so need their own write — a fill layer left
         // on a stale origin slides off its own coastline as you pan.
-        for layer in [&self.grid, &self.charts, &self.fills] {
+        for layer in [&self.grid, &self.charts, &self.fills, &self.temperature] {
             // The subtraction happens in f64 and only the small difference
             // becomes f32. Projecting to f32 first would throw away the
             // precision this whole arrangement exists to keep.
@@ -1503,6 +1680,65 @@ impl Renderer {
             tally.count(depth::assess(&check.draft, charted, &check.tide));
         }
         tally
+    }
+
+    /// Replace the temperature wash.
+    ///
+    /// Each patch becomes two triangles. Uploaded on change rather than
+    /// per frame: the lattice is geographic, so panning only moves the
+    /// uniform — the same arrangement as the chart's own geometry.
+    ///
+    /// The depth attribute is deliberately absent from these vertices:
+    /// air temperature is not a sounding, and the under-keel check must
+    /// not paint the weather red.
+    pub fn set_temperature(&mut self, patches: &[FieldPatch]) {
+        self.temperature.count = 0;
+        if patches.is_empty() {
+            return;
+        }
+
+        // Its own reference point, from the patches themselves, so the f32
+        // offsets stay small at high zoom.
+        let origin = centroid_of(patches.iter().flat_map(|p| p.corners));
+        let offset = |p: chart::WorldXY| [(p.x - origin.x) as f32, (p.y - origin.y) as f32];
+
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(patches.len() * 6);
+        for patch in patches {
+            // North-west, north-east, south-east, south-west. Split along
+            // the north-west to south-east diagonal.
+            for &(a, b, c) in &[(0, 1, 2), (0, 2, 3)] {
+                for index in [a, b, c] {
+                    vertices.push(Vertex::plain(
+                        offset(patch.corners[index]),
+                        patch.colours[index],
+                    ));
+                }
+            }
+        }
+
+        self.temperature.origin = origin;
+        self.temperature.count = vertices.len() as u32;
+        if vertices.len() as u64 > self.temperature.capacity {
+            let capacity = (vertices.len() as u64).next_power_of_two();
+            log::debug!("growing temperature buffer to {capacity} vertices");
+            self.temperature.vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("temperature"),
+                size: std::mem::size_of::<Vertex>() as u64 * capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.temperature.capacity = capacity;
+        }
+        self.queue.write_buffer(
+            &self.temperature.vertices,
+            0,
+            bytemuck::cast_slice(&vertices),
+        );
+    }
+
+    /// Triangles currently in the temperature wash.
+    pub fn temperature_triangle_count(&self) -> u32 {
+        self.temperature.count / 3
     }
 
     pub fn set_chart(
@@ -1821,6 +2057,7 @@ impl Renderer {
 
         if marks.is_empty() {
             self.overlay_count = 0;
+            self.overlay_fill_count = 0;
             return;
         }
 
@@ -1829,6 +2066,7 @@ impl Renderer {
         // them inside f32 at high zoom.
         let origin = centroid_of(marks.iter().map(Overlay::at));
         let mut vertices: Vec<OverlayVertex> = Vec::new();
+        let mut fill_vertices: Vec<OverlayVertex> = Vec::new();
 
         for mark in marks {
             let anchor = [
@@ -1846,6 +2084,15 @@ impl Renderer {
                     pixel: b,
                     colour,
                 });
+            };
+            let mut triangle = |a: [f32; 2], b: [f32; 2], c: [f32; 2], colour: [f32; 4]| {
+                for pixel in [a, b, c] {
+                    fill_vertices.push(OverlayVertex {
+                        anchor,
+                        pixel,
+                        colour,
+                    });
+                }
             };
 
             match *mark {
@@ -1927,29 +2174,47 @@ impl Renderer {
                 Overlay::Boat {
                     course_deg, colour, ..
                 } => {
-                    /// Bow to the reference point, pixels.
-                    const BOW: f32 = 13.0;
-                    /// Quarters: back from the reference point, and out.
-                    const QUARTER_AFT: f32 = -7.0;
-                    const BEAM: f32 = 5.0;
+                    // Half again the size it started at, and solid. The
+                    // first version was a 13-pixel hollow outline, which
+                    // on a chart of ten thousand soundings was genuinely
+                    // hard to find — the one mark that must never be hunted
+                    // for. Filled, outlined and larger, in that order of
+                    // how much it helped.
+                    /// Bow, forward of the fix, pixels.
+                    const BOW: f32 = 19.0;
+                    /// Quarters: abaft the fix, and out.
+                    const QUARTER_AFT: f32 = -10.0;
+                    const BEAM: f32 = 7.5;
                     /// The transom's notch, which is what makes the stern
                     /// read as a stern rather than as a second bow.
-                    const TRANSOM: f32 = -4.0;
+                    const TRANSOM: f32 = -6.0;
+                    /// Radius of the no-course mark.
+                    const DR_RING: f32 = 8.0;
+                    /// Reach of its cross.
+                    const DR_CROSS: f32 = 12.0;
+
+                    // Black, at the hull's own alpha. The outline is what
+                    // separates the boat from whatever it is over — orange
+                    // on an orange roof, or on the amber of a
+                    // tight-at-low-water shading, would otherwise
+                    // disappear exactly where the boat matters most.
+                    let edge = [0.05, 0.05, 0.08, colour[3]];
 
                     let Some(course) = course_deg else {
-                        // No course: a ringed cross, which is the chart
-                        // convention for a position without a vector.
-                        for i in 0..RING_SEGMENTS {
+                        // No course and no heading: a ringed cross, the
+                        // chart convention for a position without a
+                        // vector. Filled too, so it is as findable as the
+                        // hull it stands in for.
+                        let ring = |i: usize| {
                             let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
-                            let b = (i + 1) as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
-                            segment(
-                                [6.0 * a.cos(), 6.0 * a.sin()],
-                                [6.0 * b.cos(), 6.0 * b.sin()],
-                                colour,
-                            );
+                            [DR_RING * a.cos(), DR_RING * a.sin()]
+                        };
+                        for i in 0..RING_SEGMENTS {
+                            triangle([0.0, 0.0], ring(i), ring(i + 1), colour);
+                            segment(ring(i), ring(i + 1), edge);
                         }
-                        segment([-9.0, 0.0], [9.0, 0.0], colour);
-                        segment([0.0, -9.0], [0.0, 9.0], colour);
+                        segment([-DR_CROSS, 0.0], [DR_CROSS, 0.0], edge);
+                        segment([0.0, -DR_CROSS], [0.0, DR_CROSS], edge);
                         continue;
                     };
 
@@ -1967,10 +2232,17 @@ impl Renderer {
                     let starboard = point(QUARTER_AFT, BEAM);
                     let transom = point(TRANSOM, 0.0);
 
-                    segment(bow, port, colour);
-                    segment(port, transom, colour);
-                    segment(transom, starboard, colour);
-                    segment(starboard, bow, colour);
+                    // Two triangles about the notch, so the concave stern
+                    // stays concave. One triangle bow-port-starboard would
+                    // fill across it and the hull would read as an arrow
+                    // pointing both ways.
+                    triangle(bow, port, transom, colour);
+                    triangle(bow, transom, starboard, colour);
+
+                    segment(bow, port, edge);
+                    segment(port, transom, edge);
+                    segment(transom, starboard, edge);
+                    segment(starboard, bow, edge);
                 }
 
                 Overlay::Barb {
@@ -2044,6 +2316,27 @@ impl Renderer {
 
         self.overlay_origin = origin;
         self.overlay_count = vertices.len() as u32;
+        self.overlay_fill_count = fill_vertices.len() as u32;
+
+        if !fill_vertices.is_empty() {
+            if fill_vertices.len() as u64 > self.overlay_fill_capacity {
+                let capacity = (fill_vertices.len() as u64).next_power_of_two();
+                log::debug!("growing overlay fill buffer to {capacity} vertices");
+                self.overlay_fill_vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("overlay fills"),
+                    size: std::mem::size_of::<OverlayVertex>() as u64 * capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.overlay_fill_capacity = capacity;
+            }
+            self.queue.write_buffer(
+                &self.overlay_fill_vertices,
+                0,
+                bytemuck::cast_slice(&fill_vertices),
+            );
+        }
+
         if vertices.is_empty() {
             return;
         }
@@ -2066,6 +2359,13 @@ impl Renderer {
     /// Marks currently in the overlay buffer, as line segments.
     pub fn overlay_segment_count(&self) -> u32 {
         self.overlay_count / 2
+    }
+
+    /// Solid overlay geometry, as triangles. The boat's hull and nothing
+    /// else, so a zero here with a fix on screen means the boat is being
+    /// drawn hollow.
+    pub fn overlay_fill_triangle_count(&self) -> u32 {
+        self.overlay_fill_count / 3
     }
 
     /// Triangles currently held in the fill buffer.

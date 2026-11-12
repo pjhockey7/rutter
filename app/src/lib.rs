@@ -37,8 +37,9 @@ use rutter_core::nmea::Vessel;
 use rutter_core::tide::{CurrentKind, CurrentStation, Kind, Station};
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{
-    Action, CurrentState, DraftState, ImageryState, LayerEntry, Overlay, PanelState, Renderer,
-    TideMarker, TideReading, TideState, TimeState, Ui, VesselState, WindState,
+    Action, CurrentState, DraftState, FieldPatch, ImageryState, LayerEntry, Overlay, PanelState,
+    Renderer, TemperatureState, TideMarker, TideReading, TideState, TimeState, Ui, VesselState,
+    WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -66,41 +67,65 @@ const WANTED_SPACING_PX: f64 = 110.0;
 /// `base_deg` is the forecast's own node spacing. The returned spacing is
 /// that times a power of two, so the coarse levels fall exactly on model
 /// nodes and the fine ones subdivide them evenly.
-fn barb_lattice(view: &Viewport, base_deg: f64) -> Vec<Position> {
-    /// A ceiling on how many are generated, whatever the zoom. The spacing
-    /// ladder should keep the count near a hundred; this is the backstop
-    /// against a viewport nobody anticipated.
-    const MAX_BARBS: usize = 800;
+/// A ceiling on the wash's cells, whatever the zoom.
+///
+/// Four thousand cells is 24,000 vertices, which is nothing to upload and
+/// covers a 4K screen at thirty-pixel spacing. The backstop exists for a
+/// viewport nobody anticipated rather than for any normal one.
+const MAX_TEMPERATURE_CELLS: usize = 4_096;
+
+/// The lattice spacing for a field, as a power-of-two multiple of the
+/// model's own node spacing.
+///
+/// Tied to the model's grid rather than to a round number of degrees for
+/// two reasons: at the coarsest levels every lattice point then sits
+/// exactly on a model node, and at every level the positions are exact
+/// multiples of a fixed spacing — so the lattice never shifts as you pan.
+///
+/// `None` when the model's spacing is not a usable number, which a
+/// malformed file can carry and which the arithmetic below divides by.
+fn lattice_spacing(view: &Viewport, base_deg: f64, wanted_px: f64) -> Option<f64> {
     /// How far the subdivision may go either way from the model's own
     /// spacing.
     ///
     /// Generous at the fine end on purpose. Stopping at eight times finer
-    /// seemed principled — beyond that the barbs are interpolated rather
+    /// seemed principled — beyond that the values are interpolated rather
     /// than sampled — but it meant the layer vanished at harbour zoom,
     /// which is where the navigating happens. And the objection does not
-    /// hold: the field is bilinear, so a subdivided barb is the same
+    /// hold: the field is bilinear, so a subdivided sample is the same
     /// surface read more densely, not detail conjured out of nothing.
-    /// Twenty near-identical barbs across a harbour are a true statement
-    /// about a synoptic wind — it really is uniform at that scale.
     const FINEST: f64 = -12.0;
     const COARSEST: f64 = 8.0;
 
     // Spelled out rather than `!(base_deg > 0.0)` so the NaN case is a
-    // decision and not a side effect of negating a partial comparison. A
-    // malformed forecast file could carry a zero or a NaN step, and the
-    // arithmetic below divides by it.
+    // decision and not a side effect of negating a partial comparison.
     if !base_deg.is_finite() || base_deg <= 0.0 {
-        return Vec::new();
+        return None;
     }
 
     // Degrees of longitude per pixel. In Web Mercator a degree of longitude
     // is a constant number of pixels at any latitude, which is what makes
     // this a single number rather than a function of where you are.
     let per_pixel = 360.0 / (256.0 * 2f64.powf(view.zoom));
-    let wanted = WANTED_SPACING_PX * per_pixel;
+    let steps = (wanted_px * per_pixel / base_deg)
+        .log2()
+        .round()
+        .clamp(FINEST, COARSEST);
+    Some(base_deg * 2f64.powf(steps))
+}
 
-    let steps = (wanted / base_deg).log2().round().clamp(FINEST, COARSEST);
-    let spacing = base_deg * 2f64.powf(steps);
+fn barb_lattice(view: &Viewport, base_deg: f64) -> Vec<Position> {
+    /// A ceiling on how many are generated, whatever the zoom. The spacing
+    /// ladder should keep the count near a hundred; this is the backstop
+    /// against a viewport nobody anticipated.
+    const MAX_BARBS: usize = 800;
+
+    // The spacing ladder is shared with the temperature wash — see
+    // `lattice_spacing`, which is also where the note lives about why it
+    // is allowed to subdivide so far below the model's own node spacing.
+    let Some(spacing) = lattice_spacing(view, base_deg, WANTED_SPACING_PX) else {
+        return Vec::new();
+    };
 
     let (nw, se) = view.bounds();
     let mut out = Vec::new();
@@ -176,6 +201,22 @@ const UNDERWAY_KN: f64 = 0.5;
 /// all, so this is a judgement about what is useful rather than a limit:
 /// one tide either way covers planning a passage and getting back.
 const TIME_SPAN_SECS: i64 = 12 * 3600;
+
+/// How far apart the temperature lattice's cells should land on screen.
+///
+/// Much finer than the wind's spacing, because this is a continuous wash
+/// rather than a set of symbols: the cells are not meant to be visible,
+/// only smooth. Thirty pixels is smooth without being a quarter of a
+/// million triangles.
+const TEMPERATURE_CELL_PX: f64 = 30.0;
+
+/// How strongly the temperature wash is painted by default.
+///
+/// Light. The chart's own linework, its depth shading and the imagery all
+/// have to stay readable through it — this is context, not the subject,
+/// and a wash strong enough to read a temperature off precisely would
+/// bury the things you steer by.
+const TEMPERATURE_OPACITY: f32 = 0.30;
 
 /// The data files a platform found, however it found them.
 #[derive(Debug, Default)]
@@ -270,6 +311,11 @@ pub struct App {
     /// The wind and temperature forecast, if one was fetched.
     weather: Option<Forecast>,
     wind_visible: bool,
+    temperature_visible: bool,
+    temperature_opacity: f32,
+    /// The wash as last uploaded, compared so a still view does not
+    /// re-upload the same lattice every frame.
+    temperature_patches: Vec<FieldPatch>,
 
     /// The GPS and instrument feed, being read on a thread of its own.
     nmea: Option<nmea::Receiver>,
@@ -340,6 +386,12 @@ impl App {
             vessel_visible: true,
             // On when a forecast is present, same as the other layers.
             wind_visible: true,
+            // On when a forecast is present, like every other layer here:
+            // the reason to fetch one is to see it. Kept light — 30% — so
+            // that a wash over the whole chart is context rather than the
+            // subject, and one checkbox away from gone.
+            temperature_visible: true,
+            temperature_opacity: TEMPERATURE_OPACITY,
             // Both on when the data is there: the reason to fetch imagery or
             // stations is to see them.
             imagery_visible: true,
@@ -453,6 +505,7 @@ impl App {
         self.refresh_tide_cache();
         self.refresh_charts(renderer);
         self.refresh_imagery(renderer);
+        self.refresh_temperature(renderer);
         self.refresh_overlay(renderer);
     }
 
@@ -557,9 +610,10 @@ impl App {
         if marks != self.overlay {
             renderer.set_overlay(&marks);
             log::debug!(
-                "overlay: {} marks, {} segments",
+                "overlay: {} marks, {} segments, {} solid triangles",
                 marks.len(),
-                renderer.overlay_segment_count()
+                renderer.overlay_segment_count(),
+                renderer.overlay_fill_triangle_count()
             );
             self.overlay = marks;
         }
@@ -628,6 +682,167 @@ impl App {
             kept.len()
         );
         (kept, kept_count < lattice.len())
+    }
+
+    /// Rebuild the temperature wash if it has changed.
+    ///
+    /// On a *geographic* lattice, for the same reason the wind barbs are:
+    /// a screen lattice would slide the colours over the ground as you
+    /// panned. Here it matters even more than for the barbs, because a
+    /// wash has no symbol to anchor it — a cell boundary drifting across
+    /// the coast would show up as the whole sea shimmering.
+    fn refresh_temperature(&mut self, renderer: &mut Renderer) {
+        let patches = self.temperature_patches();
+        if patches != self.temperature_patches {
+            renderer.set_temperature(&patches);
+            log::debug!(
+                "temperature: {} cells, {} triangles",
+                patches.len(),
+                renderer.temperature_triangle_count()
+            );
+            self.temperature_patches = patches;
+        }
+    }
+
+    /// The lattice cells of the temperature wash.
+    fn temperature_patches(&self) -> Vec<FieldPatch> {
+        if !self.temperature_visible {
+            return Vec::new();
+        }
+        let Some(forecast) = &self.weather else {
+            return Vec::new();
+        };
+        let shown = self.field_time();
+        // Past the model's horizon there is no temperature, and a wash
+        // showing the last modelled hour would be a claim about a time
+        // nobody modelled. The time strip says so in words.
+        if forecast
+            .span()
+            .is_none_or(|(first, last)| !(first..=last).contains(&shown))
+        {
+            return Vec::new();
+        }
+
+        let Some((step, _)) = forecast.nearest(shown) else {
+            return Vec::new();
+        };
+        let Some(spacing) = lattice_spacing(&self.view, step.temperature.dlon, TEMPERATURE_CELL_PX)
+        else {
+            return Vec::new();
+        };
+
+        // One cell beyond the viewport on every side, so the wash reaches
+        // the edges of the screen instead of stopping a cell short of them.
+        let (nw, se) = self.view.bounds();
+        let first = |edge: f64| (edge / spacing).floor() as i64 - 1;
+        let last = |edge: f64| (edge / spacing).ceil() as i64 + 1;
+
+        let colour = |at: LatLon| {
+            forecast
+                .temperature_at(shown, at)
+                .map(|c| rutter_render::temperature_colour(c, self.temperature_opacity))
+        };
+
+        let mut out = Vec::new();
+        for row in first(se.lat)..=last(nw.lat) {
+            for column in first(nw.lon)..=last(se.lon) {
+                // Indexed and multiplied rather than accumulated, the same
+                // as the barb lattice: repeated addition drifts off the
+                // lattice, and "every corner is an exact multiple" is what
+                // makes the wash stable under panning.
+                let (south, north) = (row as f64 * spacing, (row + 1) as f64 * spacing);
+                let (west, east) = (column as f64 * spacing, (column + 1) as f64 * spacing);
+                let corners = [
+                    LatLon::new(north, west),
+                    LatLon::new(north, east),
+                    LatLon::new(south, east),
+                    LatLon::new(south, west),
+                ];
+
+                // Every corner has to be inside the forecast's area or the
+                // cell is dropped whole. A cell with three colours and one
+                // hole would be shaded by interpolating towards a colour
+                // that means nothing.
+                let mut colours = [[0.0; 4]; 4];
+                let mut complete = true;
+                for (slot, corner) in colours.iter_mut().zip(corners) {
+                    match colour(corner) {
+                        Some(c) => *slot = c,
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if !complete {
+                    continue;
+                }
+
+                out.push(FieldPatch {
+                    corners: corners.map(chart::project),
+                    colours,
+                });
+                if out.len() >= MAX_TEMPERATURE_CELLS {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// What the panel shows about the temperature.
+    fn temperature_state(&self) -> TemperatureState {
+        let Some(forecast) = &self.weather else {
+            return TemperatureState::default();
+        };
+        let shown = self.field_time();
+
+        // At the boat if there is a fix, otherwise at the middle of the
+        // screen — and said which, because the two can differ by several
+        // degrees across a bay on a sea-breeze day.
+        let (at, from) = match self.fresh_fix() {
+            Some(fix) => (fix, "at the boat"),
+            None => (self.view.centre, "at the centre"),
+        };
+
+        // The extremes in view, from the lattice that was actually drawn
+        // rather than from a fresh sweep: what the panel reports is then
+        // exactly what the wash is showing.
+        let (nw, se) = self.view.bounds();
+        let mut coldest = f32::MAX;
+        let mut warmest = f32::MIN;
+        for corner in [
+            nw,
+            se,
+            LatLon::new(nw.lat, se.lon),
+            LatLon::new(se.lat, nw.lon),
+            self.view.centre,
+        ] {
+            if let Some(c) = forecast.temperature_at(shown, corner) {
+                coldest = coldest.min(c);
+                warmest = warmest.max(c);
+            }
+        }
+
+        TemperatureState {
+            available: true,
+            visible: self.temperature_visible,
+            opacity: self.temperature_opacity,
+            here: forecast
+                .temperature_at(shown, at)
+                .map(|c| format!("{c:.1} °C")),
+            here_is: forecast.temperature_at(shown, at).map(|_| from.to_owned()),
+            range: (coldest <= warmest).then(|| {
+                if (warmest - coldest) < 0.2 {
+                    // A uniform field, which is the honest thing to say
+                    // rather than printing the same number twice.
+                    "even across this view".to_owned()
+                } else {
+                    format!("{coldest:.1} to {warmest:.1} °C in view")
+                }
+            }),
+            cells: self.temperature_patches.len(),
+        }
     }
 
     /// Current arrows, one per station in view.
@@ -778,6 +993,7 @@ impl App {
             },
             tides: self.tide_state(pixels_per_point),
             currents: self.current_state(),
+            temperature: self.temperature_state(),
             time: self.time_state(),
             draft: self.draft_state(renderer),
             wind: self.wind_state(),
@@ -802,6 +1018,14 @@ impl App {
         // Also the outstanding request, or the chart would wait forever for
         // an answer whose geometry went with the old renderer.
         self.requested.clear();
+        // And the comparison caches. These exist so an unchanged view does
+        // not re-upload what is already on the GPU — which is exactly the
+        // wrong conclusion to reach when the GPU has just been handed back
+        // to Android and nothing is on it. Without this an activity
+        // recreated behind the app comes back with no notation and no
+        // temperature until the view happens to change.
+        self.overlay.clear();
+        self.temperature_patches.clear();
     }
 
     /// Pan by a screen-space delta in pixels.
@@ -1099,6 +1323,14 @@ impl App {
                     self.currents_visible = *on;
                     touched = true;
                 }
+                Action::SetTemperature(on) => {
+                    self.temperature_visible = *on;
+                    touched = true;
+                }
+                Action::SetTemperatureOpacity(opacity) => {
+                    self.temperature_opacity = opacity.clamp(0.0, 1.0);
+                    touched = true;
+                }
                 // The time. Clamped to the span the panel offered, so a
                 // stale action from a frame where the forecast was wider
                 // cannot put the chart somewhere the slider cannot reach.
@@ -1193,6 +1425,8 @@ impl App {
                 | Action::DisconnectNmea
                 | Action::UseDeviceGps
                 | Action::SetCurrents(_)
+                | Action::SetTemperature(_)
+                | Action::SetTemperatureOpacity(_)
                 | Action::SetTimeOffset(_)
                 | Action::NowTime => {}
             }
@@ -1245,6 +1479,19 @@ impl App {
     /// Step the shown time, for a platform's own key binding.
     pub fn nudge_time(&mut self, seconds: i64) -> bool {
         self.set_time_offset(self.shown_offset_secs.saturating_add(seconds))
+    }
+
+    /// The instant a *field* is sampled for.
+    ///
+    /// The shown time, rounded down to the minute. A minute of GFS is
+    /// about a hundredth of a degree of temperature, which is invisible —
+    /// and the saving is real: the wash is a few thousand triangles whose
+    /// colours would otherwise differ every single second, re-uploading
+    /// two hundred kilobytes a second for a change nobody can see. The
+    /// same rounding keeps the panel's readout agreeing with the wash.
+    fn field_time(&self) -> i64 {
+        let shown = self.shown_time();
+        shown - shown.rem_euclid(60)
     }
 
     /// The instant the chart is being shown for.
