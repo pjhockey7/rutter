@@ -31,7 +31,8 @@
 pub mod ui;
 
 pub use ui::{
-    Action, DraftState, ImageryState, LayerEntry, TideMarker, TideReading, TideState, Ui,
+    Action, DraftState, ImageryState, LayerEntry, PanelState, TideMarker, TideReading, TideState,
+    Ui, WindState,
 };
 
 use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};
@@ -216,10 +217,120 @@ struct ImageryTile {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OverlayVertex {
+    /// Offset from the overlay buffer's reference point, world units.
+    anchor: [f32; 2],
+    /// Offset from the anchor, screen pixels.
+    pixel: [f32; 2],
+    colour: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OverlayUniform {
+    scale: [f32; 2],
+    origin: [f32; 2],
+    viewport: [f32; 2],
+    /// See the note in overlay.wgsl: 24 bytes rounded to 32.
+    _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ViewUniform {
     scale: [f32; 2],
     /// This buffer's reference point relative to the view centre.
     origin: [f32; 2],
+}
+
+/// A mark anchored to a chart position but drawn at a fixed screen size.
+///
+/// Chart notation rather than chart geometry: a station or a barb marks a
+/// place without claiming an extent, so it should not grow with the zoom.
+/// See `overlay.wgsl` for how that is done.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Overlay {
+    /// A circle, for a station or for calm air.
+    Ring {
+        at: chart::WorldXY,
+        radius_px: f32,
+        /// A second, inner ring. Used to pick out the selected station
+        /// without needing a different colour.
+        emphasised: bool,
+        colour: [f32; 4],
+    },
+    /// A meteorological wind barb: half 5 kn, full 10, pennant 50.
+    Barb {
+        at: chart::WorldXY,
+        speed_kn: f32,
+        /// Where the wind comes *from*, degrees true — which is how a wind
+        /// is named, and the way the shaft points.
+        from_deg: f32,
+        colour: [f32; 4],
+    },
+}
+
+impl Overlay {
+    fn at(&self) -> chart::WorldXY {
+        match self {
+            Self::Ring { at, .. } | Self::Barb { at, .. } => *at,
+        }
+    }
+}
+
+/// How a wind speed decomposes into barb feathers.
+///
+/// The convention: a pennant is 50 knots, a full barb 10, a half barb 5,
+/// and the speed is rounded to the nearest 5 before being split. Pure
+/// arithmetic, separated from the drawing so it can be checked — a barb
+/// showing 25 knots as 35 is a readable, confident, wrong symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Feathers {
+    pennants: u8,
+    full: u8,
+    half: bool,
+}
+
+/// Below this there is no direction worth drawing, and the symbol is a bare
+/// circle rather than a shaft.
+const CALM_KN: f32 = 2.5;
+
+fn feathers(speed_kn: f32) -> Feathers {
+    // Rounded to the nearest five, which is the resolution the symbol has.
+    //
+    // Spelled with `is_none_or` rather than `!(speed >= CALM)` so that the
+    // NaN case is deliberate rather than a side effect of negating a
+    // partial comparison: a grid can carry NaN where a model has no data,
+    // and that must read as calm rather than as a hurricane.
+    if speed_kn
+        .partial_cmp(&CALM_KN)
+        .is_none_or(|o| o == core::cmp::Ordering::Less)
+    {
+        return Feathers {
+            pennants: 0,
+            full: 0,
+            half: false,
+        };
+    }
+    let mut fives = (speed_kn / 5.0).round().max(0.0) as u32;
+    let pennants = (fives / 10).min(u8::MAX as u32) as u8;
+    fives -= u32::from(pennants) * 10;
+    let full = (fives / 2) as u8;
+    Feathers {
+        pennants,
+        full,
+        half: fives % 2 == 1,
+    }
+}
+
+/// Unit vector along a barb's shaft, in pixels.
+///
+/// A bearing is clockwise from north; pixel y grows downward. Getting this
+/// wrong mirrors every barb about the horizontal, which looks very nearly
+/// right.
+fn shaft(from_deg: f32) -> (f32, f32) {
+    let radians = from_deg.to_radians();
+    (radians.sin(), -radians.cos())
 }
 
 /// How strongly imagery shows through by default.
@@ -263,6 +374,15 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     /// Same vertices and shader as `pipeline`, triangles instead of lines.
     fill_pipeline: wgpu::RenderPipeline,
+    /// Chart notation: anchored in the world, sized in pixels.
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_bind: wgpu::BindGroup,
+    overlay_uniform: wgpu::Buffer,
+    overlay_vertices: wgpu::Buffer,
+    overlay_capacity: u64,
+    overlay_count: u32,
+    /// Reference point the overlay anchors are measured from.
+    overlay_origin: chart::WorldXY,
     bind_layout: wgpu::BindGroupLayout,
     /// egui's wgpu backend, which owns its own pipelines and font atlas and
     /// draws into the chart's render pass.
@@ -594,6 +714,99 @@ impl Renderer {
 
         let fills = Layer::new(&device, &bind_layout, "fills", GRID_CAPACITY);
 
+        // ── Overlay pipeline ───────────────────────────────────────────
+        //
+        // Its own pipeline because the vertex layout differs: two offsets
+        // rather than one, and a uniform that carries the viewport so the
+        // shader can turn pixels into clip units. Sharing the chart's
+        // pipeline would mean a vertex format with an unused field on every
+        // coastline vertex, which is the larger buffer by far.
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("overlay.wgsl").into()),
+        });
+
+        let overlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("overlay view"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let overlay_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay view"),
+            size: std::mem::size_of::<OverlayUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let overlay_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("overlay view"),
+            layout: &overlay_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: overlay_uniform.as_entire_binding(),
+            }],
+        });
+
+        let overlay_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("overlay"),
+                bind_group_layouts: &[Some(&overlay_layout)],
+                immediate_size: 0,
+            });
+
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay"),
+            layout: Some(&overlay_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2,
+                        1 => Float32x2,
+                        2 => Float32x4,
+                    ],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let overlay_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay"),
+            size: std::mem::size_of::<OverlayVertex>() as u64 * 4096,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // ── Imagery pipeline ───────────────────────────────────────────
         //
         // A second pipeline rather than a branch in the first: textured
@@ -742,6 +955,13 @@ impl Renderer {
             config,
             pipeline,
             fill_pipeline,
+            overlay_pipeline,
+            overlay_bind,
+            overlay_uniform,
+            overlay_vertices,
+            overlay_capacity: 4096,
+            overlay_count: 0,
+            overlay_origin: chart::WorldXY { x: 0.0, y: 0.0 },
             bind_layout,
             egui,
             grid,
@@ -948,6 +1168,16 @@ impl Renderer {
                 pass.draw(0..layer.count, 0..1);
             }
 
+            // Notation over the chart, under the interface: a station ring
+            // belongs on top of the water it marks and underneath the panel
+            // that explains it.
+            if self.overlay_count > 0 {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.overlay_bind, &[]);
+                pass.set_vertex_buffer(0, self.overlay_vertices.slice(..));
+                pass.draw(0..self.overlay_count, 0..1);
+            }
+
             // Interface last, over everything.
             if let (Some(gui), Some(descriptor)) = (&gui, &egui_prepared) {
                 self.egui
@@ -997,6 +1227,19 @@ impl Renderer {
     fn upload(&mut self, view: &View) {
         let scale = self.scale_for(view);
         let centre = chart::project(view.centre);
+
+        // The overlay's own uniform, which carries the viewport as well.
+        let overlay = OverlayUniform {
+            scale,
+            origin: [
+                (self.overlay_origin.x - centre.x) as f32,
+                (self.overlay_origin.y - centre.y) as f32,
+            ],
+            viewport: [self.config.width as f32, self.config.height as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.overlay_uniform, 0, bytemuck::bytes_of(&overlay));
 
         // The fills share the chart's origin, but they have their own
         // uniform buffer and so need their own write — a fill layer left
@@ -1426,6 +1669,166 @@ impl Renderer {
         self.imagery_opacity
     }
 
+    /// Replace the overlay marks.
+    ///
+    /// Uploaded once per change, not per frame: a mark's pixel offsets never
+    /// change, and panning only moves the uniform — the same arrangement
+    /// that makes the chart's own geometry cheap to drag.
+    pub fn set_overlay(&mut self, marks: &[Overlay]) {
+        /// Segments in a ring. Twenty is smooth at the sizes these are
+        /// drawn — a six-pixel circle — and 240 of them is still nothing.
+        const RING_SEGMENTS: usize = 20;
+
+        if marks.is_empty() {
+            self.overlay_count = 0;
+            return;
+        }
+
+        // One reference point for the lot, so that a pan is one uniform
+        // write. The anchors are small offsets from it, which is what keeps
+        // them inside f32 at high zoom.
+        let origin = centroid_of(marks.iter().map(Overlay::at));
+        let mut vertices: Vec<OverlayVertex> = Vec::new();
+
+        for mark in marks {
+            let anchor = [
+                (mark.at().x - origin.x) as f32,
+                (mark.at().y - origin.y) as f32,
+            ];
+            let mut segment = |a: [f32; 2], b: [f32; 2], colour: [f32; 4]| {
+                vertices.push(OverlayVertex {
+                    anchor,
+                    pixel: a,
+                    colour,
+                });
+                vertices.push(OverlayVertex {
+                    anchor,
+                    pixel: b,
+                    colour,
+                });
+            };
+
+            match *mark {
+                Overlay::Ring {
+                    radius_px,
+                    emphasised,
+                    colour,
+                    ..
+                } => {
+                    let ring = |segment: &mut dyn FnMut([f32; 2], [f32; 2], [f32; 4]), r: f32| {
+                        for i in 0..RING_SEGMENTS {
+                            let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            let b = (i + 1) as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            segment(
+                                [r * a.cos(), r * a.sin()],
+                                [r * b.cos(), r * b.sin()],
+                                colour,
+                            );
+                        }
+                    };
+                    ring(&mut segment, radius_px);
+                    if emphasised {
+                        // A second ring inside, rather than a different
+                        // colour: colour already means something here.
+                        ring(&mut segment, radius_px * 0.45);
+                    }
+                }
+
+                Overlay::Barb {
+                    speed_kn,
+                    from_deg,
+                    colour,
+                    ..
+                } => {
+                    /// Shaft length, pixels.
+                    const SHAFT: f32 = 24.0;
+                    /// A full barb; a half barb is half this.
+                    const BARB: f32 = 9.0;
+                    /// Spacing of the feathers along the shaft.
+                    const STEP: f32 = 4.5;
+                    if feathers(speed_kn)
+                        == (Feathers {
+                            pennants: 0,
+                            full: 0,
+                            half: false,
+                        })
+                    {
+                        for i in 0..RING_SEGMENTS {
+                            let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            let b = (i + 1) as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            segment(
+                                [3.0 * a.cos(), 3.0 * a.sin()],
+                                [3.0 * b.cos(), 3.0 * b.sin()],
+                                colour,
+                            );
+                        }
+                        continue;
+                    }
+
+                    let along = shaft(from_deg);
+                    let across = (along.1, -along.0);
+                    let point =
+                        |d: f32, w: f32| [along.0 * d + across.0 * w, along.1 * d + across.1 * w];
+
+                    segment([0.0, 0.0], point(SHAFT, 0.0), colour);
+
+                    // Feathers from the tip inwards, the order they read in.
+                    let Feathers {
+                        pennants,
+                        full,
+                        half,
+                    } = feathers(speed_kn);
+                    let mut offset = 0.0;
+
+                    for _ in 0..pennants {
+                        // A pennant, drawn as an outline since this pipeline
+                        // draws lines: out from the shaft, then back to it.
+                        let base = SHAFT - offset;
+                        segment(point(base, 0.0), point(base, BARB), colour);
+                        segment(point(base, BARB), point(base - STEP * 2.0, 0.0), colour);
+                        offset += STEP * 2.5;
+                    }
+                    for _ in 0..full {
+                        let base = SHAFT - offset;
+                        segment(point(base, 0.0), point(base, BARB), colour);
+                        offset += STEP;
+                    }
+                    if half {
+                        // Never at the very tip: on a five-knot wind a half
+                        // barb there reads as a full barb seen end-on.
+                        let base = SHAFT - offset.max(STEP);
+                        segment(point(base, 0.0), point(base, BARB / 2.0), colour);
+                    }
+                }
+            }
+        }
+
+        self.overlay_origin = origin;
+        self.overlay_count = vertices.len() as u32;
+        if vertices.is_empty() {
+            return;
+        }
+
+        if vertices.len() as u64 > self.overlay_capacity {
+            let capacity = (vertices.len() as u64).next_power_of_two();
+            log::debug!("growing overlay buffer to {capacity} vertices");
+            self.overlay_vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay"),
+                size: std::mem::size_of::<OverlayVertex>() as u64 * capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.overlay_capacity = capacity;
+        }
+        self.queue
+            .write_buffer(&self.overlay_vertices, 0, bytemuck::cast_slice(&vertices));
+    }
+
+    /// Marks currently in the overlay buffer, as line segments.
+    pub fn overlay_segment_count(&self) -> u32 {
+        self.overlay_count / 2
+    }
+
     /// Triangles currently held in the fill buffer.
     pub fn fill_triangle_count(&self) -> u32 {
         self.fills.count / 3
@@ -1555,6 +1958,26 @@ impl Layer {
     }
 }
 
+/// Mean of a set of positions, used as a layer's reference point.
+///
+/// The same idea as [`centroid`], over anything that yields positions.
+fn centroid_of(positions: impl Iterator<Item = chart::WorldXY>) -> chart::WorldXY {
+    let mut sum = (0.0f64, 0.0f64);
+    let mut n = 0u64;
+    for p in positions {
+        sum.0 += p.x;
+        sum.1 += p.y;
+        n += 1;
+    }
+    if n == 0 {
+        return chart::WorldXY { x: 0.0, y: 0.0 };
+    }
+    chart::WorldXY {
+        x: sum.0 / n as f64,
+        y: sum.1 / n as f64,
+    }
+}
+
 /// Mean of every vertex, used as a layer's reference point.
 ///
 /// The mean rather than the bounding-box centre: it is cheaper, it needs no
@@ -1644,6 +2067,98 @@ mod tests {
             at,
             value: None,
         }
+    }
+
+    #[test]
+    fn five_knot_steps_decompose_the_way_a_navigator_reads_them() {
+        let f = |kn: f32| feathers(kn);
+        let barb = |pennants, full, half| Feathers {
+            pennants,
+            full,
+            half,
+        };
+
+        // Calm: no shaft at all, so no feathers.
+        assert_eq!(f(0.0), barb(0, 0, false));
+        assert_eq!(f(2.0), barb(0, 0, false));
+
+        assert_eq!(f(5.0), barb(0, 0, true), "one half barb");
+        assert_eq!(f(10.0), barb(0, 1, false), "one full barb");
+        assert_eq!(f(15.0), barb(0, 1, true));
+        assert_eq!(f(25.0), barb(0, 2, true));
+        assert_eq!(f(45.0), barb(0, 4, true));
+        assert_eq!(f(50.0), barb(1, 0, false), "a pennant, not five barbs");
+        assert_eq!(f(65.0), barb(1, 1, true));
+        assert_eq!(f(100.0), barb(2, 0, false));
+        assert_eq!(f(105.0), barb(2, 0, true));
+    }
+
+    #[test]
+    fn a_barb_is_rounded_to_the_nearest_five_knots() {
+        // The symbol has no finer resolution, so 12 knots reads as 10 and
+        // 13 as 15. Rounding up at 2.5 is the convention.
+        assert_eq!(feathers(12.0).full, 1);
+        assert!(!feathers(12.0).half);
+        assert_eq!(feathers(13.0).full, 1);
+        assert!(feathers(13.0).half);
+    }
+
+    #[test]
+    fn feathers_always_add_up_to_the_speed_they_came_from() {
+        // The property that matters: whatever the decomposition, reading it
+        // back must give the rounded speed. An off-by-one in the division
+        // would pass the specific cases above and fail somewhere between.
+        for tenths in 25..2000u32 {
+            let kn = tenths as f32 / 10.0;
+            let f = feathers(kn);
+            let read_back = f64::from(f.pennants) * 50.0
+                + f64::from(f.full) * 10.0
+                + if f.half { 5.0 } else { 0.0 };
+            let rounded = f64::from((kn / 5.0).round() * 5.0);
+            assert!(
+                (read_back - rounded).abs() < 1e-9,
+                "{kn} kn decomposed to {f:?}, which reads as {read_back}, not {rounded}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonsense_speeds_do_not_produce_nonsense_barbs() {
+        // A grid can carry a fill value or a NaN where a model has no data.
+        for kn in [f32::NAN, f32::INFINITY, -10.0, -0.0] {
+            let f = feathers(kn);
+            if kn.is_infinite() {
+                // Clamped rather than overflowing into a wrapped count.
+                assert!(f.pennants > 0);
+            } else {
+                assert_eq!(
+                    f,
+                    Feathers {
+                        pennants: 0,
+                        full: 0,
+                        half: false
+                    },
+                    "{kn} should give no feathers"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shaft_points_into_the_wind() {
+        // The direction a wind is named by. Screen y grows downward, so a
+        // northerly — from 000 — runs *up* the screen, which is negative y.
+        let approx = |a: (f32, f32), b: (f32, f32)| {
+            assert!(
+                (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6,
+                "expected {b:?}, got {a:?}"
+            );
+        };
+        // A northerly points up the screen.
+        approx(shaft(0.0), (0.0, -1.0));
+        approx(shaft(90.0), (1.0, 0.0));
+        approx(shaft(180.0), (0.0, 1.0));
+        approx(shaft(270.0), (-1.0, 0.0));
     }
 
     #[test]

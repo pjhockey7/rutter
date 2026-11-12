@@ -29,6 +29,8 @@ const DEFAULT_CHARTS: &str = "build/charts/noaa.mbtiles";
 const DEFAULT_IMAGERY: &str = "build/charts/imagery.mbtiles";
 /// Where `rutter tides` writes by default.
 const DEFAULT_TIDES: &str = "build/charts/tides.sqlite";
+/// Where `rutter weather` writes by default.
+const DEFAULT_WEATHER: &str = "build/charts/weather.bin";
 
 /// Pixels of pan per arrow-key press.
 const KEY_PAN: f64 = 80.0;
@@ -95,6 +97,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
     let mut chart_path = None;
     let mut imagery_path = None;
     let mut tide_path = None;
+    let mut weather_path = None;
     let mut draft_m = None;
     let mut at = None;
     let mut zoom = None;
@@ -123,6 +126,9 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
             // rather than only a panel control: a draft does not change
             // between runs, and typing it every time would be the kind of
             // friction that stops the feature being used.
+            "--weather" | "-w" => {
+                weather_path = Some(args.next().ok_or("--weather needs a path to a .bin file")?);
+            }
             "--draft" | "-d" => {
                 let text = args.next().ok_or("--draft needs a depth in metres")?;
                 let metres: f64 = text
@@ -163,14 +169,16 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  --charts   vector chart, from `rutter charts` or `rutter noaa`");
                 println!("  --imagery  aerial photography, from `rutter imagery`");
                 println!("  --tides    tide stations, from `rutter tides`");
+                println!("  --weather  a wind forecast, from `rutter weather`");
                 println!("  --draft    your draft in metres; switches on the under-keel check");
                 println!("  --at       open here, as <lat>,<lon>, instead of the chart centre");
                 println!("  --zoom     open at this zoom");
                 println!();
-                println!("The first three default to what those commands write:");
+                println!("Each defaults to what its command writes:");
                 println!("  {DEFAULT_CHARTS}");
                 println!("  {DEFAULT_IMAGERY}");
                 println!("  {DEFAULT_TIDES}");
+                println!("  {DEFAULT_WEATHER}");
                 println!();
                 println!("  drag or arrows  pan");
                 println!("  scroll or +/-   zoom");
@@ -254,11 +262,27 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
         }
     };
 
+    let weather = match weather_path.or_else(|| default_path(DEFAULT_WEATHER)) {
+        Some(path) => {
+            let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+            let forecast =
+                rutter_app::Forecast::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
+            let hours: Vec<i32> = forecast.steps.iter().map(|s| s.hour).collect();
+            println!("weather: GFS run {}, hours {hours:?}", forecast.run);
+            Some(forecast)
+        }
+        None => {
+            println!("weather: none — fetch some with `rutter weather --chart <file>`");
+            None
+        }
+    };
+
     Ok((
         Sources {
             charts,
             imagery,
             tides,
+            weather,
         },
         draft_m,
         Opening { at, zoom },
@@ -466,6 +490,12 @@ impl ApplicationHandler for Platform {
             Some(window.scale_factor() as f32),
             None,
             None,
+        );
+        log::info!(
+            "surface {}x{} at {} px/pt",
+            size.width,
+            size.height,
+            window.scale_factor()
         );
         self.egui = Some(EguiState { ctx, winit });
 

@@ -58,6 +58,28 @@ pub enum Action {
     SetDraftCheck(bool),
     /// Change the boat's draft and the margin wanted under it.
     SetDraft(Draft),
+    /// Show or hide the wind.
+    SetWind(bool),
+}
+
+/// What the panel knows about the wind.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WindState {
+    pub available: bool,
+    pub visible: bool,
+    /// The wind at the middle of the view, formatted.
+    pub here: Option<String>,
+    /// Which forecast hour is being shown, and how stale it is. A forecast
+    /// is only worth anything with its age attached.
+    pub validity: Option<String>,
+    /// True when the nearest hour is far enough from now to distrust.
+    pub stale: bool,
+    /// Set when the view reaches past the edge of the fetched forecast.
+    ///
+    /// Said out loud because the symptom is misleading: barbs over part of
+    /// the screen and nothing beyond looks like a layer that has given up,
+    /// when it is the edge of the box someone chose to download.
+    pub partial_coverage: bool,
 }
 
 /// One high or low water, ready to print.
@@ -173,6 +195,24 @@ pub struct ImageryState {
     pub attribution: Option<String>,
 }
 
+/// Everything the panel draws from, for one frame.
+///
+/// One struct rather than eight arguments. It started as a handful of
+/// parameters and grew one per layer — charts, then imagery, then tides,
+/// then the under-keel check, then wind — which is a signature that tells
+/// you it wants to be a type. The platform builds one of these from its own
+/// state and hands it over; nothing here reaches back.
+#[derive(Debug, Default)]
+pub struct PanelState {
+    pub layers: Vec<LayerEntry>,
+    pub imagery: ImageryState,
+    pub tides: TideState,
+    pub draft: DraftState,
+    pub wind: WindState,
+    /// The top strip's text: position, zoom, scale.
+    pub status: String,
+}
+
 /// Panel state that survives between frames.
 ///
 /// Only presentation state — which groups are expanded, whether the panel is
@@ -246,19 +286,21 @@ impl Ui {
     ///
     /// `layers` is the chart's layers; `status` is a line of text for the
     /// top strip — position, zoom, whatever the platform knows.
-    pub fn show(
-        &mut self,
-        root: &mut egui::Ui,
-        layers: &[LayerEntry],
-        imagery: &ImageryState,
-        tides: &TideState,
-        draft: &DraftState,
-        status: &str,
-    ) -> Vec<Action> {
+    pub fn show(&mut self, root: &mut egui::Ui, state: &PanelState) -> Vec<Action> {
+        let PanelState {
+            layers,
+            imagery,
+            tides,
+            draft,
+            wind,
+            status,
+        } = state;
         let mut actions = Vec::new();
 
-        // Station markers first, in a background layer so the panels draw
-        // over them rather than the other way round.
+        // Station rings and wind barbs are drawn by the chart renderer, not
+        // here — see `Overlay` in this crate's root. What remains in egui is
+        // the part that needs a font atlas or a click: the selected
+        // station's label, and hit-testing the markers.
         if tides.visible {
             actions.extend(Self::paint_tide_markers(root, tides));
         }
@@ -362,6 +404,8 @@ impl Ui {
                 ui.separator();
                 actions.extend(Self::tide_section(ui, tides));
                 ui.separator();
+                actions.extend(Self::wind_section(ui, wind));
+                ui.separator();
                 actions.extend(Self::draft_section(ui, draft));
                 ui.separator();
 
@@ -454,6 +498,70 @@ impl Ui {
                     }
                 });
             });
+
+        actions
+    }
+
+    /// The wind block in the panel.
+    fn wind_section(ui: &mut egui::Ui, wind: &WindState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = wind.visible;
+            let toggle = ui.add_enabled(wind.available, egui::Checkbox::new(&mut on, "Wind"));
+            if toggle.clicked() {
+                actions.push(Action::SetWind(on));
+            }
+            if !wind.available {
+                toggle.on_hover_text(
+                    "No forecast loaded. Fetch one with \
+                     `rutter weather --chart <file>`.",
+                );
+            }
+        });
+
+        if !wind.available || !wind.visible {
+            return actions;
+        }
+
+        if let Some(here) = &wind.here {
+            ui.label(egui::RichText::new(here).strong());
+        }
+        if let Some(validity) = &wind.validity {
+            let text = egui::RichText::new(validity).weak().small();
+            // A stale forecast is the one thing here worth colouring: the
+            // numbers look exactly as confident when they are a week old.
+            ui.label(if wind.stale {
+                text.color(egui::Color32::from_rgb(0xff, 0xb3, 0x4d))
+            } else {
+                text
+            })
+            .on_hover_text(
+                "GFS at 0.25 degrees — about 28 km a node, so this is the \
+                 synoptic wind and not the sea breeze in your harbour. \
+                 Barbs: half 5 kn, full 10 kn, pennant 50 kn.",
+            );
+        }
+        if wind.stale {
+            ui.label(
+                egui::RichText::new("refetch with `rutter weather`")
+                    .weak()
+                    .small(),
+            );
+        }
+
+        if wind.partial_coverage {
+            ui.label(
+                egui::RichText::new("forecast covers only part of this view")
+                    .weak()
+                    .small(),
+            )
+            .on_hover_text(
+                "The blank area is outside the box that was downloaded, not \
+                 calm. `rutter weather --chart <file>` pads the chart's \
+                 bounds; raise --margin for more.",
+            );
+        }
 
         actions
     }
@@ -803,11 +911,18 @@ impl Ui {
         );
     }
 
-    /// Station markers over the chart, and clicks on them.
+    /// Clicks on the station markers, and the selected one's label.
+    ///
+    /// The rings themselves are drawn by the chart renderer — see `Overlay`
+    /// — so what is left here is the two things that genuinely belong to the
+    /// interface: hit-testing a tap, which needs egui's input, and a text
+    /// label, which needs its font atlas. Nothing is painted over the chart
+    /// except that label.
     fn paint_tide_markers(root: &mut egui::Ui, tides: &TideState) -> Vec<Action> {
+        /// The ring's drawn radius, matching `refresh_overlay`.
         const RADIUS: f32 = 5.0;
-        // Generous next to the 5 px dot: this has to be hittable with a
-        // thumb on a phone, not just a mouse.
+        /// Generous next to it: this has to be hittable with a thumb on a
+        /// phone, not just a mouse.
         const TOUCH: f32 = 14.0;
 
         let mut actions = Vec::new();
@@ -815,29 +930,20 @@ impl Ui {
             return actions;
         }
 
-        let painter = root.painter();
-        let fill = Self::tide_colour(true);
-
+        let clip = root.painter().clip_rect();
         for marker in &tides.markers {
             let centre = egui::pos2(marker.x, marker.y);
-            if !painter.clip_rect().expand(TOUCH).contains(centre) {
+            if !clip.expand(TOUCH).contains(centre) {
                 continue;
             }
 
-            // A ring rather than a disc, so the chart under it still reads.
-            painter.circle_stroke(
-                centre,
-                RADIUS,
-                egui::Stroke::new(if marker.selected { 2.5 } else { 1.5 }, fill),
-            );
             if marker.selected {
-                painter.circle_filled(centre, RADIUS - 2.0, fill);
-                painter.text(
-                    centre + egui::vec2(RADIUS + 4.0, 0.0),
+                root.painter().text(
+                    centre + egui::vec2(RADIUS + 5.0, 0.0),
                     egui::Align2::LEFT_CENTER,
                     &marker.label,
                     egui::FontId::proportional(11.0),
-                    fill,
+                    Self::tide_colour(true),
                 );
             }
 
@@ -1063,11 +1169,14 @@ mod font_tests {
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui_state.show(
                 ui,
-                &entries,
-                &imagery,
-                &populated_tides(),
-                &populated_draft(),
-                "32°40.80'N  117°13.80'W   z12.0",
+                &PanelState {
+                    layers: entries.clone(),
+                    imagery: imagery.clone(),
+                    tides: populated_tides(),
+                    draft: populated_draft(),
+                    wind: populated_wind(),
+                    status: "32°40.80'N  117°13.80'W   z12.0".to_owned(),
+                },
             );
         });
         let mut textures = output.textures_delta;
@@ -1129,6 +1238,19 @@ mod font_tests {
         }
     }
 
+    /// A wind state as the panel sees it. The barbs themselves are the
+    /// chart renderer's business now; what is left here is text.
+    fn populated_wind() -> WindState {
+        WindState {
+            available: true,
+            visible: true,
+            here: Some("12 kn from 299°, force 4, 22 C".to_owned()),
+            validity: Some("GFS +0 h, 40m ago".to_owned()),
+            stale: false,
+            partial_coverage: false,
+        }
+    }
+
     /// A draft state with the check on and something to report.
     fn populated_draft() -> DraftState {
         DraftState {
@@ -1166,7 +1288,17 @@ mod font_tests {
         let imagery = ImageryState::default();
 
         ctx.run_ui(egui::RawInput::default(), |ui| {
-            ui_state.show(ui, &entries, &imagery, tides, &populated_draft(), "status");
+            ui_state.show(
+                ui,
+                &PanelState {
+                    layers: entries.clone(),
+                    imagery: imagery.clone(),
+                    tides: tides.clone(),
+                    draft: populated_draft(),
+                    wind: populated_wind(),
+                    status: "status".to_owned(),
+                },
+            );
         })
     }
 
@@ -1294,11 +1426,62 @@ mod font_tests {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui_state.show(
                     ui,
-                    &[],
-                    &ImageryState::default(),
-                    &TideState::default(),
-                    &state,
-                    "status",
+                    &PanelState {
+                        draft: state,
+                        wind: populated_wind(),
+                        status: "status".to_owned(),
+                        ..PanelState::default()
+                    },
+                );
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn the_wind_panel_renders_in_every_state() {
+        // Each of these is a different path through `paint_wind`: calm
+        // circles, half barbs, full barbs, pennants, and a 105-knot wind
+        // that needs two pennants. The arithmetic divides and rounds, so a
+        // zero speed or a NaN direction would panic mid-frame.
+        let states = [
+            WindState::default(),
+            WindState {
+                visible: false,
+                ..populated_wind()
+            },
+            populated_wind(),
+            WindState {
+                stale: true,
+                validity: Some("GFS +0 h, 3d 04h ago".to_owned()),
+                ..populated_wind()
+            },
+            // Outside the fetched box entirely, so no reading.
+            WindState {
+                here: None,
+                ..populated_wind()
+            },
+            // Half in, half out of the downloaded box.
+            WindState {
+                partial_coverage: true,
+                ..populated_wind()
+            },
+        ];
+
+        for wind in states {
+            let ctx = egui::Context::default();
+            let mut ui_state = Ui {
+                open: true,
+                ..Ui::default()
+            };
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui_state.show(
+                    ui,
+                    &PanelState {
+                        wind: wind.clone(),
+                        status: "status".to_owned(),
+                        ..PanelState::default()
+                    },
                 );
             });
             output.textures_delta.clear();

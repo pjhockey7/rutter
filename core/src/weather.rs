@@ -248,9 +248,359 @@ pub fn kelvin_to_celsius(k: f32) -> f32 {
     k - 273.15
 }
 
+/// One forecast hour: wind and air temperature over the same grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    /// Hours after the model run this is valid for.
+    pub hour: i32,
+    pub wind: WindField,
+    /// Air temperature at 2 m, Celsius.
+    pub temperature: Grid,
+}
+
+/// A whole forecast: several hours over one area.
+///
+/// Read from the file `rutter weather` writes. That file exists because the
+/// alternative is a GRIB2 decoder, and GRIB2 is a container format with
+/// twelve template families and a bitmap-packing scheme that is a project in
+/// itself — while the part this app needs from it is "a rectangle of floats
+/// per parameter per hour". So GDAL does the decoding on a desktop, at fetch
+/// time, exactly as it already does for S-57 charts, and what reaches the
+/// boat is the rectangle.
+///
+/// The format is deliberately boring: a fixed 56-byte header then the
+/// values, little-endian throughout. Parsing it is pure arithmetic over a
+/// byte slice, which is why it lives in this crate; opening the file is the
+/// caller's job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Forecast {
+    /// Unix time of the model run that produced this.
+    pub run: i64,
+    pub steps: Vec<Step>,
+}
+
+/// What the writer and reader agree on.
+const MAGIC: &[u8; 8] = b"RUTTERWX";
+/// Bumped if the layout changes, so an old file is refused rather than
+/// misread as a new one.
+const FORMAT_VERSION: u16 = 1;
+const HEADER_BYTES: usize = 56;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForecastError {
+    /// Not one of our files.
+    NotAForecast,
+    /// A version this build does not know.
+    Version(u16),
+    /// The file is shorter than its own header says it should be.
+    Truncated { expected: usize, got: usize },
+    /// A grid inside it does not describe a grid.
+    Grid(GridError),
+    /// No forecast hours at all.
+    Empty,
+}
+
+impl core::fmt::Display for ForecastError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotAForecast => {
+                write!(f, "not a rutter forecast — build one with `rutter weather`")
+            }
+            Self::Version(v) => write!(f, "forecast format version {v} is not supported"),
+            Self::Truncated { expected, got } => {
+                write!(f, "forecast is {got} bytes, expected at least {expected}")
+            }
+            Self::Grid(e) => write!(f, "{e}"),
+            Self::Empty => write!(f, "forecast holds no hours"),
+        }
+    }
+}
+
+impl std::error::Error for ForecastError {}
+
+impl From<GridError> for ForecastError {
+    fn from(e: GridError) -> Self {
+        Self::Grid(e)
+    }
+}
+
+impl Forecast {
+    /// Decode the file `rutter weather` writes.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ForecastError> {
+        if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC {
+            return Err(ForecastError::NotAForecast);
+        }
+        let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+        if version != FORMAT_VERSION {
+            return Err(ForecastError::Version(version));
+        }
+
+        let u16_at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
+        let f64_at = |o: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[o..o + 8]);
+            f64::from_le_bytes(b)
+        };
+
+        let nx = u16_at(10);
+        let ny = u16_at(12);
+        let step_count = u16_at(14);
+        let mut run_bytes = [0u8; 8];
+        run_bytes.copy_from_slice(&bytes[16..24]);
+        let run = i64::from_le_bytes(run_bytes);
+        let (north, west, dlat, dlon) = (f64_at(24), f64_at(32), f64_at(40), f64_at(48));
+
+        if step_count == 0 {
+            return Err(ForecastError::Empty);
+        }
+
+        // Three parameters per hour — u, v, temperature — plus the hour.
+        let per_step = 4 + 3 * nx * ny * 4;
+        let expected = HEADER_BYTES + step_count * per_step;
+        if bytes.len() < expected {
+            return Err(ForecastError::Truncated {
+                expected,
+                got: bytes.len(),
+            });
+        }
+
+        let floats = |from: usize, count: usize| -> Vec<f32> {
+            (0..count)
+                .map(|i| {
+                    let o = from + i * 4;
+                    f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+                })
+                .collect()
+        };
+
+        let mut steps = Vec::with_capacity(step_count);
+        let nodes = nx * ny;
+        for index in 0..step_count {
+            let base = HEADER_BYTES + index * per_step;
+            let hour = i32::from_le_bytes([
+                bytes[base],
+                bytes[base + 1],
+                bytes[base + 2],
+                bytes[base + 3],
+            ]);
+            let values = base + 4;
+
+            let grid = |which: usize| {
+                Grid::new(
+                    north,
+                    west,
+                    dlat,
+                    dlon,
+                    nx,
+                    ny,
+                    floats(values + which * nodes * 4, nodes),
+                )
+            };
+
+            steps.push(Step {
+                hour,
+                wind: WindField::new(grid(0)?, grid(1)?)?,
+                temperature: grid(2)?,
+            });
+        }
+
+        Ok(Self { run, steps })
+    }
+
+    /// Encode, so that a test can round-trip a forecast without a network.
+    ///
+    /// The writer is `scripts/weather-grid.py`; this exists to check the
+    /// reader against something, and to document the layout in code rather
+    /// than only in a comment.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+
+        let (nx, ny) = match self.steps.first() {
+            Some(s) => (s.temperature.nx as u16, s.temperature.ny as u16),
+            None => (0, 0),
+        };
+        out.extend_from_slice(&nx.to_le_bytes());
+        out.extend_from_slice(&ny.to_le_bytes());
+        out.extend_from_slice(&(self.steps.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.run.to_le_bytes());
+
+        let first = self.steps.first().map(|s| &s.temperature);
+        for value in [
+            first.map_or(0.0, |g| g.north),
+            first.map_or(0.0, |g| g.west),
+            first.map_or(1.0, |g| g.dlat),
+            first.map_or(1.0, |g| g.dlon),
+        ] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+
+        for step in &self.steps {
+            out.extend_from_slice(&step.hour.to_le_bytes());
+            for grid in [&step.wind.u, &step.wind.v, &step.temperature] {
+                for value in &grid.values {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// The step closest to a time, and how stale it is.
+    ///
+    /// A forecast is only as good as its age, so the caller is told: an
+    /// hour's drift is ordinary, a day's means the file should be refetched
+    /// before anyone steers by it.
+    pub fn nearest(&self, unix: i64) -> Option<(&Step, i64)> {
+        self.steps
+            .iter()
+            .map(|s| {
+                let valid = self.run + i64::from(s.hour) * 3600;
+                (s, unix - valid)
+            })
+            .min_by_key(|(_, offset)| offset.abs())
+    }
+
+    /// The area covered, as north-west and south-east corners.
+    pub fn bounds(&self) -> Option<(crate::LatLon, crate::LatLon)> {
+        let g = &self.steps.first()?.temperature;
+        Some((
+            crate::LatLon::new(g.north, g.west),
+            crate::LatLon::new(g.south(), g.east()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A forecast over 32-33°N, 118-117°W: 3x3 nodes, two hours, with a
+    /// steady westerly that strengthens.
+    fn a_forecast() -> Forecast {
+        let grid = |v: f32| Grid::new(33.0, -118.0, 0.5, 0.5, 3, 3, vec![v; 9]).expect("grid");
+        Forecast {
+            // 2026-03-01T00:00:00Z.
+            run: 1_772_323_200,
+            steps: vec![
+                Step {
+                    hour: 0,
+                    // Blowing towards the east: positive u, zero v.
+                    wind: WindField::new(grid(5.0), grid(0.0)).expect("wind"),
+                    temperature: grid(16.0),
+                },
+                Step {
+                    hour: 3,
+                    wind: WindField::new(grid(10.0), grid(0.0)).expect("wind"),
+                    temperature: grid(17.0),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_forecast_round_trips_through_its_file_format() {
+        let original = a_forecast();
+        let parsed = Forecast::parse(&original.to_bytes()).expect("parse");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn the_header_is_the_size_the_parser_assumes() {
+        // The one number that cannot drift: the writer in
+        // scripts/weather-grid.py hard-codes the same offsets.
+        let bytes = a_forecast().to_bytes();
+        assert_eq!(&bytes[..8], MAGIC);
+        let per_step = 4 + 3 * 9 * 4;
+        assert_eq!(bytes.len(), HEADER_BYTES + 2 * per_step);
+    }
+
+    #[test]
+    fn something_that_is_not_a_forecast_is_refused() {
+        assert_eq!(Forecast::parse(b""), Err(ForecastError::NotAForecast));
+        assert_eq!(
+            Forecast::parse(b"not a forecast at all, but long enough to have a header....."),
+            Err(ForecastError::NotAForecast)
+        );
+    }
+
+    #[test]
+    fn a_future_format_version_is_refused_rather_than_misread() {
+        let mut bytes = a_forecast().to_bytes();
+        bytes[8] = 99;
+        assert_eq!(Forecast::parse(&bytes), Err(ForecastError::Version(99)));
+    }
+
+    #[test]
+    fn a_truncated_file_says_so() {
+        let full = a_forecast().to_bytes();
+        let cut = &full[..full.len() - 10];
+        match Forecast::parse(cut) {
+            Err(ForecastError::Truncated { expected, got }) => {
+                assert_eq!(got, cut.len());
+                assert_eq!(expected, full.len());
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wind_survives_the_round_trip_as_wind() {
+        // Not just the bytes: the thing that comes back has to answer the
+        // same question. A u/v swap or a sign flip would round-trip
+        // perfectly and point the wind the wrong way.
+        let parsed = Forecast::parse(&a_forecast().to_bytes()).expect("parse");
+        let here = LatLon::new(32.5, -117.5);
+        let wind = parsed.steps[0].wind.sample(here).expect("inside the grid");
+
+        assert!((wind.speed_ms() - 5.0).abs() < 1e-6);
+        // u positive, v zero: blowing towards the east, so *from* the west.
+        assert!(
+            (wind.direction_from_deg() - 270.0).abs() < 1e-6,
+            "a westerly should read 270, got {}",
+            wind.direction_from_deg()
+        );
+        assert!((wind.direction_to_deg() - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_nearest_step_is_chosen_and_its_staleness_reported() {
+        let f = a_forecast();
+        let run = f.run;
+
+        // At the run time: hour 0, not stale.
+        let (step, drift) = f.nearest(run).expect("a step");
+        assert_eq!(step.hour, 0);
+        assert_eq!(drift, 0);
+
+        // One hour in, hour 0 is an hour behind and hour 3 is two ahead,
+        // so hour 0 still wins.
+        let (step, drift) = f.nearest(run + 3600).expect("a step");
+        assert_eq!(step.hour, 0);
+        assert_eq!(drift, 3600);
+
+        // Two hours in, the midpoint is passed and hour 3 is closer. The
+        // drift is negative: the step is valid in the future.
+        let (step, drift) = f.nearest(run + 2 * 3600).expect("a step");
+        assert_eq!(step.hour, 3);
+        assert_eq!(drift, -3600);
+
+        // Long after the last hour, the staleness is what warns the caller.
+        let (step, drift) = f.nearest(run + 100 * 3600).expect("a step");
+        assert_eq!(step.hour, 3);
+        assert!(drift > 90 * 3600, "drift {drift}");
+    }
+
+    #[test]
+    fn the_bounds_are_the_grid_the_file_carries() {
+        let (nw, se) = a_forecast().bounds().expect("bounds");
+        assert!((nw.lat - 33.0).abs() < 1e-9);
+        assert!((nw.lon + 118.0).abs() < 1e-9);
+        // 3 nodes at 0.5 degrees spans 1 degree.
+        assert!((se.lat - 32.0).abs() < 1e-9);
+        assert!((se.lon + 117.0).abs() < 1e-9);
+    }
 
     /// A 3×3 grid over 50–52°N, 5°W–3°W, value == the node index.
     fn ramp() -> Grid {

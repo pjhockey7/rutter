@@ -34,14 +34,102 @@ use rutter_core::depth::{Draft, TideWindow};
 use rutter_core::tide::{Kind, Station};
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{
-    Action, DraftState, ImageryState, LayerEntry, Renderer, TideMarker, TideReading, TideState, Ui,
+    Action, DraftState, ImageryState, LayerEntry, Overlay, PanelState, Renderer, TideMarker,
+    TideReading, TideState, Ui, WindState,
 };
+
+/// Re-exported so a platform can name the panel's input without depending
+/// on the renderer directly.
+pub use rutter_render::PanelState as Panel;
 use rutter_tides::TideStations;
 
 // Re-exported for the platform shims. They need a position and a viewport to
 // translate input into, and reaching past this crate to `rutter-core` for
 // them would make the layering a suggestion rather than a rule.
+pub use rutter_core::weather::Forecast;
 pub use rutter_core::{LatLon as Position, View as Viewport};
+
+/// Roughly how far apart barbs should land on screen, pixels.
+const WANTED_SPACING_PX: f64 = 110.0;
+
+/// Positions for the wind-barb lattice, in degrees.
+///
+/// Multiples of a fixed spacing, so they are glued to the ground: panning
+/// the view returns the same positions for the ground that is still
+/// visible, which is the whole point. See [`App::wind_marks`].
+///
+/// `base_deg` is the forecast's own node spacing. The returned spacing is
+/// that times a power of two, so the coarse levels fall exactly on model
+/// nodes and the fine ones subdivide them evenly.
+fn barb_lattice(view: &Viewport, base_deg: f64) -> Vec<Position> {
+    /// A ceiling on how many are generated, whatever the zoom. The spacing
+    /// ladder should keep the count near a hundred; this is the backstop
+    /// against a viewport nobody anticipated.
+    const MAX_BARBS: usize = 800;
+    /// How far the subdivision may go either way from the model's own
+    /// spacing.
+    ///
+    /// Generous at the fine end on purpose. Stopping at eight times finer
+    /// seemed principled — beyond that the barbs are interpolated rather
+    /// than sampled — but it meant the layer vanished at harbour zoom,
+    /// which is where the navigating happens. And the objection does not
+    /// hold: the field is bilinear, so a subdivided barb is the same
+    /// surface read more densely, not detail conjured out of nothing.
+    /// Twenty near-identical barbs across a harbour are a true statement
+    /// about a synoptic wind — it really is uniform at that scale.
+    const FINEST: f64 = -12.0;
+    const COARSEST: f64 = 8.0;
+
+    // Spelled out rather than `!(base_deg > 0.0)` so the NaN case is a
+    // decision and not a side effect of negating a partial comparison. A
+    // malformed forecast file could carry a zero or a NaN step, and the
+    // arithmetic below divides by it.
+    if !base_deg.is_finite() || base_deg <= 0.0 {
+        return Vec::new();
+    }
+
+    // Degrees of longitude per pixel. In Web Mercator a degree of longitude
+    // is a constant number of pixels at any latitude, which is what makes
+    // this a single number rather than a function of where you are.
+    let per_pixel = 360.0 / (256.0 * 2f64.powf(view.zoom));
+    let wanted = WANTED_SPACING_PX * per_pixel;
+
+    let steps = (wanted / base_deg).log2().round().clamp(FINEST, COARSEST);
+    let spacing = base_deg * 2f64.powf(steps);
+
+    let (nw, se) = view.bounds();
+    let mut out = Vec::new();
+
+    // Indexed and multiplied, not accumulated. Repeatedly adding the
+    // spacing drifts off the lattice after a few dozen steps, and "every
+    // position is an exact multiple" is the property that makes these
+    // stable under panning — so it is computed that way rather than
+    // approached.
+    let first = |edge: f64| (edge / spacing).ceil() as i64;
+    let last = |edge: f64| (edge / spacing).floor() as i64;
+
+    for row in first(se.lat)..=last(nw.lat) {
+        for column in first(nw.lon)..=last(se.lon) {
+            out.push(Position::new(row as f64 * spacing, column as f64 * spacing));
+            if out.len() >= MAX_BARBS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Colours for the chart's notation, kept beside each other because they
+/// are read together.
+///
+/// Matching the panel's own tide colour, so a ring on the chart and a high
+/// water in the panel are visibly the same subject.
+const TIDE_COLOUR: [f32; 4] = [0.42, 0.78, 1.0, 1.0];
+const WIND_COLOUR: [f32; 4] = [0.78, 0.90, 0.94, 0.85];
+/// Grey, for a forecast old enough to distrust.
+const WIND_STALE_COLOUR: [f32; 4] = [0.54, 0.54, 0.54, 0.75];
+/// Past this a forecast is called stale, in the panel and in the drawing.
+const STALE_FORECAST_SECS: i64 = 6 * 3600;
 
 /// The data files a platform found, however it found them.
 #[derive(Debug, Default)]
@@ -49,6 +137,7 @@ pub struct Sources {
     pub charts: Option<ChartSource>,
     pub imagery: Option<ImagerySource>,
     pub tides: Option<TideStations>,
+    pub weather: Option<Forecast>,
 }
 
 /// Tide readings for one second, reused across that second's frames.
@@ -66,22 +155,6 @@ struct TideCache {
     window: TideWindow,
 }
 
-/// Everything the panel needs for one frame.
-///
-/// Built from `&App` and owned, so that the egui closure can borrow the app
-/// mutably while still reading it.
-#[derive(Debug)]
-pub struct PanelState {
-    layers: Vec<LayerEntry>,
-    imagery: ImageryState,
-    tides: TideState,
-    draft: DraftState,
-    status: String,
-}
-
-/// `Debug` is derived rather than hand-written because every field has it:
-/// the sources print as their metadata, not their contents, and `Ui` holds
-/// only presentation state.
 #[derive(Debug, Default)]
 pub struct App {
     pub view: View,
@@ -128,12 +201,22 @@ pub struct App {
     imagery_visible: bool,
     imagery_loaded: Vec<TileId>,
 
+    /// The wind and temperature forecast, if one was fetched.
+    weather: Option<Forecast>,
+    wind_visible: bool,
+
     /// Last computed tide readings, and the second they were computed for.
     ///
     /// The curve and the high/low list cost about 0.6 ms together, which is
     /// worth having once a second and not sixty times. Markers are *not*
     /// cached: they move with the view and are only a projection each.
     tide_cache: Option<TideCache>,
+
+    /// The chart's notation, as last uploaded. Compared each frame so an
+    /// unchanged view does not re-upload it.
+    overlay: Vec<Overlay>,
+    /// Whether the last barb lattice reached past the forecast's edge.
+    wind_partial: bool,
 
     /// Panel presentation state — which groups are open, the filter text.
     pub ui: Ui,
@@ -160,6 +243,9 @@ impl App {
             charts: sources.charts.and_then(ChartWorker::spawn),
             imagery: sources.imagery,
             tides: sources.tides,
+            weather: sources.weather,
+            // On when a forecast is present, same as the other layers.
+            wind_visible: true,
             // Both on when the data is there: the reason to fetch imagery or
             // stations is to see them.
             imagery_visible: true,
@@ -240,6 +326,118 @@ impl App {
         self.refresh_tide_cache();
         self.refresh_charts(renderer);
         self.refresh_imagery(renderer);
+        self.refresh_overlay(renderer);
+    }
+
+    /// Rebuild the chart's notation: station rings and wind barbs.
+    ///
+    /// These were drawn through egui at first, which gave constant screen
+    /// size for nothing — and put chart notation in a different renderer
+    /// with a different palette, re-tessellated every frame. They are marks
+    /// on the chart, so they are drawn by the chart; `overlay.wgsl`
+    /// anchors them in the world and sizes them in pixels.
+    fn refresh_overlay(&mut self, renderer: &mut Renderer) {
+        let mut marks: Vec<Overlay> = Vec::new();
+
+        // Wind under the stations: a station is a place and the wind is
+        // context, so the station should not be hidden behind a barb.
+        if self.wind_visible {
+            let (barbs, partial) = self.wind_marks();
+            self.wind_partial = partial;
+            marks.extend(barbs);
+        }
+        if self.tide_visible {
+            let selected = self.tide_station().map(|s| s.id.clone());
+            let (nw, se) = self.view.bounds();
+            for station in &self.stations {
+                if station.lat < se.lat
+                    || station.lat > nw.lat
+                    || station.lon < nw.lon
+                    || station.lon > se.lon
+                {
+                    continue;
+                }
+                marks.push(Overlay::Ring {
+                    at: chart::project(LatLon::new(station.lat, station.lon)),
+                    radius_px: 5.0,
+                    emphasised: selected.as_deref() == Some(station.id.as_str()),
+                    colour: TIDE_COLOUR,
+                });
+            }
+        }
+
+        // Compared before uploading: a still view rebuilds the same marks
+        // every frame, and re-uploading them would undo the point of
+        // having them on the GPU at all.
+        if marks != self.overlay {
+            renderer.set_overlay(&marks);
+            log::debug!(
+                "overlay: {} marks, {} segments",
+                marks.len(),
+                renderer.overlay_segment_count()
+            );
+            self.overlay = marks;
+        }
+    }
+
+    /// Wind barbs at fixed geographic positions.
+    ///
+    /// On a *geographic* lattice, not a screen one. The first version used
+    /// screen positions — a barb every 150 pixels, sampling whatever wind
+    /// was under it — and the result was barbs nailed to the window: panning
+    /// slid the coast beneath them while they sat still and silently changed
+    /// value. A barb has to belong to a place.
+    ///
+    /// The spacing is a power-of-two multiple of the forecast's own node
+    /// spacing, chosen so the barbs land roughly [`WANTED_SPACING_PX`] apart
+    /// on screen. Tying it to the model's grid rather than to a round number
+    /// of degrees means every barb sits exactly on a model node at the
+    /// coarsest levels, and that the lattice never shifts as you pan — the
+    /// positions are multiples of a fixed spacing, not offsets from the
+    /// viewport.
+    ///
+    /// Zooming does change which positions are drawn, because the
+    /// subdivision level changes. That is the same thing a graticule or a
+    /// contour interval does, and it reads as detail appearing rather than
+    /// as the field moving.
+    fn wind_marks(&self) -> (Vec<Overlay>, bool) {
+        let Some(forecast) = &self.weather else {
+            return (Vec::new(), false);
+        };
+        let Some((step, drift)) = forecast.nearest(unix_now()) else {
+            return (Vec::new(), false);
+        };
+        // A stale forecast is still drawn, because it beats nothing, but it
+        // is drawn apologetically.
+        let colour = if drift.abs() > STALE_FORECAST_SECS {
+            WIND_STALE_COLOUR
+        } else {
+            WIND_COLOUR
+        };
+
+        let lattice = barb_lattice(&self.view, step.wind.u.dlon);
+        let kept: Vec<Overlay> = lattice
+            .iter()
+            .filter_map(|&at| {
+                let wind = step.wind.sample(at)?;
+                Some(Overlay::Barb {
+                    at: chart::project(at),
+                    speed_kn: wind.speed_kn() as f32,
+                    from_deg: wind.direction_from_deg() as f32,
+                    colour,
+                })
+            })
+            .collect();
+        let kept_count = kept.len();
+        log::debug!(
+            "wind: viewport {}x{} at z{:.1}, lattice {} points, {} inside the forecast",
+            self.view.width_px,
+            self.view.height_px,
+            self.view.zoom,
+            lattice.len(),
+            kept.len()
+        );
+        (kept, kept_count < lattice.len())
     }
 
     /// Gather what the panel needs. See [`PanelState`].
@@ -258,20 +456,14 @@ impl App {
             },
             tides: self.tide_state(pixels_per_point),
             draft: self.draft_state(renderer),
+            wind: self.wind_state(),
             status: status_line(&self.view),
         }
     }
 
     /// Draw the panel for one frame and report what the user did.
     pub fn show(&mut self, ui: &mut egui::Ui, state: &PanelState) -> Vec<Action> {
-        self.ui.show(
-            ui,
-            &state.layers,
-            &state.imagery,
-            &state.tides,
-            &state.draft,
-            &state.status,
-        )
+        self.ui.show(ui, state)
     }
 
     /// Forget everything uploaded to a renderer that has gone away.
@@ -530,6 +722,10 @@ impl App {
                     self.imagery_loaded.clear();
                     touched = true;
                 }
+                Action::SetWind(on) => {
+                    self.wind_visible = *on;
+                    touched = true;
+                }
                 Action::SetTides(on) => {
                     self.tide_visible = *on;
                     touched = true;
@@ -603,7 +799,8 @@ impl App {
                 | Action::SetTides(_)
                 | Action::SelectTideStation(_)
                 | Action::SetDraftCheck(_)
-                | Action::SetDraft(_) => {}
+                | Action::SetDraft(_)
+                | Action::SetWind(_) => {}
             }
         }
 
@@ -731,6 +928,43 @@ impl App {
     /// a still-falling tide rather than a turning point inside it.
     fn tide_window(&self) -> Option<TideWindow> {
         self.tide_cache.as_ref().map(|c| c.window)
+    }
+
+    /// Everything the panel needs to show about the wind.
+    fn wind_state(&self) -> WindState {
+        let Some(forecast) = &self.weather else {
+            return WindState::default();
+        };
+
+        let mut state = WindState {
+            available: true,
+            visible: self.wind_visible,
+            ..WindState::default()
+        };
+
+        let Some((step, drift)) = forecast.nearest(unix_now()) else {
+            return state;
+        };
+        state.stale = drift.abs() > STALE_FORECAST_SECS;
+        state.partial_coverage = self.wind_visible && self.wind_partial;
+        state.validity = Some(format!("GFS +{} h, {}", step.hour, format_away(-drift)));
+
+        if let Some(wind) = step.wind.sample(self.view.centre) {
+            let temperature = step
+                .temperature
+                .sample(self.view.centre)
+                .map(|c| format!(", {c:.0} C"))
+                .unwrap_or_default();
+            state.here = Some(format!(
+                "{:.0} kn from {:.0}°, force {}{}",
+                wind.speed_kn(),
+                wind.direction_from_deg(),
+                wind.beaufort(),
+                temperature
+            ));
+        }
+
+        state
     }
 
     /// Everything the panel needs to show about the under-keel check.
@@ -916,6 +1150,141 @@ fn format_away(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GFS's own spacing, which is what the lattice is built from.
+    const GFS_DEG: f64 = 0.25;
+
+    fn view_at(lat: f64, lon: f64, zoom: f64) -> Viewport {
+        Viewport::new(Position::new(lat, lon), zoom, 1280, 800)
+    }
+
+    #[test]
+    fn the_barb_lattice_is_glued_to_the_ground() {
+        // The bug this exists for: the lattice was built on screen
+        // positions, so panning slid the coast under barbs that sat still
+        // and quietly changed value. Every position has to be a multiple of
+        // the spacing, which makes it a property of the ground and not of
+        // the window.
+        let before = barb_lattice(&view_at(32.70, -117.25, 11.0), GFS_DEG);
+        let after = barb_lattice(&view_at(32.70, -117.15, 11.0), GFS_DEG);
+
+        assert!(!before.is_empty() && !after.is_empty());
+
+        // The two views overlap, so the positions in both must be identical
+        // — not merely similar in number.
+        let shared: Vec<&Position> = before
+            .iter()
+            .filter(|p| after.iter().any(|q| same_place(p, q)))
+            .collect();
+        assert!(
+            shared.len() > before.len() / 2,
+            "a small pan should keep most positions, kept {} of {}",
+            shared.len(),
+            before.len()
+        );
+
+        // And the set is not the same set shifted: panning east must bring
+        // in positions further east than anything in the first view.
+        let easternmost_before = before.iter().map(|p| p.lon).fold(f64::MIN, f64::max);
+        let easternmost_after = after.iter().map(|p| p.lon).fold(f64::MIN, f64::max);
+        assert!(
+            easternmost_after > easternmost_before,
+            "panning east should reveal ground further east"
+        );
+    }
+
+    fn same_place(a: &Position, b: &Position) -> bool {
+        (a.lat - b.lat).abs() < 1e-9 && (a.lon - b.lon).abs() < 1e-9
+    }
+
+    #[test]
+    fn every_position_sits_on_the_lattice() {
+        // Multiples of the spacing, which is what makes them stable. A
+        // position computed from the viewport's own corner would pass the
+        // pan test by luck and fail this.
+        for zoom in [8.0, 10.0, 11.0, 13.0, 15.0] {
+            let view = view_at(32.70, -117.25, zoom);
+            let positions = barb_lattice(&view, GFS_DEG);
+            assert!(!positions.is_empty(), "nothing at zoom {zoom}");
+
+            // Recover the spacing from the two closest longitudes.
+            let mut lons: Vec<f64> = positions.iter().map(|p| p.lon).collect();
+            lons.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            lons.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+            assert!(lons.len() > 1, "only one column at zoom {zoom}");
+            let spacing = lons[1] - lons[0];
+
+            for p in &positions {
+                let steps = p.lon / spacing;
+                assert!(
+                    (steps - steps.round()).abs() < 1e-6,
+                    "zoom {zoom}: longitude {} is not a multiple of {spacing}",
+                    p.lon
+                );
+                let steps = p.lat / spacing;
+                assert!(
+                    (steps - steps.round()).abs() < 1e-6,
+                    "zoom {zoom}: latitude {} is not a multiple of {spacing}",
+                    p.lat
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_spacing_tracks_the_zoom() {
+        // Zoomed out, barbs should be further apart on the ground so they
+        // stay a readable distance apart on screen. Without this the
+        // lattice is either a thicket or empty.
+        let spacing_at = |zoom: f64| {
+            let p = barb_lattice(&view_at(32.70, -117.25, zoom), GFS_DEG);
+            let mut lons: Vec<f64> = p.iter().map(|q| q.lon).collect();
+            lons.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            lons.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+            lons[1] - lons[0]
+        };
+
+        let coarse = spacing_at(8.0);
+        let mid = spacing_at(11.0);
+        let fine = spacing_at(14.0);
+        assert!(
+            coarse > mid && mid > fine,
+            "spacing should shrink with zoom: {coarse}, {mid}, {fine}"
+        );
+
+        // And every level is a power-of-two multiple of the model's own
+        // spacing, so the coarse levels land on real nodes.
+        for spacing in [coarse, mid, fine] {
+            let ratio = (spacing / GFS_DEG).log2();
+            assert!(
+                (ratio - ratio.round()).abs() < 1e-9,
+                "{spacing} is not GFS's 0.25 times a power of two"
+            );
+        }
+    }
+
+    #[test]
+    fn there_are_barbs_at_every_zoom_and_never_too_many() {
+        // A readable screen holds around a hundred. The first version
+        // clamped the subdivision three levels below the model's spacing,
+        // and the layer silently emptied above zoom 14 — harbour zoom,
+        // where someone is actually navigating.
+        for zoom in [2.0, 5.0, 8.0, 11.0, 14.0, 16.0, 18.0, 20.0] {
+            let n = barb_lattice(&view_at(32.70, -117.25, zoom), GFS_DEG).len();
+            println!("zoom {zoom}: {n} barbs");
+            assert!(n > 4, "zoom {zoom} produced only {n}");
+            assert!(n <= 800, "zoom {zoom} produced {n}");
+        }
+    }
+
+    #[test]
+    fn a_forecast_with_no_spacing_produces_nothing() {
+        // A malformed file could carry a zero or negative step, and the
+        // loop below divides by it.
+        assert!(barb_lattice(&view_at(32.7, -117.25, 11.0), 0.0).is_empty());
+        assert!(barb_lattice(&view_at(32.7, -117.25, 11.0), -0.25).is_empty());
+        assert!(barb_lattice(&view_at(32.7, -117.25, 11.0), f64::NAN).is_empty());
+    }
 
     #[test]
     fn utc_times_are_formatted_from_the_epoch_correctly() {

@@ -37,6 +37,7 @@ use winit::platform::android::activity::AndroidApp;
 const CHART_ASSET: &str = "noaa.mbtiles";
 const IMAGERY_ASSET: &str = "imagery.mbtiles";
 const TIDES_ASSET: &str = "tides.sqlite";
+const WEATHER_ASSET: &str = "weather.bin";
 
 // The only unsafe thing in the project, and unavoidable: the NDK's glue
 // finds this entry point by symbol name, so it cannot be mangled. Spelled
@@ -192,10 +193,35 @@ fn open_bundled_sources(app: &AndroidApp) -> Sources {
         }
     });
 
+    // A forecast expires, unlike the chart and the tide constituents, so a
+    // bundled one is only ever a starting point — the app says how old it is
+    // and in-app fetching is what will really serve this.
+    let weather = extract_asset(app, WEATHER_ASSET).and_then(|path| match std::fs::read(&path) {
+        Ok(bytes) => match rutter_app::Forecast::parse(&bytes) {
+            Ok(forecast) => {
+                log::info!(
+                    "weather: GFS run {}, {} hours",
+                    forecast.run,
+                    forecast.steps.len()
+                );
+                Some(forecast)
+            }
+            Err(e) => {
+                log::error!("{}: {e}", path.display());
+                None
+            }
+        },
+        Err(e) => {
+            log::error!("reading {}: {e}", path.display());
+            None
+        }
+    });
+
     Sources {
         charts,
         imagery,
         tides,
+        weather,
     }
 }
 

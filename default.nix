@@ -743,6 +743,10 @@ let
           cp build/charts/tides.sqlite "$assets/tides.sqlite"
           bundled="$bundled tides.sqlite"
         fi
+        if [ -f build/charts/weather.bin ]; then
+          cp build/charts/weather.bin "$assets/weather.bin"
+          bundled="$bundled weather.bin"
+        fi
         if [ -f build/charts/imagery.mbtiles ] && [ -z "''${RUTTER_APK_SKIP_IMAGERY:-}" ]; then
           cp build/charts/imagery.mbtiles "$assets/imagery.mbtiles"
           bundled="$bundled imagery.mbtiles"
@@ -1226,6 +1230,91 @@ print('%.4f,%.4f,%.4f,%.4f' % (lat - dlat, lon - dlon, lat + dlat, lon + dlon))
         fi
         ;;
 
+      weather)
+        shift
+        # ── Wind and temperature ──────────────────────────────────────────
+        #
+        # GFS from NOAA's NOMADS, subset by variable and bounding box, so a
+        # coastline's forecast is a kilobyte an hour instead of the half a
+        # gigabyte a global field would be. Public domain, no key.
+        #
+        # Unlike tides, this expires: a forecast is worth having for a day
+        # or two and then it is fiction. `rutter run` says how old the file
+        # is rather than drawing it as though it were fresh.
+        out=build/charts/weather.bin
+        box=""
+        hours=''${RUTTER_WEATHER_HOURS:-0,3,6,9,12,15,18,21,24}
+        # Degrees of padding added when the box comes from a chart.
+        #
+        # Generous because the data is almost free: GFS at 0.25 degrees is
+        # three floats a node, so a two-degree margin around a harbour chart
+        # costs a few tens of kilobytes. Without it the forecast ends at the
+        # chart's own edge, and zooming out shows barbs over a small
+        # rectangle with nothing beyond — which reads as a broken layer
+        # rather than as the edge of the data.
+        margin=''${RUTTER_WEATHER_MARGIN:-2}
+
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --box)    box=$2; shift 2 ;;
+            --chart)  chart=$2; shift 2 ;;
+            --hours)  hours=$2; shift 2 ;;
+            --margin) margin=$2; shift 2 ;;
+            --out)    out=$2; shift 2 ;;
+            *) echo "rutter weather: unknown option '$1'" >&2; exit 64 ;;
+          esac
+        done
+
+        # Same convenience as `rutter imagery`: the chart's own extent is
+        # almost always the area wanted.
+        if [ -z "$box" ] && [ -n "''${chart:-}" ]; then
+          if [ ! -f "$chart" ]; then
+            echo "no such chart: $chart" >&2
+            exit 1
+          fi
+          bounds=$(sqlite3 -noheader "$chart"             "select value from metadata where name = 'bounds';")
+          if [ -z "$bounds" ]; then
+            echo "$chart declares no bounds; pass --box instead" >&2
+            exit 1
+          fi
+          IFS=, read -r bw bs be bn <<<"$bounds"
+          box=$(python3 -c "
+import sys
+s, w, n, e, m = (float(v) for v in sys.argv[1:])
+print('%.4f,%.4f,%.4f,%.4f' % (
+    max(s - m, -89.0), max(w - m, -179.0),
+    min(n + m, 89.0), min(e + m, 179.0)))
+" "$bs" "$bw" "$bn" "$be" "$margin")
+          echo "using $chart's bounds plus ''${margin} deg: $box"
+        fi
+
+        if [ -z "$box" ]; then
+          echo "usage: rutter weather --box <s>,<w>,<n>,<e> [--hours 0,3,6] [--out FILE]" >&2
+          echo "       rutter weather --chart <file.mbtiles> [--margin DEG]" >&2
+          echo >&2
+          echo "  rutter weather --chart build/charts/noaa.mbtiles" >&2
+          echo "  rutter weather --box 32.5,-118.7,33.6,-117.0 --hours 0,6,12" >&2
+          echo >&2
+          echo "GFS at 0.25 degrees — about 28 km, so this is the synoptic" >&2
+          echo "wind and not the sea breeze in your harbour." >&2
+          echo >&2
+          echo "--chart pads the chart's bounds by --margin (default 2 deg)," >&2
+          echo "because a forecast that stops at the chart's edge looks like" >&2
+          echo "a broken layer when you zoom out. The data is cheap: three" >&2
+          echo "floats per node per hour." >&2
+          exit 64
+        fi
+
+        mkdir -p "$(dirname "$out")"
+        python3 ${./scripts/weather-grid.py} --box "$box" --hours "$hours" --out "$out"
+        echo
+        if [ "$out" = build/charts/weather.bin ]; then
+          echo 'rutter run picks this up on its own.'
+        else
+          echo "Load it with: rutter run --weather $out"
+        fi
+        ;;
+
       imagery)
         shift
         # ── Aerial imagery ────────────────────────────────────────────────
@@ -1481,6 +1570,7 @@ print('%.4f,%.4f,%.4f,%.4f' % (lat - dlat, lon - dlon, lat + dlat, lon + dlon))
           '  noaa         fetch NOAA ENC charts (US waters) and tile them' \
           '  imagery      fetch USGS aerial imagery for a chart or a box' \
           '  tides        fetch NOAA tide-station constituents near a position' \
+          '  weather      fetch a GFS wind and temperature forecast' \
           '  fmt          cargo fmt' \
           '  lint         cargo clippy' \
           '  adb          pass through to the SDK'"'"'s adb' \
