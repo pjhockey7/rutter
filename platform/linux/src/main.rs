@@ -204,6 +204,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  b               centre on the boat");
                 println!("  [ and ]         step the shown time by 30 minutes");
                 println!("  n               back to now");
+                println!("  i               show or hide the aerial imagery");
                 println!("  Escape          quit");
                 std::process::exit(0);
             }
@@ -641,6 +642,14 @@ impl ApplicationHandler for Platform {
                     Key::Character("[") => changed = self.app.nudge_time(-30 * 60),
                     Key::Character("]") => changed = self.app.nudge_time(30 * 60),
                     Key::Character("n" | "N") => changed = self.app.set_time_offset(0),
+                    // The imagery, which is the layer most often wanted
+                    // off and on: a photograph is wonderful for finding a
+                    // slipway and in the way when reading soundings.
+                    Key::Character("i" | "I") => {
+                        let on = self.app.toggle_imagery();
+                        log::info!("imagery {}", if on { "on" } else { "off" });
+                        changed = true;
+                    }
                     _ => changed = false,
                 }
                 if changed {

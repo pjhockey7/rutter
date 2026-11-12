@@ -1256,9 +1256,15 @@ impl App {
                 }
                 Action::SetImagery(on) => {
                     self.imagery_visible = *on;
-                    // The tile set is unchanged — only whether it is drawn
-                    // — so refresh_imagery needs nudging.
-                    self.imagery_loaded.clear();
+                    // `imagery_loaded` is deliberately *not* touched here.
+                    // It means "what is on the GPU", and clearing it to
+                    // nudge the refresh was a lie about that — which
+                    // `refresh_imagery` then believed: asked to hide the
+                    // imagery it found an empty list, concluded there was
+                    // nothing to clear, and left every tile drawing while
+                    // the checkbox said off. Hiding a layer and forgetting
+                    // what is on the GPU are two different statements and
+                    // only one of them was true.
                     touched = true;
                 }
                 Action::SetWind(on) => {
@@ -1521,6 +1527,16 @@ impl App {
             max = max.max(last - now);
         }
         (min, max)
+    }
+
+    /// Show or hide the aerial imagery, for a platform's own key binding.
+    ///
+    /// The same state the panel's checkbox sets, and deliberately *not*
+    /// touching `imagery_loaded` — see the note in `apply`. Returns the
+    /// new state.
+    pub fn toggle_imagery(&mut self) -> bool {
+        self.imagery_visible = !self.imagery_visible;
+        self.imagery_visible
     }
 
     /// Centre on the boat, for a platform's own key binding.
@@ -1852,33 +1868,74 @@ impl App {
     /// Separate from `refresh_charts` because the two have different costs:
     /// a vector tile is a protobuf parse, an imagery tile is a JPEG decode
     /// and a quarter-megabyte upload.
-    fn refresh_imagery(&mut self, renderer: &mut Renderer) {
-        if !self.imagery_visible {
-            if !self.imagery_loaded.is_empty() {
-                renderer.clear_imagery();
-                self.imagery_loaded.clear();
-            }
-            return;
-        }
-
-        let Some(source) = self.imagery.as_mut() else {
-            return;
+    /// Which imagery tiles should be on the GPU right now.
+    ///
+    /// Empty when the layer is hidden or no file is open, which is what
+    /// makes "hide it" and "the view moved" the same decision rather than
+    /// two code paths that can disagree.
+    fn wanted_imagery_tiles(&self) -> Vec<TileId> {
+        let (true, Some(source)) = (self.imagery_visible, self.imagery.as_ref()) else {
+            return Vec::new();
         };
-
         let zoom = source.clamp_zoom(self.view.tile_zoom());
         let (nw, se) = self.view.bounds();
-        let wanted = chart::tiles_in_view(nw, se, zoom);
-        if wanted == self.imagery_loaded {
-            return;
-        }
+        chart::tiles_in_view(nw, se, zoom)
+    }
 
-        let tiles = source.collect(&self.view);
-        renderer.set_imagery(&tiles);
-        log::debug!(
-            "imagery: {} tiles on the GPU",
-            renderer.imagery_tile_count()
-        );
-        self.imagery_loaded = wanted;
+    fn refresh_imagery(&mut self, renderer: &mut Renderer) {
+        let wanted = self.wanted_imagery_tiles();
+
+        // One comparison for both directions. The old version had a
+        // separate early return for the hidden case, which is where the
+        // bug lived: whether to clear was decided from a list the action
+        // handler had already emptied.
+        match imagery_plan(&self.imagery_loaded, &wanted) {
+            ImageryPlan::Leave => {}
+            ImageryPlan::Clear => {
+                renderer.clear_imagery();
+                self.imagery_loaded.clear();
+                log::debug!("imagery: cleared");
+            }
+            ImageryPlan::Upload => {
+                let Some(source) = self.imagery.as_mut() else {
+                    return;
+                };
+                let tiles = source.collect(&self.view);
+                renderer.set_imagery(&tiles);
+                log::debug!(
+                    "imagery: {} tiles on the GPU",
+                    renderer.imagery_tile_count()
+                );
+                self.imagery_loaded = wanted;
+            }
+        }
+    }
+}
+
+/// What the imagery layer should do about the tiles it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageryPlan {
+    /// What is resident is what is wanted.
+    Leave,
+    /// Nothing should be resident, and something is.
+    Clear,
+    /// Load the wanted set.
+    Upload,
+}
+
+/// Decide between them.
+///
+/// Pulled out as a pure function because the bug it replaces was a
+/// three-state decision written as an early return plus an inequality, and
+/// because this is the one part of the imagery layer that can be tested
+/// without a GPU.
+fn imagery_plan(loaded: &[chart::TileId], wanted: &[chart::TileId]) -> ImageryPlan {
+    if loaded == wanted {
+        ImageryPlan::Leave
+    } else if wanted.is_empty() {
+        ImageryPlan::Clear
+    } else {
+        ImageryPlan::Upload
     }
 }
 
@@ -2438,5 +2495,120 @@ mod tests {
         let before = app.view.centre;
         assert!(!app.go_to_boat_now(), "claimed to have a boat to go to");
         assert!(same_place(&app.view.centre, &before));
+    }
+
+    // ── The imagery layer's residency ───────────────────────────────────
+
+    #[test]
+    fn the_imagery_plan_covers_every_combination() {
+        // Two real tiles over San Diego, a degree apart in longitude so
+        // they are certainly different.
+        let a = chart::TileId::containing(Position::new(32.68, -117.23), 12);
+        let b = chart::TileId::containing(Position::new(32.68, -116.23), 12);
+        assert_ne!(a, b);
+
+        // Nothing resident, nothing wanted: the state at startup with no
+        // imagery file, and every frame thereafter.
+        assert_eq!(imagery_plan(&[], &[]), ImageryPlan::Leave);
+        // Already correct.
+        assert_eq!(imagery_plan(&[a], &[a]), ImageryPlan::Leave);
+        // Something resident and nothing wanted: the hidden case, and the
+        // one the old code got wrong.
+        assert_eq!(imagery_plan(&[a], &[]), ImageryPlan::Clear);
+        // Wanted and not resident, or resident but wrong.
+        assert_eq!(imagery_plan(&[], &[a]), ImageryPlan::Upload);
+        assert_eq!(imagery_plan(&[a], &[b]), ImageryPlan::Upload);
+    }
+
+    #[test]
+    fn hiding_the_imagery_asks_for_it_to_be_cleared() {
+        // The regression. The checkbox set `imagery_visible = false` and
+        // also cleared `imagery_loaded` to nudge the refresh — after which
+        // the refresh saw an empty resident list, concluded there was
+        // nothing to clear, and left every tile on the GPU. The checkbox
+        // appeared to do nothing except hide its own opacity slider.
+        //
+        // The whole path cannot be tested without a GPU, so this tests the
+        // decision the path makes, from a real app over real imagery.
+        let path = "../build/charts/imagery.mbtiles";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("no {path}; skipping");
+            return;
+        }
+        let source = rutter_charts::ImagerySource::open(path).expect("open the imagery");
+
+        let mut app = App::new(
+            Sources {
+                charts: None,
+                imagery: Some(source),
+                tides: None,
+                weather: None,
+                nmea: None,
+                gps: None,
+            },
+            None,
+        );
+        app.view.centre = Position::new(32.68, -117.23);
+        app.view.zoom = 12.0;
+        assert!(app.imagery_visible, "imagery should start visible");
+
+        // Settled: what the view wants is what is resident.
+        let wanted = app.wanted_imagery_tiles();
+        assert!(!wanted.is_empty(), "the view is not over the imagery");
+        app.imagery_loaded = wanted.clone();
+        assert_eq!(
+            imagery_plan(&app.imagery_loaded, &app.wanted_imagery_tiles()),
+            ImageryPlan::Leave
+        );
+
+        // Unticked. Nothing is wanted, something is resident, so it has to
+        // be cleared — and `imagery_loaded` must still say what is on the
+        // GPU for that conclusion to be reachable.
+        app.imagery_visible = false;
+        assert!(
+            !app.imagery_loaded.is_empty(),
+            "the resident list was emptied, which is the bug: nothing would be cleared"
+        );
+        assert_eq!(
+            imagery_plan(&app.imagery_loaded, &app.wanted_imagery_tiles()),
+            ImageryPlan::Clear
+        );
+
+        // And reticked, from the cleared state, it loads again.
+        app.imagery_loaded.clear();
+        app.imagery_visible = true;
+        assert_eq!(
+            imagery_plan(&app.imagery_loaded, &app.wanted_imagery_tiles()),
+            ImageryPlan::Upload
+        );
+    }
+
+    #[test]
+    fn a_hidden_layer_wants_no_tiles_even_over_the_imagery() {
+        let path = "../build/charts/imagery.mbtiles";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("no {path}; skipping");
+            return;
+        }
+        let source = rutter_charts::ImagerySource::open(path).expect("open the imagery");
+        let mut app = App::new(
+            Sources {
+                charts: None,
+                imagery: Some(source),
+                tides: None,
+                weather: None,
+                nmea: None,
+                gps: None,
+            },
+            None,
+        );
+        app.view.centre = Position::new(32.68, -117.23);
+        app.view.zoom = 12.0;
+
+        app.imagery_visible = false;
+        assert!(
+            app.wanted_imagery_tiles().is_empty(),
+            "a hidden layer asked for tiles"
+        );
     }
 }
