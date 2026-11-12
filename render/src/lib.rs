@@ -32,8 +32,8 @@ pub mod ui;
 
 pub use ui::{
     Action, CurrentState, DownloadProgress, DownloadState, DraftState, ImageryState, LayerEntry,
-    PanelState, Tab, TemperatureState, TideMarker, TideReading, TideState, TimeState, Ui,
-    VesselState, WindState,
+    PanelState, RouteState, Tab, TemperatureState, TideMarker, TideReading, TideState, TimeState,
+    Ui, VesselState, WaypointRow, WindState,
 };
 
 use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};
@@ -441,6 +441,25 @@ pub enum Overlay {
         course_deg: Option<f32>,
         colour: [f32; 4],
     },
+    /// One leg of a route: a line between two places on the chart.
+    ///
+    /// The only mark here drawn in *world* space at both ends rather than
+    /// anchored at one and sized in pixels. A leg has a real extent — it
+    /// is sixty miles of water — so it has to grow and shrink with the
+    /// zoom like a coastline, not stay a fixed length on screen like a
+    /// symbol.
+    Leg {
+        from: chart::WorldXY,
+        to: chart::WorldXY,
+        colour: [f32; 4],
+    },
+    /// A waypoint: a place you are steering for.
+    Waypoint {
+        at: chart::WorldXY,
+        /// The one being steered for now, drawn with a ring around it.
+        active: bool,
+        colour: [f32; 4],
+    },
     /// A tidal current: an arrow the way the water is going.
     ///
     /// Length carries the speed, which is the opposite choice from a wind
@@ -475,7 +494,11 @@ impl Overlay {
             Self::Ring { at, .. }
             | Self::Barb { at, .. }
             | Self::Boat { at, .. }
+            | Self::Waypoint { at, .. }
             | Self::Current { at, .. } => *at,
+            // A leg's reference point is its start; the far end carries
+            // its own world anchor. See the `Leg` arm in `set_overlay`.
+            Self::Leg { from, .. } => *from,
         }
     }
 }
@@ -2119,6 +2142,50 @@ impl Renderer {
                         // A second ring inside, rather than a different
                         // colour: colour already means something here.
                         ring(&mut segment, radius_px * 0.45);
+                    }
+                }
+
+                // World space at both ends, so the leg stretches with
+                // the chart. Pushed directly rather than through
+                // `segment`, which anchors every vertex of a mark at one
+                // point — right for a symbol, wrong for a line sixty
+                // miles long.
+                Overlay::Leg { from, to, colour } => {
+                    for end in [from, to] {
+                        vertices.push(OverlayVertex {
+                            anchor: [(end.x - origin.x) as f32, (end.y - origin.y) as f32],
+                            pixel: [0.0, 0.0],
+                            colour,
+                        });
+                    }
+                }
+
+                Overlay::Waypoint { active, colour, .. } => {
+                    /// Half-width of the diamond, pixels.
+                    const ARM: f32 = 7.0;
+
+                    // A diamond rather than a circle: a tide station is
+                    // already a ring and a waypoint has to be
+                    // distinguishable from one at a glance, in the same
+                    // colour family as the leg it belongs to.
+                    let points = [[0.0, -ARM], [ARM, 0.0], [0.0, ARM], [-ARM, 0.0]];
+                    for pair in 0..4 {
+                        segment(points[pair], points[(pair + 1) % 4], colour);
+                    }
+
+                    if active {
+                        // The one being steered for. A ring outside the
+                        // diamond, so which mark the bearing and the
+                        // distance refer to is never in doubt.
+                        for i in 0..RING_SEGMENTS {
+                            let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            let b = (i + 1) as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            segment(
+                                [11.0 * a.cos(), 11.0 * a.sin()],
+                                [11.0 * b.cos(), 11.0 * b.sin()],
+                                colour,
+                            );
+                        }
                     }
                 }
 

@@ -70,6 +70,18 @@ pub enum Action {
     UseDeviceGps,
     /// Show or hide the tidal currents.
     SetCurrents(bool),
+    /// Show or hide the route.
+    SetRoute(bool),
+    /// Put a waypoint at the middle of the view.
+    AddWaypointAtCentre,
+    /// Remove the waypoint at this index.
+    RemoveWaypoint(usize),
+    /// Throw the whole route away.
+    ClearRoute,
+    /// Steer for this waypoint rather than the one the plotter chose.
+    SelectLeg(usize),
+    /// Follow whichever leg the boat is nearest, again.
+    FollowNearestLeg,
     /// Show or hide the temperature wash.
     SetTemperature(bool),
     /// Mark the current viewport as the area to download.
@@ -94,6 +106,41 @@ pub enum Action {
     SetFollow(bool),
     /// Centre on the boat once, without following it.
     GoToBoat,
+}
+
+/// One waypoint, as the panel shows it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WaypointRow {
+    pub name: String,
+    /// Where it is, in degrees and decimal minutes.
+    pub at: String,
+    /// The leg *to* this waypoint: course to steer and distance. Empty for
+    /// the first, which has no leg before it.
+    pub leg: String,
+    /// Whether this is the one being steered for.
+    pub active: bool,
+}
+
+/// What the panel knows about the passage.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RouteState {
+    pub visible: bool,
+    pub waypoints: Vec<WaypointRow>,
+    /// Total length, as "63.4 nm".
+    pub length: Option<String>,
+    /// Where the boat is on it. All `None` with no fix: a route is a plan
+    /// whether or not anyone is following it, and it is worth drawing and
+    /// editing with the GPS off.
+    pub to_waypoint: Option<String>,
+    pub cross_track: Option<String>,
+    /// Which way to steer back, so the number is actionable. "steer left".
+    pub correction: Option<String>,
+    pub made_good: Option<String>,
+    pub eta: Option<String>,
+    /// Whether the plotter chose the leg itself, or was told.
+    pub leg_chosen_by_hand: bool,
+    /// Whether the boat is at the active waypoint.
+    pub arrived: bool,
 }
 
 /// What the panel knows about the tidal currents.
@@ -421,6 +468,7 @@ pub struct PanelState {
     pub imagery: ImageryState,
     pub tides: TideState,
     pub currents: CurrentState,
+    pub route: RouteState,
     pub temperature: TemperatureState,
     pub download: DownloadState,
     pub time: TimeState,
@@ -442,6 +490,8 @@ pub enum Tab {
     /// Where the boat is and whether it fits.
     #[default]
     Boat,
+    /// The passage: waypoints, legs, and how far off the line you are.
+    Route,
     /// What the chart is drawn from: the imagery under it and its layers.
     Chart,
     /// Tides and tidal currents.
@@ -453,7 +503,13 @@ pub enum Tab {
 impl Tab {
     /// In the order they appear, which is roughly how often they are
     /// wanted: the boat first, the tools last.
-    const ALL: [Self; 4] = [Self::Boat, Self::Chart, Self::Water, Self::Weather];
+    const ALL: [Self; 5] = [
+        Self::Boat,
+        Self::Route,
+        Self::Chart,
+        Self::Water,
+        Self::Weather,
+    ];
 
     /// Plain words, not icon glyphs. egui's default font covers Latin text
     /// and little else, so an anchor or a cloud renders as an empty box —
@@ -461,6 +517,7 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Self::Boat => "Boat",
+            Self::Route => "Route",
             Self::Chart => "Chart",
             Self::Water => "Water",
             Self::Weather => "Weather",
@@ -470,6 +527,7 @@ impl Tab {
     fn hint(self) -> &'static str {
         match self {
             Self::Boat => "Position, the GPS feed, your draft and the under-keel check",
+            Self::Route => "Waypoints, legs, and how far off the line you are",
             Self::Chart => "Aerial imagery and the chart's own layers",
             Self::Water => "Tide heights and tidal currents",
             Self::Weather => "Wind and air temperature",
@@ -572,6 +630,7 @@ impl Ui {
             imagery,
             tides,
             currents,
+            route,
             temperature,
             download,
             time,
@@ -683,6 +742,9 @@ impl Ui {
                         ui.separator();
                         actions.extend(Self::draft_section(ui, draft));
                     }
+                    Tab::Route => {
+                        actions.extend(Self::route_section(ui, route));
+                    }
                     Tab::Chart => {
                         actions.extend(Self::imagery_section(ui, imagery));
                         ui.separator();
@@ -700,6 +762,133 @@ impl Ui {
                     }
                 }
             });
+
+        actions
+    }
+
+    /// The passage: what it is, and how well it is being followed.
+    fn route_section(ui: &mut egui::Ui, route: &RouteState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = route.visible;
+            if ui.checkbox(&mut on, "Show route").clicked() {
+                actions.push(Action::SetRoute(on));
+            }
+            if let Some(length) = &route.length {
+                ui.label(egui::RichText::new(length).weak().small());
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui
+                .button("Add waypoint")
+                .on_hover_text(
+                    "Puts one at the middle of the view. The `w` key does \
+                     the same at the cursor.",
+                )
+                .clicked()
+            {
+                actions.push(Action::AddWaypointAtCentre);
+            }
+            if !route.waypoints.is_empty() && ui.button("Clear").clicked() {
+                actions.push(Action::ClearRoute);
+            }
+        });
+
+        if route.waypoints.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "No route yet. Add waypoints and the legs between them \
+                     give you a course to steer, how far off the line you \
+                     are, and when you will get there.",
+                )
+                .weak()
+                .small(),
+            );
+            return actions;
+        }
+
+        // ── Following it ───────────────────────────────────────────────
+        //
+        // Above the list, because when under way this is what you look at
+        // and the list is reference.
+        if route.to_waypoint.is_some() {
+            ui.separator();
+
+            if route.arrived {
+                ui.label(
+                    egui::RichText::new("At the waypoint")
+                        .strong()
+                        .color(egui::Color32::from_rgb(0x59, 0xeb, 0xc7)),
+                );
+            }
+            if let Some(line) = &route.to_waypoint {
+                ui.label(egui::RichText::new(line).strong());
+            }
+            if let Some(line) = &route.cross_track {
+                // The number and the correction together: "0.4 nm off"
+                // without "steer left" is half an instruction, and the
+                // wrong half to guess at.
+                ui.horizontal(|ui| {
+                    ui.label(line);
+                    if let Some(correction) = &route.correction {
+                        ui.label(
+                            egui::RichText::new(correction)
+                                .strong()
+                                .color(egui::Color32::from_rgb(0xff, 0xb8, 0x26)),
+                        );
+                    }
+                });
+            }
+            for line in [&route.made_good, &route.eta].into_iter().flatten() {
+                ui.label(egui::RichText::new(line).weak().small());
+            }
+
+            if route.leg_chosen_by_hand && ui.button("Follow the nearest leg").clicked() {
+                actions.push(Action::FollowNearestLeg);
+            }
+        }
+
+        // ── The list ───────────────────────────────────────────────────
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let mut remove = None;
+            for (index, waypoint) in route.waypoints.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    // Clicking the name steers for it, which is the
+                    // ordinary way to skip a leg you have decided against.
+                    let label = if waypoint.active {
+                        egui::RichText::new(&waypoint.name).strong()
+                    } else {
+                        egui::RichText::new(&waypoint.name)
+                    };
+                    if ui
+                        .selectable_label(waypoint.active, label)
+                        .on_hover_text("Steer for this one")
+                        .clicked()
+                    {
+                        actions.push(Action::SelectLeg(index));
+                    }
+                    if ui
+                        .small_button("x")
+                        .on_hover_text("Remove this waypoint")
+                        .clicked()
+                    {
+                        remove = Some(index);
+                    }
+                });
+                ui.label(egui::RichText::new(&waypoint.at).monospace().small());
+                if !waypoint.leg.is_empty() {
+                    ui.label(egui::RichText::new(&waypoint.leg).weak().small());
+                }
+                ui.add_space(2.0);
+            }
+            if let Some(index) = remove {
+                actions.push(Action::RemoveWaypoint(index));
+            }
+        });
 
         actions
     }
@@ -2153,6 +2342,7 @@ mod font_tests {
                     layers: entries.clone(),
                     vessel: populated_vessel(),
                     currents: populated_currents(),
+                    route: populated_route(),
                     temperature: populated_temperature(),
                     download: populated_download(),
                     time: populated_time(),
@@ -2330,6 +2520,42 @@ mod font_tests {
         }
     }
 
+    /// A passage under way, for the drawing tests: off the line, with a
+    /// correction to steer and an arrival time.
+    fn populated_route() -> RouteState {
+        RouteState {
+            visible: true,
+            waypoints: vec![
+                WaypointRow {
+                    name: "001".to_owned(),
+                    at: "32°42.60'N  117°13.80'W".to_owned(),
+                    leg: String::new(),
+                    active: false,
+                },
+                WaypointRow {
+                    name: "002".to_owned(),
+                    at: "32°40.20'N  117°14.10'W".to_owned(),
+                    leg: "187° · 2.4 nm".to_owned(),
+                    active: true,
+                },
+                WaypointRow {
+                    name: "003".to_owned(),
+                    at: "33°20.70'N  118°19.50'W".to_owned(),
+                    leg: "311° · 61.8 nm".to_owned(),
+                    active: false,
+                },
+            ],
+            length: Some("64.2 nm total".to_owned()),
+            to_waypoint: Some("002: 187° · 1.42 nm".to_owned()),
+            cross_track: Some("0.18 nm off track".to_owned()),
+            correction: Some("steer left".to_owned()),
+            made_good: Some("5.4 kn made good towards it".to_owned()),
+            eta: Some("63.2 nm to run, arriving 04:20Z (in 11h 42m)".to_owned()),
+            leg_chosen_by_hand: true,
+            arrived: false,
+        }
+    }
+
     fn populated_wind() -> WindState {
         WindState {
             available: true,
@@ -2384,6 +2610,7 @@ mod font_tests {
                     layers: entries.clone(),
                     vessel: populated_vessel(),
                     currents: populated_currents(),
+                    route: populated_route(),
                     temperature: populated_temperature(),
                     download: populated_download(),
                     time: populated_time(),

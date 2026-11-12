@@ -35,12 +35,13 @@ use rutter_charts::{ChartSource, Collected, ImagerySource};
 use rutter_core::chart::TileId;
 use rutter_core::depth::{Draft, TideWindow};
 use rutter_core::nmea::Vessel;
+use rutter_core::route::{Leg, Route, Waypoint};
 use rutter_core::tide::{CurrentKind, CurrentStation, Kind, Station};
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{
     Action, CurrentState, DownloadProgress, DownloadState, DraftState, FieldPatch, ImageryState,
-    LayerEntry, Overlay, PanelState, Renderer, TemperatureState, TideMarker, TideReading,
-    TideState, TimeState, Ui, VesselState, WindState,
+    LayerEntry, Overlay, PanelState, Renderer, RouteState, TemperatureState, TideMarker,
+    TideReading, TideState, TimeState, Ui, VesselState, WaypointRow, WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -163,6 +164,16 @@ const TIDE_COLOUR: [f32; 4] = [0.42, 0.78, 1.0, 1.0];
 /// and from the boat's orange. A current is a different kind of statement
 /// from a height and should not be mistaken for one.
 const CURRENT_COLOUR: [f32; 4] = [0.35, 0.92, 0.78, 0.95];
+/// The route: its legs and its waypoints.
+///
+/// Magenta, which is the colour a paper chart reserves for things that are
+/// *advisory* rather than surveyed — recommended tracks, radio marks — and
+/// which nothing else here uses. A route is a human intention drawn over
+/// the chart, and it should not be mistakable for something the
+/// hydrographer put there.
+const ROUTE_COLOUR: [f32; 4] = [0.95, 0.35, 0.85, 0.9];
+/// The leg being steered, and its waypoint.
+const ROUTE_ACTIVE_COLOUR: [f32; 4] = [1.0, 0.55, 0.95, 1.0];
 const WIND_COLOUR: [f32; 4] = [0.78, 0.90, 0.94, 0.85];
 /// Grey, for a forecast old enough to distrust.
 const WIND_STALE_COLOUR: [f32; 4] = [0.54, 0.54, 0.54, 0.75];
@@ -397,6 +408,18 @@ pub struct App {
 
     /// The area marked for download, and what to fetch for it.
     download: Download,
+
+    /// The passage being planned or followed.
+    route: Route,
+    route_visible: bool,
+    /// The waypoint being steered for, if one was chosen by hand.
+    ///
+    /// `None` means the plotter follows whichever leg the boat is beside.
+    /// Choosing by hand is how you skip a leg you have decided against,
+    /// and it has to stick: a plotter that reselects every second hops
+    /// between legs where a passage doubles back, and the course to steer
+    /// then alternates between two answers a hundred degrees apart.
+    chosen_leg: Option<usize>,
     /// Every station, loaded once.
     ///
     /// Held in memory rather than queried per frame. `nearest` and `in_box`
@@ -515,6 +538,7 @@ impl App {
             vessel_visible: true,
             // On when a forecast is present, same as the other layers.
             wind_visible: true,
+            route_visible: true,
             // On when a forecast is present, like every other layer here:
             // the reason to fetch one is to see it. Kept light — 30% — so
             // that a wash over the whole chart is context rather than the
@@ -642,9 +666,13 @@ impl App {
     /// Take whatever the NMEA reader has produced, and follow the boat if
     /// that is what was asked for.
     ///
+    /// Public for the same reason the other pollers are: `refresh` calls
+    /// it every frame, and anything that wants the boat without a
+    /// renderer needs a way in.
+    ///
     /// Centring is done here rather than in the reader because panning is a
     /// view decision: the thread's job ends at "this is where the boat is".
-    fn poll_nmea(&mut self) {
+    pub fn poll_nmea(&mut self) {
         let Some(nmea) = &mut self.nmea else {
             return;
         };
@@ -721,6 +749,11 @@ impl App {
                 });
             }
         }
+
+        // The route over the data layers: it is the thing being followed,
+        // so nothing that merely describes the water should sit on top of
+        // it.
+        marks.extend(self.route_marks());
 
         // Currents over the barbs and under the boat: an arrow at a
         // station is a statement about that place, so it should not be
@@ -973,6 +1006,202 @@ impl App {
             }),
             cells: self.temperature_patches.len(),
         }
+    }
+
+    /// Put a waypoint at a position, at the end of the route.
+    ///
+    /// Named by number as plotters traditionally do, because a name typed
+    /// on a phone at sea is a name nobody types.
+    pub fn add_waypoint(&mut self, at: LatLon) {
+        let number = self.route.waypoints.len() + 1;
+        self.route
+            .waypoints
+            .push(Waypoint::new(at, format!("{number:03}")));
+        // Any hand-chosen leg is about an index that may now mean a
+        // different waypoint.
+        self.chosen_leg = None;
+        self.route_visible = true;
+    }
+
+    /// Remove one. Out of range is ignored rather than a panic: the panel
+    /// builds its list a frame before the click arrives.
+    pub fn remove_waypoint(&mut self, index: usize) {
+        if index < self.route.waypoints.len() {
+            self.route.waypoints.remove(index);
+            self.chosen_leg = None;
+        }
+    }
+
+    pub fn clear_route(&mut self) {
+        self.route.waypoints.clear();
+        self.chosen_leg = None;
+    }
+
+    /// Steer for this waypoint rather than the one the plotter chose.
+    ///
+    /// Choosing the one already chosen hands it back, so there is a way
+    /// out without a second control.
+    pub fn apply_route_selection(&mut self, index: usize) {
+        self.chosen_leg = if self.chosen_leg == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
+    }
+
+    /// Go back to following whichever leg the boat is beside.
+    pub fn follow_nearest_leg(&mut self) {
+        self.chosen_leg = None;
+    }
+
+    /// Close the GPS feed, as the panel's control does.
+    pub fn apply_disconnect_nmea(&mut self) {
+        self.nmea = None;
+        self.nmea_trouble = None;
+        self.follow = false;
+    }
+
+    /// The leg being steered: the one chosen by hand, or the nearest.
+    fn active_leg(&self) -> Option<Leg> {
+        let legs = self.route.legs();
+        if let Some(index) = self.chosen_leg {
+            // A chosen *waypoint* index names the leg that ends at it.
+            if let Some(leg) = legs.iter().find(|l| l.to_index == index) {
+                return Some(*leg);
+            }
+        }
+        let from = self.fresh_fix()?;
+        self.route.nearest_leg(from)
+    }
+
+    /// What the panel shows about the passage.
+    pub fn route_state(&self) -> RouteState {
+        let legs = self.route.legs();
+        let active = self.active_leg();
+        let active_index = active.map(|l| l.to_index);
+
+        let waypoints = self
+            .route
+            .waypoints
+            .iter()
+            .enumerate()
+            .map(|(index, waypoint)| WaypointRow {
+                name: waypoint.name.clone(),
+                at: format_position(waypoint.at),
+                // The leg *into* this waypoint, which is the course that
+                // gets you to it. The first waypoint has none.
+                leg: legs
+                    .iter()
+                    .find(|l| l.to_index == index)
+                    .map(|l| format!("{:03.0}° · {:.1} nm", l.bearing_deg(), l.length_nm()))
+                    .unwrap_or_default(),
+                active: active_index == Some(index),
+            })
+            .collect();
+
+        let mut state = RouteState {
+            visible: self.route_visible,
+            waypoints,
+            length: (!legs.is_empty()).then(|| format!("{:.1} nm total", self.route.length_nm())),
+            leg_chosen_by_hand: self.chosen_leg.is_some(),
+            ..RouteState::default()
+        };
+
+        // Following it needs a fix. Without one the route is still a plan
+        // worth drawing and editing, which is why everything above this
+        // works with the GPS off.
+        let Some(vessel) = self.nmea.as_ref().map(|n| n.vessel()) else {
+            return state;
+        };
+        let Some(at) = self.fresh_fix() else {
+            return state;
+        };
+        let Some(progress) = self.route.progress(
+            at,
+            active,
+            vessel.sog_kn.map(|s| s.value),
+            vessel.cog_deg.map(|c| c.value),
+        ) else {
+            return state;
+        };
+
+        let name = self
+            .route
+            .waypoints
+            .get(progress.leg.to_index)
+            .map_or("the waypoint", |w| w.name.as_str());
+
+        state.to_waypoint = Some(format!(
+            "{name}: {:03.0}° · {:.2} nm",
+            progress.bearing_deg,
+            rutter_core::geo::metres_to_nm(progress.to_waypoint_m)
+        ));
+
+        let off_nm = rutter_core::geo::metres_to_nm(progress.cross_track_m.abs());
+        state.cross_track = Some(if off_nm < 0.01 {
+            "on the line".to_owned()
+        } else {
+            format!("{off_nm:.2} nm off track")
+        });
+        // Which way to steer back. The sign of the cross-track is right of
+        // track positive, so correcting means going the other way — and
+        // getting that round the wrong way doubles the error.
+        state.correction = (off_nm >= 0.01).then(|| {
+            if progress.cross_track_m > 0.0 {
+                "steer left".to_owned()
+            } else {
+                "steer right".to_owned()
+            }
+        });
+
+        state.made_good = progress
+            .vmg_kn
+            .map(|vmg| format!("{vmg:.1} kn made good towards it"));
+        state.eta = progress.to_end_secs.map(|secs| {
+            format!(
+                "{:.1} nm to run, arriving {} ({})",
+                rutter_core::geo::metres_to_nm(progress.remaining_m),
+                format_utc_hhmm(unix_now() + secs),
+                format_away(secs)
+            )
+        });
+        state.arrived = progress.arrived;
+
+        state
+    }
+
+    /// The route's legs and waypoints, as marks on the chart.
+    fn route_marks(&self) -> Vec<Overlay> {
+        if !self.route_visible {
+            return Vec::new();
+        }
+        let active = self.active_leg().map(|l| l.to_index);
+        let mut marks = Vec::new();
+
+        for leg in self.route.legs() {
+            marks.push(Overlay::Leg {
+                from: chart::project(leg.from),
+                to: chart::project(leg.to),
+                colour: if active == Some(leg.to_index) {
+                    ROUTE_ACTIVE_COLOUR
+                } else {
+                    ROUTE_COLOUR
+                },
+            });
+        }
+        for (index, waypoint) in self.route.waypoints.iter().enumerate() {
+            let is_active = active == Some(index);
+            marks.push(Overlay::Waypoint {
+                at: chart::project(waypoint.at),
+                active: is_active,
+                colour: if is_active {
+                    ROUTE_ACTIVE_COLOUR
+                } else {
+                    ROUTE_COLOUR
+                },
+            });
+        }
+        marks
     }
 
     /// Current arrows, one per station in view.
@@ -1374,6 +1603,7 @@ impl App {
             },
             tides: self.tide_state(pixels_per_point),
             currents: self.current_state(),
+            route: self.route_state(),
             temperature: self.temperature_state(),
             download: self.download_state(),
             time: self.time_state(),
@@ -1677,9 +1907,7 @@ impl App {
                     touched |= self.use_device_gps();
                 }
                 Action::DisconnectNmea => {
-                    self.nmea = None;
-                    self.nmea_trouble = None;
-                    self.follow = false;
+                    self.apply_disconnect_nmea();
                     touched = true;
                 }
                 Action::SetVessel(on) => {
@@ -1709,6 +1937,32 @@ impl App {
                 }
                 Action::SetCurrents(on) => {
                     self.currents_visible = *on;
+                    touched = true;
+                }
+                Action::SetRoute(on) => {
+                    self.route_visible = *on;
+                    touched = true;
+                }
+                Action::AddWaypointAtCentre => {
+                    self.add_waypoint(self.view.centre);
+                    touched = true;
+                }
+                Action::RemoveWaypoint(index) => {
+                    self.remove_waypoint(*index);
+                    touched = true;
+                }
+                Action::ClearRoute => {
+                    self.clear_route();
+                    touched = true;
+                }
+                // One line each, calling what a platform or a test would,
+                // so the panel's path cannot drift from any other.
+                Action::SelectLeg(index) => {
+                    self.apply_route_selection(*index);
+                    touched = true;
+                }
+                Action::FollowNearestLeg => {
+                    self.follow_nearest_leg();
                     touched = true;
                 }
                 Action::SetTemperature(on) => {
@@ -1834,6 +2088,12 @@ impl App {
                 | Action::SetCurrents(_)
                 | Action::SetTemperature(_)
                 | Action::SetTemperatureOpacity(_)
+                | Action::SetRoute(_)
+                | Action::AddWaypointAtCentre
+                | Action::RemoveWaypoint(_)
+                | Action::ClearRoute
+                | Action::SelectLeg(_)
+                | Action::FollowNearestLeg
                 | Action::SetTimeOffset(_)
                 | Action::NowTime
                 | Action::SetTimeLinked(_)

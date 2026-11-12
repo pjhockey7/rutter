@@ -30,6 +30,7 @@ pub mod chart;
 pub mod depth;
 pub mod geo;
 pub mod nmea;
+pub mod route;
 pub mod tide;
 pub mod triangulate;
 pub mod weather;

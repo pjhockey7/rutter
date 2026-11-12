@@ -205,6 +205,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  [ and ]         step the shown time by 30 minutes");
                 println!("  n               back to now");
                 println!("  i               show or hide the aerial imagery");
+                println!("  w               add a waypoint under the cursor");
                 println!("  m               mark this view for download (Tools tab)");
                 println!("  Escape          quit");
                 std::process::exit(0);
@@ -666,6 +667,24 @@ impl ApplicationHandler for Platform {
                     // hundred-megabyte transfer is not a keystroke anyone
                     // wants to hit by accident. The Tools tab has the
                     // button, with the size written next to it.
+                    // A waypoint where the cursor is, which is the
+                    // gesture a chart invites. Tap-to-place on the chart
+                    // itself wants a mode, and a mode wants a button; the
+                    // key is here now because drawing a route is the
+                    // first thing anyone does with one.
+                    Key::Character("w" | "W") => {
+                        // Under the cursor if there is one, otherwise the
+                        // middle of the view — the key has to do something
+                        // when the pointer has never entered the window.
+                        let (x, y) = self.cursor.unwrap_or((
+                            f64::from(self.app.view.width_px) / 2.0,
+                            f64::from(self.app.view.height_px) / 2.0,
+                        ));
+                        let at = self.app.view.position_at(x, y);
+                        self.app.add_waypoint(at);
+                        log::info!("waypoint at {at:?}");
+                        changed = true;
+                    }
                     Key::Character("m" | "M") => {
                         self.app.mark_view_for_download();
                         log::info!("marked this view for download — see the Tools tab");

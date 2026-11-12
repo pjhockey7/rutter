@@ -16,17 +16,32 @@ time slider driving all of the above · NMEA 0183 over TCP, UDP and serial ·
 phone GPS through JNI · own-ship marker with course and heading · follow mode
 · Linux and Android builds · a portable glibc 2.17 binary.
 
-375 tests, clippy and fmt clean on host and `aarch64-linux-android`.
+401 tests, clippy and fmt clean on host and `aarch64-linux-android`.
 
 ## Tier 1 — not a plotter without these
 
 Six of these are small. One is not, and most of the rest of this page waits
 behind it.
 
-- [ ] **Routes and waypoints.** Go-to, bearing, distance, cross-track error,
-      ETA. Every other feature here serves a decision that currently cannot
-      be expressed. Tracks, alarms and ETA all hang off the same geometry
-      plumbing, so they get much cheaper once this exists.
+- [x] **Routes and waypoints.** Done. Waypoints placed by hand (`w` key or
+      the Route tab), straight legs between them, and the three numbers that
+      make a route worth having: course and distance to the next mark,
+      signed cross-track error *with which way to steer back*, and speed
+      made good with an arrival time. Legs are drawn in world space so they
+      stretch with the zoom; the active waypoint is ringed.
+
+      Choosing a waypoint by hand sticks, because a plotter that reselects
+      the nearest leg every second hops between legs where a passage
+      doubles back. Editing the route releases that choice, since an index
+      names a waypoint and deleting one renumbers them.
+
+      Rhumb-line bearings, because a rhumb line is the only track a helm or
+      an autopilot can hold; cross-track measured against the great circle,
+      with a test that measures the disagreement rather than assuming it.
+
+      Still to come: **tap to place** a waypoint on the chart rather than
+      the `w` key, **saving** routes (GPX, so they interchange with other
+      plotters), and **arrival and off-track alarms** — which are small now.
 
 - [ ] **Tracks.** Where you have been — a safety feature in its own right,
       retracing your own line out of shallow water in fog, and the basis of a

@@ -1,0 +1,33 @@
+[package]
+name = "rutter-fetch"
+description = "HTTPS tile fetching, isolated so nothing else carries the dependency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rutter-app.workspace = true
+log.workspace = true
+
+# The project's only network dependency, and the reason this crate exists:
+# `rutter-core` has none at all and `rutter-app` should not grow a TLS
+# stack to satisfy one optional feature. A platform that wants to fetch
+# imagery links this; one that would rather use the operating system's own
+# HTTP stack implements `TileFetcher` instead and never sees these.
+#
+# rustls is pinned to the `ring` provider. The default is now aws-lc-rs,
+# which is considerably harder to cross-compile for four Android ABIs —
+# `ring` builds for aarch64-linux-android with the NDK as it stands.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+# The live test downloads a handful of real tiles and reopens them with the
+# reader the app uses, which is the only way to check the writer and the
+# URL template against the actual service.
+rutter-charts.workspace = true
+rutter-core.workspace = true
+
+[lints]
+workspace = true
