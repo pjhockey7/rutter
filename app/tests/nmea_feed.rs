@@ -106,7 +106,21 @@ fn the_simulator_and_the_parser_agree_about_where_the_boat_is() {
             .expect("start the feed"),
     );
 
-    wait_for(&mut nmea, "a fix", |n| n.vessel().position.is_some());
+    // Waiting for every field, not just the position. The feed corrupts
+    // one sentence in forty on purpose, so a cycle can arrive with a good
+    // RMC and a mangled MWV — and asserting on the wind the instant a
+    // position appeared made this test fail about one run in ten. The feed
+    // repeats every second, so waiting is both correct and quick.
+    wait_for(&mut nmea, "a full instrument cycle", |n| {
+        let v = n.vessel();
+        v.position.is_some()
+            && v.sog_kn.is_some()
+            && v.cog_deg.is_some()
+            && v.heading_deg.is_some()
+            && v.depth_m.is_some()
+            && v.apparent_wind.is_some()
+            && v.satellites.is_some()
+    });
 
     let vessel = *nmea.vessel();
     let fix = vessel.position.expect("a fix").value;

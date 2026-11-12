@@ -31,8 +31,8 @@
 pub mod ui;
 
 pub use ui::{
-    Action, CurrentState, DraftState, ImageryState, LayerEntry, PanelState, TemperatureState,
-    TideMarker, TideReading, TideState, TimeState, Ui, VesselState, WindState,
+    Action, CurrentState, DownloadState, DraftState, ImageryState, LayerEntry, PanelState, Tab,
+    TemperatureState, TideMarker, TideReading, TideState, TimeState, Ui, VesselState, WindState,
 };
 
 use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};

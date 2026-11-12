@@ -72,12 +72,20 @@ pub enum Action {
     SetCurrents(bool),
     /// Show or hide the temperature wash.
     SetTemperature(bool),
+    /// Mark the current viewport as the area to download.
+    UseViewAsDownloadArea,
+    /// Forget the marked area.
+    ClearDownloadArea,
+    /// Change the zoom range to fetch, as `(min, max)`.
+    SetDownloadZoom(u8, u8),
     /// How strongly the temperature wash is painted, 0..1.
     SetTemperatureOpacity(f32),
     /// Look at a time this many seconds from now. Zero is now.
     SetTimeOffset(i64),
     /// Back to now.
     NowTime,
+    /// Follow the shared clock, or keep this screen's own time.
+    SetTimeLinked(bool),
     /// Keep the chart centred on the boat as it moves.
     SetFollow(bool),
     /// Centre on the boat once, without following it.
@@ -103,6 +111,35 @@ pub struct CurrentState {
     /// as harmonic ones, and a chart with two arrows on it looks broken
     /// until you know why.
     pub subordinate_nearby: usize,
+}
+
+/// What the panel knows about fetching more chart.
+///
+/// The area is the *viewport*, marked with a button, rather than a box
+/// dragged on the chart. That is a deliberate simplification and not only a
+/// shortcut: "download what I am looking at" is the gesture people actually
+/// want, it needs no new input plumbing in either platform shim, and it
+/// cannot produce the degenerate boxes a drag can. A drag-to-select can be
+/// added later for the case of marking an area you are not looking at.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DownloadState {
+    /// The marked area, as `south,west to north,east`. `None` until the
+    /// view has been marked.
+    pub area: Option<String>,
+    /// How big it is, in miles, which is the unit the answer matters in.
+    pub span: Option<String>,
+    /// The zoom range to fetch, and the range the sources can serve.
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    pub zoom_limits: (u8, u8),
+    /// What fetching it would cost: tiles and bytes, per kind.
+    pub imagery_estimate: Option<String>,
+    pub chart_estimate: Option<String>,
+    /// The commands that would do it, ready to be typed.
+    pub commands: Vec<String>,
+    /// Whether the app can do the fetching itself yet. False for now, and
+    /// the panel says why rather than offering a button that does nothing.
+    pub in_app: bool,
 }
 
 /// What the panel knows about the air temperature.
@@ -147,6 +184,14 @@ pub struct TimeState {
     /// Whether the forecast covers the time being shown. False past the
     /// model's horizon, where the tide still works and the wind does not.
     pub wind_covers_this: bool,
+    /// Whether this screen follows the clock the other screens share.
+    ///
+    /// Shown only when it could matter — see `time_strip`. With one screen
+    /// linked and unlinked are indistinguishable, and a control that makes
+    /// no difference is worse than no control.
+    pub linked: bool,
+    /// Whether there is more than one screen to be linked *to*.
+    pub screens: usize,
 }
 
 /// What the panel knows about the boat's own position.
@@ -344,11 +389,69 @@ pub struct PanelState {
     pub tides: TideState,
     pub currents: CurrentState,
     pub temperature: TemperatureState,
+    pub download: DownloadState,
     pub time: TimeState,
     pub draft: DraftState,
     pub wind: WindState,
     /// The top strip's text: position, zoom, scale.
     pub status: String,
+}
+
+/// Which group of controls the panel is showing.
+///
+/// Fixed rather than configurable, and every screen has all of them: the
+/// tabs are a way through the controls, not a statement about what a screen
+/// is for. Saved presets — "this display shows depth and tides" — are a
+/// separate thing that sits on top of this later, and they are a selection
+/// of layers rather than a selection of tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    /// Where the boat is and whether it fits.
+    #[default]
+    Boat,
+    /// What the chart is drawn from: the imagery under it and its layers.
+    Chart,
+    /// Tides and tidal currents.
+    Water,
+    /// Wind and air temperature.
+    Weather,
+    /// Fetching more chart, and in time routes and tracks.
+    Tools,
+}
+
+impl Tab {
+    /// In the order they appear, which is roughly how often they are
+    /// wanted: the boat first, the tools last.
+    const ALL: [Self; 5] = [
+        Self::Boat,
+        Self::Chart,
+        Self::Water,
+        Self::Weather,
+        Self::Tools,
+    ];
+
+    /// Plain words, not icon glyphs. egui's default font covers Latin text
+    /// and little else, so an anchor or a cloud renders as an empty box —
+    /// which is how the first version of this panel appeared.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Boat => "Boat",
+            Self::Chart => "Chart",
+            Self::Water => "Water",
+            Self::Weather => "Weather",
+            Self::Tools => "Tools",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Boat => "Position, the GPS feed, your draft and the under-keel check",
+            Self::Chart => "Aerial imagery and the chart's own layers",
+            Self::Water => "Tide heights and tidal currents",
+            Self::Weather => "Wind and air temperature",
+            Self::Tools => "Download more chart for an area",
+        }
+    }
 }
 
 /// Panel state that survives between frames.
@@ -378,6 +481,8 @@ pub struct Ui {
     /// `--nmea` shows up in the box and can be edited rather than retyped.
     nmea_address: String,
     nmea_seeded: bool,
+    /// Which tab is showing.
+    tab: Tab,
 }
 
 /// A short, readable name for a style group.
@@ -440,6 +545,7 @@ impl Ui {
             tides,
             currents,
             temperature,
+            download,
             time,
             draft,
             wind,
@@ -507,174 +613,333 @@ impl Ui {
 
         // `default_size`, not `default_width`: the unified Panel takes one
         // size that means width for a side panel and height for a top one.
-        egui::Panel::left("layers")
-            .default_size(260.0)
+        egui::Panel::left("panel")
+            .default_size(272.0)
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("All").clicked() {
-                        actions.push(Action::ShowAll);
-                    }
-                    if ui.button("None").clicked() {
-                        actions.push(Action::HideAll);
-                    }
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("filter")
-                            .desired_width(110.0),
-                    );
-                });
-                ui.separator();
-                actions.extend(self.vessel_section(ui, vessel));
+                actions.extend(self.tab_bar(ui));
                 ui.separator();
 
-                // Imagery above the vector layers: it is the ground
-                // everything else sits on, and it is the control most
-                // likely to be reached for.
-                ui.horizontal(|ui| {
-                    let mut on = imagery.visible;
-                    let toggle = ui.add_enabled(
-                        imagery.available,
-                        egui::Checkbox::new(&mut on, "Aerial imagery"),
-                    );
-                    if toggle.clicked() {
-                        actions.push(Action::SetImagery(on));
+                // One tab's worth of controls. All of this used to be a
+                // single column, which on a real ENC meant a panel longer
+                // than any screen: the chart's sixty layer groups pushed
+                // the tide, the wind and the boat off the bottom, so the
+                // controls reached for most often were the ones furthest
+                // down.
+                //
+                // Only the chart tab needs to scroll now, and it is the one
+                // tab where scrolling is the point.
+                match self.tab {
+                    Tab::Boat => {
+                        actions.extend(self.vessel_section(ui, vessel));
+                        ui.separator();
+                        actions.extend(Self::draft_section(ui, draft));
                     }
-                    if !imagery.available {
-                        toggle.on_hover_text(
-                            "No imagery loaded. Build some with \
-                             `rutter imagery --chart <file>`, then pass \
-                             --imagery <file>.",
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new(format!("{} tiles", imagery.tiles))
-                                .weak()
-                                .small(),
-                        );
+                    Tab::Chart => {
+                        actions.extend(Self::imagery_section(ui, imagery));
+                        ui.separator();
+                        actions.extend(self.layers_section(ui, layers));
                     }
-                });
-
-                if imagery.available && imagery.visible {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("fade").weak().small());
-                        let mut opacity = imagery.opacity;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut opacity, 0.0..=1.0)
-                                    .show_value(false)
-                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                            )
-                            .changed()
-                        {
-                            actions.push(Action::SetImageryOpacity(opacity));
-                        }
-                    });
-                    if let Some(credit) = &imagery.attribution {
-                        ui.label(egui::RichText::new(credit).weak().small());
+                    Tab::Water => {
+                        actions.extend(Self::tide_section(ui, tides));
+                        ui.separator();
+                        actions.extend(Self::current_section(ui, currents));
+                    }
+                    Tab::Weather => {
+                        actions.extend(Self::wind_section(ui, wind));
+                        ui.separator();
+                        actions.extend(Self::temperature_section(ui, temperature));
+                    }
+                    Tab::Tools => {
+                        actions.extend(Self::tools_section(ui, download));
                     }
                 }
+            });
 
-                ui.separator();
-                actions.extend(Self::tide_section(ui, tides));
-                ui.separator();
-                actions.extend(Self::current_section(ui, currents));
-                ui.separator();
-                actions.extend(Self::wind_section(ui, wind));
-                ui.separator();
-                actions.extend(Self::temperature_section(ui, temperature));
-                ui.separator();
-                actions.extend(Self::draft_section(ui, draft));
-                ui.separator();
+        actions
+    }
 
-                if layers.is_empty() {
-                    ui.label("No chart loaded.");
+    /// Fetching more chart for an area.
+    fn tools_section(ui: &mut egui::Ui, download: &DownloadState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.label(egui::RichText::new("Download an area").strong());
+        ui.label(
+            egui::RichText::new(
+                "Pan and zoom until the screen shows the water you want, \
+                 then mark it.",
+            )
+            .weak()
+            .small(),
+        );
+
+        ui.horizontal(|ui| {
+            if ui.button("Use this view").clicked() {
+                actions.push(Action::UseViewAsDownloadArea);
+            }
+            if download.area.is_some() && ui.button("Clear").clicked() {
+                actions.push(Action::ClearDownloadArea);
+            }
+        });
+
+        let Some(area) = &download.area else {
+            return actions;
+        };
+
+        ui.separator();
+        ui.label(egui::RichText::new(area).monospace().small());
+        if let Some(span) = &download.span {
+            ui.label(egui::RichText::new(span).weak().small());
+        }
+
+        // The zoom range, which is what actually decides the size: each
+        // extra level is four times the tiles of the one before it.
+        let (lowest, highest) = download.zoom_limits;
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("detail").weak().small());
+
+        let mut min_zoom = download.min_zoom;
+        let mut max_zoom = download.max_zoom;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("from").weak().small());
+            changed |= ui
+                .add(egui::Slider::new(&mut min_zoom, lowest..=highest).show_value(true))
+                .on_hover_text("Coarsest zoom to fetch — what you see when zoomed out")
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("to").weak().small());
+            changed |= ui
+                .add(egui::Slider::new(&mut max_zoom, lowest..=highest).show_value(true))
+                .on_hover_text("Finest zoom to fetch — this is what costs")
+                .changed();
+        });
+        if changed {
+            actions.push(Action::SetDownloadZoom(min_zoom, max_zoom));
+        }
+
+        ui.add_space(4.0);
+        for estimate in [&download.imagery_estimate, &download.chart_estimate]
+            .into_iter()
+            .flatten()
+        {
+            ui.label(estimate);
+        }
+
+        if download.in_app {
+            // Not reachable yet; the state says so rather than this hiding
+            // the possibility.
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Fetching is not wired up here yet.").weak());
+        } else {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Run this on the machine with the toolchain:")
+                    .weak()
+                    .small(),
+            )
+            .on_hover_text(
+                "The chart pipeline needs GDAL and tippecanoe, which are not \
+                 on a phone. Imagery is only HTTP tile requests and could be \
+                 fetched here once there is an HTTP client in the build.",
+            );
+            for command in &download.commands {
+                // Selectable, so it can be copied rather than retyped off
+                // a screen.
+                ui.add(
+                    egui::TextEdit::singleline(&mut command.clone())
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+            }
+        }
+
+        actions
+    }
+
+    /// The row of tabs, and what it says about where you are.
+    fn tab_bar(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
+        let actions = Vec::new();
+
+        // Wrapped, because five words do not fit across a phone's panel in
+        // one row and a horizontal scroll for tabs would be worse than two
+        // lines of them.
+        ui.horizontal_wrapped(|ui| {
+            for tab in Tab::ALL {
+                let selected = self.tab == tab;
+                if ui
+                    .selectable_label(selected, tab.label())
+                    .on_hover_text(tab.hint())
+                    .clicked()
+                {
+                    self.tab = tab;
+                }
+            }
+        });
+
+        actions
+    }
+
+    /// The aerial imagery: whether it shows and how strongly.
+    ///
+    /// On the chart tab rather than a tab of its own, because it is the
+    /// ground the chart is drawn over and the two are adjusted together.
+    fn imagery_section(ui: &mut egui::Ui, imagery: &ImageryState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = imagery.visible;
+            let toggle = ui.add_enabled(
+                imagery.available,
+                egui::Checkbox::new(&mut on, "Aerial imagery"),
+            );
+            if toggle.clicked() {
+                actions.push(Action::SetImagery(on));
+            }
+            if imagery.available {
+                ui.label(
+                    egui::RichText::new(format!("{} tiles", imagery.tiles))
+                        .weak()
+                        .small(),
+                );
+            } else {
+                toggle.on_hover_text(
+                    "No imagery loaded. Build some with \
+                     `rutter imagery --chart <file>`, then pass \
+                     --imagery <file>.",
+                );
+            }
+        });
+
+        if !imagery.available || !imagery.visible {
+            return actions;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("fade").weak().small());
+            let mut opacity = imagery.opacity;
+            if ui
+                .add(
+                    egui::Slider::new(&mut opacity, 0.0..=1.0)
+                        .show_value(false)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                )
+                .changed()
+            {
+                actions.push(Action::SetImageryOpacity(opacity));
+            }
+        });
+        if let Some(credit) = &imagery.attribution {
+            ui.label(egui::RichText::new(credit).weak().small());
+        }
+
+        actions
+    }
+
+    /// The chart's own layers, grouped by what they are.
+    fn layers_section(&mut self, ui: &mut egui::Ui, layers: &[LayerEntry]) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        if layers.is_empty() {
+            ui.label("No chart loaded.");
+            ui.label(
+                egui::RichText::new(
+                    "Pass --charts <file.mbtiles>, or build one with \
+                     `rutter charts` or `rutter noaa`.",
+                )
+                .weak(),
+            );
+            return actions;
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("All").clicked() {
+                actions.push(Action::ShowAll);
+            }
+            if ui.button("None").clicked() {
+                actions.push(Action::HideAll);
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("filter")
+                    .desired_width(110.0),
+            );
+        });
+
+        let needle = self.filter.trim().to_ascii_uppercase();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for style in group_order() {
+                // Only the layers in this group that pass the filter.
+                let in_group: Vec<&LayerEntry> = layers
+                    .iter()
+                    .filter(|l| l.style == style)
+                    .filter(|l| needle.is_empty() || l.name.to_ascii_uppercase().contains(&needle))
+                    .collect();
+
+                if in_group.is_empty() {
+                    continue;
+                }
+
+                let shown = in_group.iter().filter(|l| l.visible).count();
+
+                // egui's own collapsing state, which draws the expand
+                // arrow as a triangle rather than a glyph — so it works
+                // with no icon font — and remembers whether the group is
+                // open without this type tracking it.
+                //
+                // Collapsed by default: a real ENC has sixty-odd layers,
+                // and an expanded list is a wall of acronyms you have to
+                // scroll past to find anything. The group headers alone
+                // fit on one screen.
+                let id = ui.make_persistent_id(style_label(style));
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    false,
+                )
+                .show_header(ui, |ui| {
+                    // A swatch in the chart's own colour, so the panel and
+                    // the chart agree without a legend.
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, Self::swatch(style));
+
+                    // Group toggle. Tristate in appearance only: any
+                    // visible means clicking hides the group.
+                    let mut group_on = shown > 0;
+                    if ui.checkbox(&mut group_on, style_label(style)).clicked() {
+                        actions.push(Action::SetStyle {
+                            style,
+                            visible: group_on,
+                        });
+                    }
+
                     ui.label(
-                        egui::RichText::new(
-                            "Pass --charts <file.mbtiles>, or build one with \
-                             `rutter charts` or `rutter noaa`.",
-                        )
-                        .weak(),
+                        egui::RichText::new(format!("{shown}/{}", in_group.len()))
+                            .weak()
+                            .small(),
                     );
-                    return;
-                }
-
-                let needle = self.filter.trim().to_ascii_uppercase();
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for style in group_order() {
-                        // Only the layers in this group that pass the filter.
-                        let in_group: Vec<&LayerEntry> = layers
-                            .iter()
-                            .filter(|l| l.style == style)
-                            .filter(|l| {
-                                needle.is_empty() || l.name.to_ascii_uppercase().contains(&needle)
-                            })
-                            .collect();
-
-                        if in_group.is_empty() {
-                            continue;
-                        }
-
-                        let shown = in_group.iter().filter(|l| l.visible).count();
-
-                        // egui's own collapsing state, which draws the
-                        // expand arrow as a triangle rather than a glyph —
-                        // so it works with no icon font — and remembers
-                        // whether the group is open without this type
-                        // tracking it.
-                        // Collapsed by default: a real ENC has sixty-odd
-                        // layers, and an expanded list is a wall of acronyms
-                        // you have to scroll past to find anything. The
-                        // group headers alone fit on one screen.
-                        let id = ui.make_persistent_id(style_label(style));
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            // A swatch in the chart's own colour, so the
-                            // panel and the chart agree without a legend.
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 2.0, Self::swatch(style));
-
-                            // Group toggle. Tristate in appearance only: any
-                            // visible means clicking hides the group.
-                            let mut group_on = shown > 0;
-                            if ui.checkbox(&mut group_on, style_label(style)).clicked() {
-                                actions.push(Action::SetStyle {
-                                    style,
-                                    visible: group_on,
+                })
+                .body(|ui| {
+                    for layer in in_group {
+                        ui.horizontal(|ui| {
+                            let mut on = layer.visible;
+                            if ui.checkbox(&mut on, &layer.name).clicked() {
+                                actions.push(Action::SetLayer {
+                                    name: layer.name.clone(),
+                                    visible: on,
                                 });
                             }
-
-                            ui.label(
-                                egui::RichText::new(format!("{shown}/{}", in_group.len()))
-                                    .weak()
-                                    .small(),
-                            );
-                        })
-                        .body(|ui| {
-                            for layer in in_group {
-                                ui.horizontal(|ui| {
-                                    let mut on = layer.visible;
-                                    if ui.checkbox(&mut on, &layer.name).clicked() {
-                                        actions.push(Action::SetLayer {
-                                            name: layer.name.clone(),
-                                            visible: on,
-                                        });
-                                    }
-                                    if let Some(n) = layer.count {
-                                        ui.label(egui::RichText::new(n.to_string()).weak().small())
-                                            .on_hover_text("features in view");
-                                    }
-                                });
+                            if let Some(n) = layer.count {
+                                ui.label(egui::RichText::new(n.to_string()).weak().small())
+                                    .on_hover_text("features in view");
                             }
                         });
                     }
                 });
-            });
+            }
+        });
 
         actions
     }
@@ -900,6 +1165,23 @@ impl Ui {
                             .small()
                             .color(egui::Color32::from_rgb(0x6c, 0xc6, 0xff)),
                     );
+                }
+                // The link control, and only when there is something to
+                // link to. One screen can neither gain nor lose anything
+                // by it.
+                if time.screens > 1 {
+                    let mut linked = time.linked;
+                    if ui
+                        .checkbox(&mut linked, "Linked")
+                        .on_hover_text(
+                            "Linked screens scrub together, which is what you \
+                             want when planning. Unlink the screen you are \
+                             steering by so it stays where you left it.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::SetTimeLinked(linked));
+                    }
                 }
                 if !time.wind_covers_this {
                     ui.label(
@@ -1772,6 +2054,7 @@ mod font_tests {
                     vessel: populated_vessel(),
                     currents: populated_currents(),
                     temperature: populated_temperature(),
+                    download: populated_download(),
                     time: populated_time(),
                     imagery: imagery.clone(),
                     tides: populated_tides(),
@@ -1898,6 +2181,29 @@ mod font_tests {
             away: "in 3h 20m".to_owned(),
             at_now: false,
             wind_covers_this: false,
+            // Unlinked on a three-screen boat, which is the state that
+            // draws every control in this strip.
+            linked: false,
+            screens: 3,
+        }
+    }
+
+    /// An area marked for download, for the drawing tests.
+    fn populated_download() -> DownloadState {
+        DownloadState {
+            area: Some("32.4000,-118.8000 to 33.8000,-117.0000".to_owned()),
+            span: Some("91 by 84 nautical miles".to_owned()),
+            min_zoom: 6,
+            max_zoom: 16,
+            zoom_limits: (2, 16),
+            imagery_estimate: Some("imagery: 124,416 tiles, about 3.0 GB".to_owned()),
+            chart_estimate: Some("chart: 1,398 tiles to z11, about 1.9 MB".to_owned()),
+            commands: vec![
+                "rutter noaa --box 32.4000,-118.8000,33.8000,-117.0000".to_owned(),
+                "rutter imagery --box 32.4000,-118.8000,33.8000,-117.0000 --min-zoom 6 --zoom 16"
+                    .to_owned(),
+            ],
+            in_app: false,
         }
     }
 
@@ -1969,6 +2275,7 @@ mod font_tests {
                     vessel: populated_vessel(),
                     currents: populated_currents(),
                     temperature: populated_temperature(),
+                    download: populated_download(),
                     time: populated_time(),
                     imagery: imagery.clone(),
                     tides: tides.clone(),

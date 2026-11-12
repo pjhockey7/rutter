@@ -37,9 +37,9 @@ use rutter_core::nmea::Vessel;
 use rutter_core::tide::{CurrentKind, CurrentStation, Kind, Station};
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{
-    Action, CurrentState, DraftState, FieldPatch, ImageryState, LayerEntry, Overlay, PanelState,
-    Renderer, TemperatureState, TideMarker, TideReading, TideState, TimeState, Ui, VesselState,
-    WindState,
+    Action, CurrentState, DownloadState, DraftState, FieldPatch, ImageryState, LayerEntry, Overlay,
+    PanelState, Renderer, TemperatureState, TideMarker, TideReading, TideState, TimeState, Ui,
+    VesselState, WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -190,6 +190,69 @@ const FIX_STALE_SECS: i64 = 8;
 /// just wrong.
 const FOLLOW_STALE_SECS: i64 = 30;
 
+/// Where a screen's time comes from.
+///
+/// One box driving three displays wants both: the tide, currents and wind
+/// scrubbed together across every screen while planning a passage, and one
+/// screen held at now to actually steer by. So the offset is either taken
+/// from the shared clock or owned by this screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeScope {
+    /// Follow the offset every other linked screen is using. The default,
+    /// so that dragging the slider anywhere moves everything.
+    #[default]
+    Linked,
+    /// This screen's own offset, unaffected by the others.
+    Own(i64),
+}
+
+/// What has been marked for download, and how much of it.
+#[derive(Debug, Clone, PartialEq)]
+struct Download {
+    /// The marked area, as north-west and south-east corners. `None` until
+    /// a view has been marked.
+    area: Option<(LatLon, LatLon)>,
+    min_zoom: u8,
+    max_zoom: u8,
+}
+
+impl Default for Download {
+    fn default() -> Self {
+        Self {
+            area: None,
+            // The pyramid `rutter imagery` builds by default: coarse enough
+            // to still have something when zoomed out, fine enough to pick
+            // out a slipway.
+            min_zoom: 6,
+            max_zoom: 16,
+        }
+    }
+}
+
+/// Bytes a stored tile takes, averaged over the files this was developed
+/// against.
+///
+/// Measured rather than guessed: `build/charts/imagery.mbtiles` is 1,419
+/// tiles in 35.2 MB and `noaa.mbtiles` is 21,628 in 27.8 MB. An estimate
+/// built on a guess would be the kind that tells you 200 MB and downloads
+/// two gigabytes onto a phone.
+const IMAGERY_TILE_BYTES: u64 = 26_000;
+const CHART_TILE_BYTES: u64 = 1_400;
+
+/// How far a vector chart is worth tiling, when none is open to ask.
+///
+/// An ENC carries a fixed amount of detail and tiling past it only
+/// subdivides the same lines, so a chart has a much lower useful maximum
+/// zoom than aerial imagery. Falling back to the *imagery* maximum
+/// instead — which the first version of this did — reported a chart
+/// download of five thousand tiles to z16, promising detail no ENC
+/// contains and an estimate five times too large.
+///
+/// Twelve rather than the eleven the current file happens to carry: that
+/// eleven is a consequence of the scale-band issue in `rutter noaa` rather
+/// than a property of the data.
+const DEFAULT_CHART_MAX_ZOOM: u8 = 12;
+
 /// Above this the boat is making way and its course over ground means
 /// something. Below it, GPS course is noise.
 const UNDERWAY_KN: f64 = 0.5;
@@ -278,13 +341,24 @@ pub struct App {
     /// Harmonic tidal current stations, loaded once like the tide ones.
     currents: Vec<CurrentStation>,
     currents_visible: bool,
-    /// Seconds from now that the chart is being shown for.
+    /// How this screen gets its time. See [`TimeScope`].
+    time_scope: TimeScope,
+    /// The offset every linked screen shares, in seconds from now.
     ///
     /// Zero is now, and nearly always is. Everything astronomical or
     /// forecast follows it — tide, currents, the under-keel check, wind,
     /// temperature. The boat's own position deliberately does not: a GPS
     /// says where the boat is, and no slider can change that.
-    shown_offset_secs: i64,
+    ///
+    /// Lives here and not only on the screen because on a boat with
+    /// several displays you want to scrub them together while planning,
+    /// and pin one to now to navigate by. With a single screen the two are
+    /// indistinguishable, which is why it costs nothing to build now and
+    /// would cost a rework to add later.
+    shared_offset_secs: i64,
+
+    /// The area marked for download, and what to fetch for it.
+    download: Download,
     /// Every station, loaded once.
     ///
     /// Held in memory rather than queried per frame. `nearest` and `in_box`
@@ -950,21 +1024,115 @@ impl App {
         }
     }
 
+    /// Mark what is on screen as the area to fetch.
+    pub fn mark_view_for_download(&mut self) {
+        self.download.area = Some(self.view.bounds());
+    }
+
+    /// Forget the marked area.
+    pub fn clear_download_area(&mut self) {
+        self.download.area = None;
+    }
+
+    /// Set the zoom range to fetch. Ordered whichever way it arrives.
+    pub fn set_download_zoom(&mut self, min: u8, max: u8) {
+        self.download.min_zoom = min.min(max);
+        self.download.max_zoom = max.max(min);
+    }
+
+    /// What the panel shows about downloading an area.
+    pub fn download_state(&self) -> DownloadState {
+        // The range the sources can actually serve. Offering zoom 20 for a
+        // chart that stops at 11 would promise detail that does not exist.
+        let limits = (
+            2,
+            self.imagery
+                .as_ref()
+                .map_or(16, |i| i.metadata().max_zoom)
+                .max(self.charts.as_ref().map_or(0, |c| c.metadata().max_zoom))
+                .max(8),
+        );
+
+        let mut state = DownloadState {
+            min_zoom: self.download.min_zoom.clamp(limits.0, limits.1),
+            max_zoom: self.download.max_zoom.clamp(limits.0, limits.1),
+            zoom_limits: limits,
+            // Not yet: fetching imagery here needs an HTTP client in the
+            // build, and fetching charts needs an S-57 reader as well.
+            in_app: false,
+            ..DownloadState::default()
+        };
+
+        let Some((nw, se)) = self.download.area else {
+            return state;
+        };
+
+        let (south, west) = (se.lat, nw.lon);
+        let (north, east) = (nw.lat, se.lon);
+        state.area = Some(format!("{south:.4},{west:.4} to {north:.4},{east:.4}"));
+
+        // The span in miles, which is the unit the size of the job is felt
+        // in. Measured along the box's own edges rather than the diagonal.
+        let across = nw.distance_to(LatLon::new(nw.lat, se.lon)) / 1852.0;
+        let down = nw.distance_to(LatLon::new(se.lat, nw.lon)) / 1852.0;
+        state.span = Some(format!("{across:.0} by {down:.0} nautical miles"));
+
+        let tiles = tiles_over(nw, se, state.min_zoom, state.max_zoom);
+        state.imagery_estimate = Some(format!(
+            "imagery: {} tiles, about {}",
+            thousands(tiles),
+            bytes_roughly(tiles * IMAGERY_TILE_BYTES)
+        ));
+        // Vector tiles are twenty times smaller, and the chart's own
+        // maximum zoom is lower, so this is counted separately rather than
+        // folded into one number that would be wrong for both.
+        // The chart's own ceiling, or a sensible one for an ENC if there
+        // is no chart open to ask.
+        let chart_max = state.max_zoom.min(
+            self.charts
+                .as_ref()
+                .map_or(DEFAULT_CHART_MAX_ZOOM, |c| c.metadata().max_zoom),
+        );
+        let chart_tiles = tiles_over(nw, se, state.min_zoom.min(chart_max), chart_max);
+        state.chart_estimate = Some(format!(
+            "chart: {} tiles to z{chart_max}, about {}",
+            thousands(chart_tiles),
+            bytes_roughly(chart_tiles * CHART_TILE_BYTES)
+        ));
+
+        state.commands = vec![
+            format!("rutter noaa --box {south:.4},{west:.4},{north:.4},{east:.4}"),
+            format!(
+                "rutter imagery --box {south:.4},{west:.4},{north:.4},{east:.4} \
+                 --min-zoom {} --zoom {}",
+                state.min_zoom, state.max_zoom
+            ),
+            format!("rutter tides --box {south:.4},{west:.4},{north:.4},{east:.4}"),
+            format!("rutter weather --box {south:.4},{west:.4},{north:.4},{east:.4}"),
+        ];
+
+        state
+    }
+
     /// What the panel shows about the time being viewed.
     pub fn time_state(&self) -> TimeState {
         let (min, max) = self.time_span();
         let shown = self.shown_time();
         TimeState {
-            offset_secs: self.shown_offset_secs,
+            offset_secs: self.time_offset(),
             min_secs: min,
             max_secs: max,
             shown: format_utc_hhmm(shown),
-            away: if self.shown_offset_secs == 0 {
+            away: if self.time_offset() == 0 {
                 String::new()
             } else {
-                format_away(self.shown_offset_secs)
+                format_away(self.time_offset())
             },
-            at_now: self.shown_offset_secs == 0,
+            at_now: self.time_offset() == 0,
+            linked: self.time_linked(),
+            // One, until there is a second screen to be linked to. The
+            // control hides itself rather than sitting there inert.
+            screens: 1,
             // True when there is no forecast at all: there is then nothing
             // to be outside of, and saying "no forecast this far out"
             // beside a chart with no wind layer would be noise.
@@ -994,6 +1162,7 @@ impl App {
             tides: self.tide_state(pixels_per_point),
             currents: self.current_state(),
             temperature: self.temperature_state(),
+            download: self.download_state(),
             time: self.time_state(),
             draft: self.draft_state(renderer),
             wind: self.wind_state(),
@@ -1341,18 +1510,30 @@ impl App {
                 // stale action from a frame where the forecast was wider
                 // cannot put the chart somewhere the slider cannot reach.
                 Action::SetTimeOffset(seconds) => {
-                    let (min, max) = self.time_span();
-                    let clamped = (*seconds).clamp(min, max);
-                    if clamped != self.shown_offset_secs {
-                        self.shown_offset_secs = clamped;
-                        touched = true;
-                    }
+                    touched |= self.set_time_offset(*seconds);
                 }
                 Action::NowTime => {
-                    if self.shown_offset_secs != 0 {
-                        self.shown_offset_secs = 0;
-                        touched = true;
-                    }
+                    touched |= self.set_time_offset(0);
+                }
+                Action::SetTimeLinked(linked) => {
+                    touched |= self.set_time_linked(*linked);
+                }
+                // The area to download. Neither of these touches the GPU,
+                // but both change what the panel reports.
+                // One line each, calling the same methods a platform or
+                // a test would, so the panel's path and every other path
+                // cannot drift apart.
+                Action::UseViewAsDownloadArea => {
+                    self.mark_view_for_download();
+                    touched = true;
+                }
+                Action::ClearDownloadArea => {
+                    self.clear_download_area();
+                    touched = true;
+                }
+                Action::SetDownloadZoom(min, max) => {
+                    self.set_download_zoom(*min, *max);
+                    touched = true;
                 }
                 // Neither of these touches the geometry any more: the
                 // charted depth is in the vertex and the boat is in a
@@ -1434,7 +1615,11 @@ impl App {
                 | Action::SetTemperature(_)
                 | Action::SetTemperatureOpacity(_)
                 | Action::SetTimeOffset(_)
-                | Action::NowTime => {}
+                | Action::NowTime
+                | Action::SetTimeLinked(_)
+                | Action::UseViewAsDownloadArea
+                | Action::ClearDownloadArea
+                | Action::SetDownloadZoom(..) => {}
             }
         }
 
@@ -1475,16 +1660,45 @@ impl App {
     pub fn set_time_offset(&mut self, seconds: i64) -> bool {
         let (min, max) = self.time_span();
         let clamped = seconds.clamp(min, max);
-        if clamped == self.shown_offset_secs {
+        if clamped == self.time_offset() {
             return false;
         }
-        self.shown_offset_secs = clamped;
+        // Written back through whichever scope this screen is in, so
+        // dragging the slider on a linked screen moves every linked screen
+        // and dragging it on an unlinked one moves only that.
+        match self.time_scope {
+            TimeScope::Linked => self.shared_offset_secs = clamped,
+            TimeScope::Own(_) => self.time_scope = TimeScope::Own(clamped),
+        }
+        true
+    }
+
+    /// Whether this screen follows the shared clock.
+    pub fn time_linked(&self) -> bool {
+        matches!(self.time_scope, TimeScope::Linked)
+    }
+
+    /// Link this screen to the shared clock, or give it its own.
+    ///
+    /// Unlinking keeps the time it was showing, so the act of unlinking
+    /// never moves the chart — it only stops it moving with the others.
+    pub fn set_time_linked(&mut self, linked: bool) -> bool {
+        let was = self.time_offset();
+        let scope = if linked {
+            TimeScope::Linked
+        } else {
+            TimeScope::Own(was)
+        };
+        if scope == self.time_scope {
+            return false;
+        }
+        self.time_scope = scope;
         true
     }
 
     /// Step the shown time, for a platform's own key binding.
     pub fn nudge_time(&mut self, seconds: i64) -> bool {
-        self.set_time_offset(self.shown_offset_secs.saturating_add(seconds))
+        self.set_time_offset(self.time_offset().saturating_add(seconds))
     }
 
     /// The instant a *field* is sampled for.
@@ -1508,7 +1722,15 @@ impl App {
     /// depends on time follows. The boat's own position does not use this
     /// and must not — see [`Self::boat_mark`].
     fn shown_time(&self) -> i64 {
-        unix_now() + self.shown_offset_secs
+        unix_now() + self.time_offset()
+    }
+
+    /// This screen's offset from now, whichever scope it is in.
+    fn time_offset(&self) -> i64 {
+        match self.time_scope {
+            TimeScope::Linked => self.shared_offset_secs,
+            TimeScope::Own(seconds) => seconds,
+        }
     }
 
     /// How far the slider may be dragged, in seconds from now.
@@ -1936,6 +2158,48 @@ fn imagery_plan(loaded: &[chart::TileId], wanted: &[chart::TileId]) -> ImageryPl
         ImageryPlan::Clear
     } else {
         ImageryPlan::Upload
+    }
+}
+
+/// How many tiles cover a box across a range of zooms.
+///
+/// Summed per level rather than estimated from the area, because the count
+/// is what gets downloaded and each level is close to four times the one
+/// below it: the finest zoom in the range is three quarters of the job.
+fn tiles_over(nw: LatLon, se: LatLon, min_zoom: u8, max_zoom: u8) -> u64 {
+    (min_zoom..=max_zoom)
+        .map(|z| chart::tiles_in_view(nw, se, z).len() as u64)
+        .sum()
+}
+
+/// A count with thousands separated, because `124416` and `1244160` look
+/// alike at a glance and differ by a factor of ten in download time.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A size in the unit a person would say it in.
+///
+/// Deliberately coarse — one significant decimal and no attempt at
+/// precision — because the number behind it is an average tile size and
+/// pretending to megabyte accuracy would be a false claim.
+fn bytes_roughly(bytes: u64) -> String {
+    const MB: f64 = 1_048_576.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{mb:.1} MB")
     }
 }
 

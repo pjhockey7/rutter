@@ -237,3 +237,215 @@ fn the_boat_does_not_move_with_the_slider() {
         "the slider changed what the panel says about the boat"
     );
 }
+
+// ── Scoped time, for a boat with more than one screen ───────────────────
+
+#[test]
+fn an_unlinked_screen_keeps_its_own_time() {
+    // The point of the whole scope mechanism: one display scrubbed forward
+    // for planning while the one you steer by stays where you put it.
+    let Some(mut app) = with_stations() else {
+        return;
+    };
+    assert!(app.time_linked(), "screens should start linked");
+
+    // Unlinking must not move the chart — it only stops it moving with the
+    // others. A screen that jumped when you unlinked it would be useless
+    // for the thing unlinking is for.
+    slide(&mut app, 4);
+    let before = app.time_state().offset_secs;
+    app.set_time_linked(false);
+    assert!(!app.time_linked());
+    assert_eq!(
+        app.time_state().offset_secs,
+        before,
+        "unlinking moved the time"
+    );
+
+    // And it still takes its own slider.
+    app.set_time_offset(2 * 3600);
+    assert_eq!(app.time_state().offset_secs, 2 * 3600);
+
+    // Relinking picks the shared offset back up, which is still where the
+    // linked screens left it.
+    app.set_time_linked(true);
+    assert_eq!(
+        app.time_state().offset_secs,
+        before,
+        "relinking did not return to the shared clock"
+    );
+}
+
+#[test]
+fn now_works_in_either_scope() {
+    // Whichever scope a screen is in, the Now button has to get it back to
+    // the present — that is the one control that must never be subtle.
+    let Some(mut app) = with_stations() else {
+        return;
+    };
+    for linked in [true, false] {
+        app.set_time_linked(linked);
+        app.set_time_offset(5 * 3600);
+        assert_ne!(app.time_state().offset_secs, 0);
+        app.set_time_offset(0);
+        assert_eq!(
+            app.time_state().offset_secs,
+            0,
+            "Now failed with linked = {linked}"
+        );
+        assert!(app.time_state().at_now);
+    }
+}
+
+#[test]
+fn nudging_steps_from_wherever_the_screen_is() {
+    let Some(mut app) = with_stations() else {
+        return;
+    };
+    app.set_time_linked(false);
+    app.set_time_offset(3600);
+    app.nudge_time(1800);
+    assert_eq!(app.time_state().offset_secs, 5400);
+    app.nudge_time(-5400);
+    assert_eq!(app.time_state().offset_secs, 0);
+}
+
+// ── The download area ───────────────────────────────────────────────────
+
+#[test]
+fn marking_the_view_describes_what_it_would_cost() {
+    let Some(mut app) = with_stations() else {
+        return;
+    };
+    look_at(&mut app, 32.68, -117.23);
+
+    // Nothing marked: no area, no estimate, and nothing to run.
+    let empty = app.download_state();
+    assert!(empty.area.is_none());
+    assert!(empty.commands.is_empty());
+    assert!(
+        !empty.in_app,
+        "the panel should not claim it can fetch this itself yet"
+    );
+
+    app.mark_view_for_download();
+    let marked = app.download_state();
+
+    let area = marked.area.expect("an area");
+    assert!(area.contains("32."), "the area reads {area:?}");
+    assert!(area.contains("-117."), "the area reads {area:?}");
+    assert!(marked.span.is_some(), "no span");
+
+    // Both estimates, because imagery and vector tiles differ by a factor
+    // of twenty in size and the chart stops at a lower zoom.
+    let imagery = marked.imagery_estimate.expect("an imagery estimate");
+    let chart = marked.chart_estimate.expect("a chart estimate");
+    assert!(imagery.contains("tiles"), "{imagery:?}");
+    assert!(chart.contains("tiles"), "{chart:?}");
+
+    // A vector chart holds a fixed amount of detail, so tiling it as deep
+    // as aerial imagery subdivides the same lines and inflates the
+    // estimate several-fold. With no chart open the fallback has to be an
+    // ENC's ceiling, not the imagery's.
+    assert!(
+        !chart.contains("z16"),
+        "the chart estimate claims imagery-depth detail: {chart:?}"
+    );
+
+    // The commands have to carry the box, or they are decoration.
+    assert!(!marked.commands.is_empty());
+    for command in &marked.commands {
+        assert!(command.contains("--box"), "{command:?}");
+        assert!(command.starts_with("rutter "), "{command:?}");
+    }
+
+    // Printed as well as asserted: the estimate rests on an average tile
+    // size, and a wrong constant would pass every assertion here while
+    // telling someone 200 MB before downloading two gigabytes onto a
+    // phone. Worth being able to read the actual numbers.
+    println!("  area    {area}");
+    println!("  span    {}", marked.span.unwrap_or_default());
+    println!("  {imagery}");
+    println!("  {chart}");
+
+    app.clear_download_area();
+    assert!(app.download_state().area.is_none());
+}
+
+#[test]
+fn an_extra_zoom_level_roughly_quadruples_the_job() {
+    // The property that makes the estimate worth showing at all: the
+    // finest level in the range is most of the download. Someone who
+    // drags the slider from 14 to 16 should be told it is sixteen times
+    // the work, not left to find out.
+    let Some(mut app) = with_stations() else {
+        return;
+    };
+    look_at(&mut app, 32.68, -117.23);
+    app.mark_view_for_download();
+
+    app.set_download_zoom(10, 12);
+    let shallow = app.download_state();
+    app.set_download_zoom(10, 13);
+    let deeper = app.download_state();
+
+    let count = |s: &str| -> u64 {
+        s.chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    };
+    // Parsed back out of the sentence, which also checks the thousands
+    // separator has not mangled it.
+    let a = count(
+        shallow
+            .imagery_estimate
+            .as_deref()
+            .unwrap_or("")
+            .split(" tiles")
+            .next()
+            .unwrap_or(""),
+    );
+    let b = count(
+        deeper
+            .imagery_estimate
+            .as_deref()
+            .unwrap_or("")
+            .split(" tiles")
+            .next()
+            .unwrap_or(""),
+    );
+    assert!(a > 0 && b > a, "{a} tiles then {b}");
+    assert!(
+        b > a * 2,
+        "one more zoom level only went from {a} to {b} tiles"
+    );
+}
+
+#[test]
+fn the_zoom_range_cannot_be_inverted() {
+    let Some(mut app) = with_stations() else {
+        return;
+    };
+    look_at(&mut app, 32.68, -117.23);
+    app.mark_view_for_download();
+
+    // Dragging the coarse slider past the fine one pushes rather than
+    // inverts, or the tile count would come out as zero and the panel
+    // would promise a free download.
+    app.set_download_zoom(14, 8);
+    let state = app.download_state();
+    assert!(
+        state.min_zoom <= state.max_zoom,
+        "range is {}..{}",
+        state.min_zoom,
+        state.max_zoom
+    );
+    assert!(
+        state
+            .imagery_estimate
+            .is_some_and(|e| !e.contains(" 0 tiles")),
+        "an inverted range produced an empty download"
+    );
+}
