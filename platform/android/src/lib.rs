@@ -47,6 +47,11 @@ const WEATHER_ASSET: &str = "weather.bin";
 /// one, which is the normal case.
 const NMEA_ASSET: &str = "nmea.txt";
 
+// The phone's own GPS, which is Java and therefore JNI. Android-only, and
+// the only file in the project that calls into the framework.
+#[cfg(target_os = "android")]
+mod gps;
+
 // The only unsafe thing in the project, and unavoidable: the NDK's glue
 // finds this entry point by symbol name, so it cannot be mangled. Spelled
 // with the explicit `unsafe(…)` form and an `allow` rather than relaxing the
@@ -247,6 +252,15 @@ fn open_bundled_sources(app: &AndroidApp) -> Sources {
         tides,
         weather,
         nmea,
+        // The phone's own GPS. A factory rather than an opened source so
+        // that the app can switch to a network feed and back again — and
+        // so the permission dialogue comes up when the GPS is wanted
+        // rather than while the charts are still being extracted.
+        //
+        // Used automatically when no `nmea.txt` named a feed, which is the
+        // normal case: a phone's own GPS is the obvious position source,
+        // and the panel can still be pointed at the boat's instruments.
+        gps: Some(rutter_app::DeviceGps::new(gps::open)),
     }
 }
 

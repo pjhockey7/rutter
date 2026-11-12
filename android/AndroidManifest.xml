@@ -29,6 +29,42 @@
         android:targetSdkVersion="35" />
 
     <!--
+      Needed to open a socket at all — any socket, including a UDP bind on
+      the boat's own WiFi with no route to the internet. Without it the
+      NMEA reader fails with EACCES on the phone while working perfectly on
+      the laptop, which is the least helpful way for this to break.
+
+      An install-time permission, not a runtime one: there is no dialogue
+      and nothing to ask the user for. It is also the *only* permission
+      this app declares. Reading the GPS chip directly would need
+      ACCESS_FINE_LOCATION and the runtime prompt that goes with it; taking
+      position over the network instead means a chart app that asks for
+      nothing.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      The phone's own GPS. A runtime permission, so declaring it here only
+      buys the right to ask; src/gps.rs does the asking, and the app runs
+      perfectly well without it — the chart, the tides and a network feed
+      all work with location refused.
+
+      Both, not just the fine one. From API 31 a request for
+      ACCESS_FINE_LOCATION that does not also ask for the coarse one is
+      *ignored*: no dialogue appears and nothing is granted, which is
+      indistinguishable from a user who said no.
+
+      Not `android:required` on a feature, either: a tablet with no GPS
+      should still install and still be a chart.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <uses-feature
+        android:name="android.hardware.location.gps"
+        android:required="false" />
+
+    <!--
       Vulkan rather than GL ES. Not required=true: wgpu falls back to GL ES,
       and refusing to install on a device without Vulkan would be a worse
       failure than running slower on one.

@@ -181,7 +181,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  --tides    tide stations, from `rutter tides`");
                 println!("  --weather  a wind forecast, from `rutter weather`");
                 println!("  --draft    your draft in metres; switches on the under-keel check");
-                println!("  --nmea     a GPS or instrument feed: tcp://host:port or udp://:port");
+                println!("  --nmea     a GPS or instrument feed; see below");
                 println!("  --at       open here, as <lat>,<lon>, instead of the chart centre");
                 println!("  --zoom     open at this zoom");
                 println!();
@@ -192,6 +192,8 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  {DEFAULT_WEATHER}");
                 println!();
                 println!("--nmea has no default. Common sources:");
+                println!("  /dev/ttyUSB0           a USB GPS dongle, 4800 baud");
+                println!("  /dev/ttyACM0@38400     a dongle at a stated rate");
                 println!("  tcp://<phone>:10110    a GPS relay app on a phone");
                 println!("  tcp://<plotter>:10110  a chartplotter or multiplexer");
                 println!("  udp://:10110           anything broadcasting to the boat network");
@@ -307,6 +309,12 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
             tides,
             weather,
             nmea,
+            // Linux has no system location service worth the name:
+            // GeoClue is a D-Bus daemon that mostly asks Mozilla where
+            // your WiFi is, which is not navigation. A GPS on a laptop is
+            // a dongle on a serial port, and `--nmea /dev/ttyUSB0` is
+            // already that.
+            gps: None,
         },
         draft_m,
         Opening { at, zoom },

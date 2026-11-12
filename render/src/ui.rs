@@ -66,6 +66,8 @@ pub enum Action {
     ConnectNmea(String),
     /// Close the feed.
     DisconnectNmea,
+    /// Use the device's own GPS instead of a network feed.
+    UseDeviceGps,
     /// Keep the chart centred on the boat as it moves.
     SetFollow(bool),
     /// Centre on the boat once, without following it.
@@ -110,6 +112,13 @@ pub struct VesselState {
     /// The address currently in use, for seeding the address box. Every
     /// platform can connect from the panel; only Linux has a flag.
     pub address: Option<String>,
+    /// Whether this device has a GPS of its own to fall back on.
+    pub has_device_gps: bool,
+    /// Whether that is what is currently being read.
+    pub using_device_gps: bool,
+    /// Horizontal accuracy, when the source states one. A phone does; a
+    /// NMEA feed cannot.
+    pub accuracy: Option<String>,
 }
 
 /// What the panel knows about the wind.
@@ -639,6 +648,30 @@ impl Ui {
             }
         });
 
+        // The device's own GPS, where there is one. Shown disabled rather
+        // than hidden on a laptop, so it is clear this is a thing the app
+        // does and a thing this machine lacks.
+        if vessel.has_device_gps || !vessel.available {
+            ui.horizontal(|ui| {
+                let button = ui.add_enabled(
+                    vessel.has_device_gps && !vessel.using_device_gps,
+                    egui::Button::new("Use this device's GPS"),
+                );
+                if button.clicked() {
+                    actions.push(Action::UseDeviceGps);
+                }
+                if !vessel.has_device_gps {
+                    button.on_hover_text(
+                        "This machine has no GPS of its own. Plug in a USB \
+                         dongle and pass its device path, or connect to a \
+                         feed over the network.",
+                    );
+                } else if vessel.using_device_gps {
+                    button.on_hover_text("Already in use");
+                }
+            });
+        }
+
         if !vessel.available {
             return actions;
         }
@@ -680,6 +713,14 @@ impl Ui {
             ui.label(line);
         }
 
+        if let Some(accuracy) = &vessel.accuracy {
+            ui.label(egui::RichText::new(accuracy).weak().small())
+                .on_hover_text(
+                    "How far the fix could be out, as the receiver \
+                     reckons it. A phone states this; an NMEA feed \
+                     carries HDOP instead, which is not a distance.",
+                );
+        }
         if let Some(age) = &vessel.age {
             let text = egui::RichText::new(age).weak().small();
             ui.label(if vessel.stale {
@@ -1483,6 +1524,9 @@ mod font_tests {
             follow: true,
             counts: Some("812 read, 94 ignored, 0 refused".to_owned()),
             address: Some("tcp://192.168.1.50:10110".to_owned()),
+            has_device_gps: true,
+            using_device_gps: false,
+            accuracy: Some("within 4 m".to_owned()),
         }
     }
 

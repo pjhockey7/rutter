@@ -35,5 +35,16 @@ winit = { workspace = true, features = ["android-native-activity", "rwh_06"] }
 android-activity.workspace = true
 android_logger.workspace = true
 
+# Location is Java-only on Android — there is no NDK API for it — so the
+# phone's own GPS has to be reached through JNI. Both of these are already
+# in the tree underneath android-activity, so this declares what is being
+# used rather than adding anything.
+jni = "0.22"
+ndk-context = "0.1"
+
+# For `LatLon`, which the GPS fills in. The other crates come in through
+# rutter-app, but this one is named directly by platform/android/src/gps.rs.
+rutter-core.workspace = true
+
 [lints]
 workspace = true

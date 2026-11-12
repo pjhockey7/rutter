@@ -27,6 +27,7 @@
 
 mod charts;
 pub mod nmea;
+mod serial;
 pub use charts::ChartWorker;
 
 use rutter_charts::{ChartSource, Collected, ImagerySource};
@@ -48,7 +49,8 @@ use rutter_tides::TideStations;
 // Re-exported for the platform shims. They need a position and a viewport to
 // translate input into, and reaching past this crate to `rutter-core` for
 // them would make the layering a suggestion rather than a rule.
-pub use nmea::Endpoint as NmeaEndpoint;
+pub use nmea::{DeviceGps, Endpoint as NmeaEndpoint, FixSource};
+pub use rutter_core::nmea::Fix;
 pub use rutter_core::weather::Forecast;
 pub use rutter_core::{LatLon as Position, View as Viewport};
 
@@ -171,6 +173,13 @@ pub struct Sources {
     /// Where to read NMEA 0183 from, if anywhere. Parsed by the platform
     /// from its own command line, because that is the layer that has one.
     pub nmea: Option<nmea::Endpoint>,
+    /// How to open the device's own GPS, where the platform has one.
+    ///
+    /// Used when no `nmea` address was given, and reachable from the panel
+    /// afterwards. A phone has one of these and a laptop does not, which
+    /// is exactly the kind of difference the board support exists to
+    /// absorb — the layers above only ever see a [`nmea::Receiver`].
+    pub gps: Option<nmea::DeviceGps>,
 }
 
 /// Tide readings for one second, reused across that second's frames.
@@ -240,6 +249,9 @@ pub struct App {
 
     /// The GPS and instrument feed, being read on a thread of its own.
     nmea: Option<nmea::Receiver>,
+    /// The device's own GPS, kept so the panel can switch back to it after
+    /// a network feed has been tried.
+    gps: Option<nmea::DeviceGps>,
     /// Why there is no feed, when the reason was a bad address typed into
     /// the panel. Worth keeping: an address that will not parse is the
     /// most likely failure and the least self-explanatory.
@@ -290,7 +302,15 @@ impl App {
             imagery: sources.imagery,
             tides: sources.tides,
             weather: sources.weather,
-            nmea: sources.nmea.and_then(nmea::Receiver::spawn),
+            // An address given explicitly wins over the built-in GPS: a
+            // feed from the boat's instruments carries depth and wind as
+            // well as position, so someone who named one meant it.
+            nmea: match (sources.nmea, &sources.gps) {
+                (Some(endpoint), _) => nmea::Receiver::spawn(endpoint),
+                (None, Some(_)) => None,
+                (None, None) => None,
+            },
+            gps: sources.gps,
             // On whenever there is a feed, for the same reason the other
             // layers are: the point of connecting one is to see the boat.
             vessel_visible: true,
@@ -309,6 +329,13 @@ impl App {
             draft_check: draft_m.is_some(),
             ..Self::default()
         };
+        // The built-in GPS, if nothing else was named. Done here rather
+        // than in the initialiser above because `gps` has to be stored
+        // before it can be opened from, and both borrow `app`.
+        if app.nmea.is_none() && app.gps.is_some() {
+            app.use_device_gps();
+        }
+
         app.stations = app
             .tides
             .as_ref()
@@ -859,6 +886,9 @@ impl App {
                     }
                     touched = true;
                 }
+                Action::UseDeviceGps => {
+                    touched |= self.use_device_gps();
+                }
                 Action::DisconnectNmea => {
                     self.nmea = None;
                     self.nmea_trouble = None;
@@ -965,7 +995,8 @@ impl App {
                 | Action::SetFollow(_)
                 | Action::GoToBoat
                 | Action::ConnectNmea(_)
-                | Action::DisconnectNmea => {}
+                | Action::DisconnectNmea
+                | Action::UseDeviceGps => {}
             }
         }
 
@@ -980,6 +1011,23 @@ impl App {
             self.rebuild_layer_entries();
         }
         changed
+    }
+
+    /// Switch to the device's own GPS.
+    ///
+    /// False if this platform has none, which is the normal case on a
+    /// laptop — the panel shows the control disabled rather than hiding
+    /// it, so it is clear the feature exists and what is missing.
+    fn use_device_gps(&mut self) -> bool {
+        let Some(gps) = self.gps.clone() else {
+            return false;
+        };
+        // Replacing the receiver drops any network feed, which is what
+        // stops its thread and releases its socket.
+        self.nmea = nmea::Receiver::spawn_device(gps);
+        self.nmea_trouble = None;
+        self.vessel_visible = true;
+        self.nmea.is_some()
     }
 
     /// Centre on the boat, for a platform's own key binding.
@@ -1021,6 +1069,7 @@ impl App {
             return VesselState {
                 link: self.nmea_trouble.clone().unwrap_or_default(),
                 trouble: self.nmea_trouble.is_some(),
+                has_device_gps: self.gps.is_some(),
                 ..VesselState::default()
             };
         };
@@ -1045,11 +1094,22 @@ impl App {
             stale: age.is_some_and(|s| s > FIX_STALE_SECS),
             quality: fix_quality_line(vessel),
             follow: self.follow,
-            address: Some(format!(
-                "{}://{}",
-                nmea.endpoint().protocol_name().to_lowercase(),
-                nmea.endpoint().address()
-            )),
+            has_device_gps: self.gps.is_some(),
+            using_device_gps: matches!(nmea.endpoint(), nmea::Endpoint::Device),
+            accuracy: vessel
+                .accuracy_m
+                .map(|a| format!("within {:.0} m", a.value.max(1.0))),
+            address: match nmea.endpoint() {
+                // Nothing to type: the built-in GPS is not an address, and
+                // seeding the box with a fake one would be worse than
+                // leaving the hint text showing.
+                nmea::Endpoint::Device => None,
+                other => Some(format!(
+                    "{}://{}",
+                    other.protocol_name().to_lowercase(),
+                    other.address()
+                )),
+            },
             counts: (report.accepted + report.unsupported + report.rejected > 0).then(|| {
                 format!(
                     "{} read, {} ignored, {} refused",
@@ -1696,6 +1756,8 @@ mod tests {
             apparent_wind: Some(Stamped::new((45.0, 12.0), 1_000)),
             satellites: Some(11),
             fix_quality: 2,
+            // None, as it is for every NMEA feed: HDOP is not metres.
+            accuracy_m: None,
         }
     }
 

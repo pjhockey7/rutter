@@ -1604,7 +1604,9 @@ print('%.4f,%.4f,%.4f,%.4f' % (
           "" \
           'A GPS feed:' \
           '  rutter nmea                    a synthetic boat, UDP to localhost' \
+          '  rutter nmea --pty              the same, as a fake serial dongle' \
           '  rutter run --nmea udp://:10110 listen for it (or for a real one)' \
+          '  rutter run --nmea /dev/ttyUSB0       a real USB GPS dongle' \
           '  rutter run --nmea tcp://host:10110   connect to a plotter or phone' \
           "" \
           'Environment:' \

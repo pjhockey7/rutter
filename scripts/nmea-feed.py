@@ -9,6 +9,7 @@ receiver would, at the rate a real receiver would.
 
     python3 scripts/nmea-feed.py                       # UDP to localhost
     python3 scripts/nmea-feed.py --tcp                 # listen; app connects
+    python3 scripts/nmea-feed.py --pty                 # a fake serial dongle
     python3 scripts/nmea-feed.py --from 32.68,-117.23 --course 210 --speed 6
 
 What it sends, once a second:
@@ -30,6 +31,8 @@ refusal count should climb slowly and the boat should never jump.
 
 import argparse
 import math
+import os
+import pty
 import random
 import socket
 import sys
@@ -136,6 +139,11 @@ def main():
         help="listen for a TCP connection instead of sending datagrams",
     )
     parser.add_argument(
+        "--pty",
+        action="store_true",
+        help="pretend to be a serial GPS; prints the device path to use",
+    )
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="never corrupt a sentence (the default corrupts one in %d)"
@@ -166,7 +174,17 @@ def main():
     sent = 0
     corrupted = 0
 
-    if args.tcp:
+    if args.pty:
+        # A pseudo-terminal is a serial port as far as termios is
+        # concerned, so this exercises the whole dongle path — open,
+        # configure, read, resynchronise — with nothing plugged in. The
+        # baud rate is the one thing it cannot test: a pty ignores it.
+        master, slave = pty.openpty()
+        device = os.ttyname(slave)
+        print("pretending to be a serial GPS on %s" % device)
+        print("  rutter run --nmea %s" % device)
+        send = lambda data: os.write(master, data)
+    elif args.tcp:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((args.host, args.port))
@@ -247,9 +265,9 @@ def main():
     except KeyboardInterrupt:
         print()
         print("%d cycles sent, %d sentences corrupted on purpose" % (sent, corrupted))
-    except (BrokenPipeError, ConnectionResetError):
+    except (BrokenPipeError, ConnectionResetError, OSError) as e:
         print()
-        print("the app disconnected after %d cycles" % sent)
+        print("the feed ended after %d cycles: %s" % (sent, e))
 
 
 if __name__ == "__main__":

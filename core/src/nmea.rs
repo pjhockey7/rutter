@@ -323,6 +323,48 @@ pub struct Vessel {
     pub satellites: Option<u8>,
     /// GGA's fix quality: 0 none, 1 GPS, 2 differential, 4/5 RTK.
     pub fix_quality: u8,
+    /// Horizontal accuracy in metres, when the source states one.
+    ///
+    /// Always `None` from NMEA: a GGA carries HDOP, which is a unitless
+    /// multiplier on an unstated receiver error and *not* a distance.
+    /// Converting one to the other needs a number only the receiver's
+    /// maker knows, so claiming metres from HDOP would be an invention.
+    /// A phone's own GPS does state metres, which is one of the reasons
+    /// its fixes are not pushed through the NMEA parser to get here.
+    pub accuracy_m: Option<Stamped<f64>>,
+}
+
+/// A position report from something that is not NMEA.
+///
+/// A phone's location service hands over a structure, not a sentence.
+/// Formatting it into `$GPRMC,…`, computing a checksum, and then
+/// immediately verifying that checksum to parse it back would be a round
+/// trip through a text format for no gain — and a lossy one, because NMEA
+/// has nowhere to put the accuracy. So it fills a [`Vessel`] directly.
+///
+/// This lives beside `Vessel` rather than in a module of its own because
+/// `Vessel` is what it is for, and `Vessel` is transport-independent even
+/// though it is spelled in the NMEA module.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fix {
+    pub at: LatLon,
+    /// Speed over ground in knots, if the source measured one. A phone
+    /// reports metres per second; converting is the platform's job, so
+    /// that every number reaching here is in the unit the panel shows.
+    pub sog_kn: Option<f64>,
+    /// Course over ground, degrees true.
+    pub cog_deg: Option<f64>,
+    /// Horizontal accuracy in metres.
+    pub accuracy_m: Option<f64>,
+    /// Satellites used, if known.
+    pub satellites: Option<u8>,
+    /// When the *source* says the fix was taken, in Unix seconds.
+    ///
+    /// Not when it was read. A phone's cached location can be minutes old
+    /// — that is the normal state of a location service that nothing has
+    /// asked for updates from — and stamping it with the time it was
+    /// collected would present a fix from the last anchorage as current.
+    pub taken: i64,
 }
 
 /// A value and when it arrived.
@@ -352,6 +394,33 @@ impl Vessel {
     /// it. Losing a fix momentarily should not make the boat vanish from
     /// the chart — it should make the position go stale, which the
     /// timestamps express.
+    /// Take a fix from a source that is not NMEA.
+    ///
+    /// Stamped with the fix's own time, not the time it arrived: see
+    /// [`Fix::taken`]. Everything that reads staleness off `Stamped::at`
+    /// therefore tells the truth about a cached position without needing
+    /// to know where it came from.
+    ///
+    /// Quality is reported as 1 — a plain fix — rather than invented. A
+    /// phone will not say whether it is differential, and claiming it was
+    /// would make the panel more confident than the data.
+    pub fn apply_fix(&mut self, fix: Fix) {
+        self.position = Some(Stamped::new(fix.at, fix.taken));
+        if let Some(v) = fix.sog_kn {
+            self.sog_kn = Some(Stamped::new(v, fix.taken));
+        }
+        if let Some(v) = fix.cog_deg {
+            self.cog_deg = Some(Stamped::new(v, fix.taken));
+        }
+        if let Some(v) = fix.accuracy_m {
+            self.accuracy_m = Some(Stamped::new(v, fix.taken));
+        }
+        if fix.satellites.is_some() {
+            self.satellites = fix.satellites;
+        }
+        self.fix_quality = self.fix_quality.max(1);
+    }
+
     pub fn apply(&mut self, sentence: Sentence, now: i64) {
         match sentence {
             Sentence::Rmc {
@@ -700,6 +769,68 @@ mod tests {
         // A talker ID with no sentence type behind it. Truncated rather
         // than unsupported: there is nothing here to not support.
         assert_eq!(parse("$GP"), Err(Invalid::Truncated));
+    }
+
+    #[test]
+    fn a_device_fix_is_stamped_with_when_it_was_taken() {
+        // The failure this guards: a phone's cached location can be
+        // minutes old, and stamping it with the moment it was read would
+        // present the last anchorage as the present position — with no
+        // staleness warning, because by arrival time it would be new.
+        let mut vessel = Vessel::default();
+        vessel.apply_fix(Fix {
+            at: LatLon::new(32.68, -117.23),
+            sog_kn: Some(5.2),
+            cog_deg: Some(184.0),
+            accuracy_m: Some(4.5),
+            satellites: Some(9),
+            taken: 1_000,
+        });
+
+        let fix = vessel.position.expect("a fix");
+        assert_eq!(fix.at, 1_000, "stamped with the wrong time");
+        // Read a hundred seconds later, it is stale — which is the whole
+        // point of carrying the taken time rather than the arrival time.
+        assert!(
+            !vessel.has_fix(1_100, 5),
+            "an old cached fix read as current"
+        );
+        assert!(vessel.has_fix(1_002, 5), "two seconds old is still a fix");
+        assert_eq!(vessel.accuracy_m.map(|a| a.value), Some(4.5));
+        assert_eq!(vessel.fix_quality, 1, "a plain fix, not an invented one");
+    }
+
+    #[test]
+    fn a_device_fix_does_not_erase_what_the_instruments_said() {
+        // A phone gives position, speed and course. It knows nothing about
+        // the depth under the keel or the wind at the masthead, and a fix
+        // arriving must not blank them.
+        let mut vessel = Vessel::default();
+        vessel.apply(parse("$SDDBT,32.8,f,10.0,M,5.5,F").expect("depth"), 500);
+        vessel.apply_fix(Fix {
+            at: LatLon::new(32.68, -117.23),
+            sog_kn: None,
+            cog_deg: None,
+            accuracy_m: None,
+            satellites: None,
+            taken: 1_000,
+        });
+        assert!(vessel.depth_m.is_some(), "the depth was lost");
+        assert!(vessel.position.is_some());
+        assert!(vessel.sog_kn.is_none(), "a speed was invented");
+    }
+
+    #[test]
+    fn nmea_never_claims_an_accuracy_in_metres() {
+        // HDOP is a unitless multiplier, not a distance. Presenting it as
+        // metres would be a confident number with no basis.
+        let mut vessel = Vessel::default();
+        vessel.apply(
+            parse("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,").expect("gga"),
+            1_000,
+        );
+        assert!(vessel.position.is_some(), "the fix itself should be taken");
+        assert_eq!(vessel.accuracy_m, None, "HDOP was presented as metres");
     }
 
     #[test]

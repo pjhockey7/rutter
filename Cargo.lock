@@ -2388,10 +2388,13 @@ dependencies = [
  "android-activity",
  "android_logger",
  "egui",
+ "jni",
  "log",
+ "ndk-context",
  "pollster",
  "rutter-app",
  "rutter-charts",
+ "rutter-core",
  "rutter-render",
  "rutter-tides",
  "winit",
@@ -2402,6 +2405,7 @@ name = "rutter-app"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "libc",
  "log",
  "rutter-charts",
  "rutter-core",

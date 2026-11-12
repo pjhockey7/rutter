@@ -19,6 +19,13 @@ egui.workspace = true
 
 log.workspace = true
 
+# For the serial transport's termios setup, and nothing else. Already in the
+# tree several times over through winit, so this costs no build time and adds
+# nothing to the supply chain — and it is the alternative to a serial crate
+# with a platform backend of its own.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The worker tests drive it against the charts crate's own fixture, and
 # integration tests see only dev-dependencies.
