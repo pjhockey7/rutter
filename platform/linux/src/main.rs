@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use rutter_app::{App, Position, Sources, Viewport};
+use rutter_app::{App, NmeaEndpoint, Position, Sources, Viewport};
 use rutter_charts::{ChartSource, ImagerySource};
 use rutter_render::{Frame, GuiFrame, Renderer};
 use rutter_tides::TideStations;
@@ -99,6 +99,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
     let mut tide_path = None;
     let mut weather_path = None;
     let mut draft_m = None;
+    let mut nmea: Option<NmeaEndpoint> = None;
     let mut at = None;
     let mut zoom = None;
 
@@ -128,6 +129,15 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
             // friction that stops the feature being used.
             "--weather" | "-w" => {
                 weather_path = Some(args.next().ok_or("--weather needs a path to a .bin file")?);
+            }
+            // A GPS or an instrument network, over the wire. No default:
+            // an address cannot be guessed, and a plotter that quietly
+            // probes the network on startup is not one anybody asked for.
+            "--nmea" | "-n" => {
+                let text = args
+                    .next()
+                    .ok_or("--nmea needs an address, like tcp://192.168.1.50:10110")?;
+                nmea = Some(NmeaEndpoint::parse(&text).map_err(|e| format!("--nmea: {e}"))?);
             }
             "--draft" | "-d" => {
                 let text = args.next().ok_or("--draft needs a depth in metres")?;
@@ -171,6 +181,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  --tides    tide stations, from `rutter tides`");
                 println!("  --weather  a wind forecast, from `rutter weather`");
                 println!("  --draft    your draft in metres; switches on the under-keel check");
+                println!("  --nmea     a GPS or instrument feed: tcp://host:port or udp://:port");
                 println!("  --at       open here, as <lat>,<lon>, instead of the chart centre");
                 println!("  --zoom     open at this zoom");
                 println!();
@@ -180,9 +191,15 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  {DEFAULT_TIDES}");
                 println!("  {DEFAULT_WEATHER}");
                 println!();
+                println!("--nmea has no default. Common sources:");
+                println!("  tcp://<phone>:10110    a GPS relay app on a phone");
+                println!("  tcp://<plotter>:10110  a chartplotter or multiplexer");
+                println!("  udp://:10110           anything broadcasting to the boat network");
+                println!();
                 println!("  drag or arrows  pan");
                 println!("  scroll or +/-   zoom");
                 println!("  0               fit the chart");
+                println!("  b               centre on the boat");
                 println!("  Escape          quit");
                 std::process::exit(0);
             }
@@ -262,6 +279,12 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
         }
     };
 
+    if let Some(endpoint) = &nmea {
+        println!("nmea: {} {}", endpoint.protocol_name(), endpoint.address());
+    } else {
+        println!("nmea: none — pass --nmea tcp://<host>:10110 for a GPS");
+    }
+
     let weather = match weather_path.or_else(|| default_path(DEFAULT_WEATHER)) {
         Some(path) => {
             let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -283,6 +306,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
             imagery,
             tides,
             weather,
+            nmea,
         },
         draft_m,
         Opening { at, zoom },
@@ -597,6 +621,10 @@ impl ApplicationHandler for Platform {
                     // view moved to San Diego — so "home" took you 5000
                     // miles from your charts.
                     Key::Character("0") => changed = self.app.fit_chart(),
+                    // To the boat. The one place worth a key of its own:
+                    // on the water it is where you look back to after
+                    // every detour across the chart.
+                    Key::Character("b" | "B") => changed = self.app.go_to_boat_now(),
                     _ => changed = false,
                 }
                 if changed {

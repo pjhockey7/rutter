@@ -32,7 +32,7 @@ pub mod ui;
 
 pub use ui::{
     Action, DraftState, ImageryState, LayerEntry, PanelState, TideMarker, TideReading, TideState,
-    Ui, WindState,
+    Ui, VesselState, WindState,
 };
 
 use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};
@@ -259,6 +259,20 @@ pub enum Overlay {
         emphasised: bool,
         colour: [f32; 4],
     },
+    /// Where the boat is, from a GPS fix.
+    ///
+    /// Drawn as a pointed hull when the course is known and as a ringed
+    /// cross when it is not — the same distinction a paper chart draws
+    /// between a fix with a course and a dead-reckoning position.
+    Boat {
+        at: chart::WorldXY,
+        /// Which way the bow points, degrees true. Course over ground
+        /// where the boat is moving, heading where it is not. `None` when
+        /// neither is known: a position alone is still worth marking, and
+        /// a symbol pointing north by default is a lie about the heading.
+        course_deg: Option<f32>,
+        colour: [f32; 4],
+    },
     /// A meteorological wind barb: half 5 kn, full 10, pennant 50.
     Barb {
         at: chart::WorldXY,
@@ -273,7 +287,7 @@ pub enum Overlay {
 impl Overlay {
     fn at(&self) -> chart::WorldXY {
         match self {
-            Self::Ring { at, .. } | Self::Barb { at, .. } => *at,
+            Self::Ring { at, .. } | Self::Barb { at, .. } | Self::Boat { at, .. } => *at,
         }
     }
 }
@@ -1732,6 +1746,55 @@ impl Renderer {
                         // colour: colour already means something here.
                         ring(&mut segment, radius_px * 0.45);
                     }
+                }
+
+                Overlay::Boat {
+                    course_deg, colour, ..
+                } => {
+                    /// Bow to the reference point, pixels.
+                    const BOW: f32 = 13.0;
+                    /// Quarters: back from the reference point, and out.
+                    const QUARTER_AFT: f32 = -7.0;
+                    const BEAM: f32 = 5.0;
+                    /// The transom's notch, which is what makes the stern
+                    /// read as a stern rather than as a second bow.
+                    const TRANSOM: f32 = -4.0;
+
+                    let Some(course) = course_deg else {
+                        // No course: a ringed cross, which is the chart
+                        // convention for a position without a vector.
+                        for i in 0..RING_SEGMENTS {
+                            let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            let b = (i + 1) as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            segment(
+                                [6.0 * a.cos(), 6.0 * a.sin()],
+                                [6.0 * b.cos(), 6.0 * b.sin()],
+                                colour,
+                            );
+                        }
+                        segment([-9.0, 0.0], [9.0, 0.0], colour);
+                        segment([0.0, -9.0], [0.0, 9.0], colour);
+                        continue;
+                    };
+
+                    // The same unit vector a barb's shaft uses: a bearing
+                    // clockwise from north, in a frame where y grows down.
+                    // A course is a direction of travel rather than a
+                    // direction of origin, but the arithmetic is identical.
+                    let along = shaft(course);
+                    let across = (along.1, -along.0);
+                    let point =
+                        |d: f32, w: f32| [along.0 * d + across.0 * w, along.1 * d + across.1 * w];
+
+                    let bow = point(BOW, 0.0);
+                    let port = point(QUARTER_AFT, -BEAM);
+                    let starboard = point(QUARTER_AFT, BEAM);
+                    let transom = point(TRANSOM, 0.0);
+
+                    segment(bow, port, colour);
+                    segment(port, transom, colour);
+                    segment(transom, starboard, colour);
+                    segment(starboard, bow, colour);
                 }
 
                 Overlay::Barb {

@@ -60,6 +60,56 @@ pub enum Action {
     SetDraft(Draft),
     /// Show or hide the wind.
     SetWind(bool),
+    /// Show or hide the boat's own position.
+    SetVessel(bool),
+    /// Open a feed at this address, replacing any current one.
+    ConnectNmea(String),
+    /// Close the feed.
+    DisconnectNmea,
+    /// Keep the chart centred on the boat as it moves.
+    SetFollow(bool),
+    /// Centre on the boat once, without following it.
+    GoToBoat,
+}
+
+/// What the panel knows about the boat's own position.
+///
+/// Strings rather than numbers, as with the other sections: the formatting
+/// is navigation — degrees and decimal minutes, knots, degrees true — and
+/// belongs with the code that knows what the numbers mean, not with the
+/// code that draws labels.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VesselState {
+    /// Whether a feed was configured at all. False means no `--nmea`, and
+    /// the section explains itself rather than looking broken.
+    pub available: bool,
+    pub visible: bool,
+    /// One line about the socket: connected, listening, or why not.
+    pub link: String,
+    /// Whether that line is a problem rather than a status.
+    pub trouble: bool,
+    /// The position, in degrees and decimal minutes. `None` until a fix.
+    pub fix: Option<String>,
+    /// Speed and course over ground, when the feed carries them.
+    pub motion: Option<String>,
+    /// Heading from a compass, which is not the same as course.
+    pub heading: Option<String>,
+    /// Depth under the transducer.
+    pub depth: Option<String>,
+    /// Apparent wind at the masthead — the boat's own instrument, not the
+    /// forecast.
+    pub wind: Option<String>,
+    /// How old the fix is, and whether that is too old to steer by.
+    pub age: Option<String>,
+    pub stale: bool,
+    /// Quality and satellite count, for when a fix looks wrong.
+    pub quality: Option<String>,
+    pub follow: bool,
+    /// Sentence counts: accepted, unsupported, rejected.
+    pub counts: Option<String>,
+    /// The address currently in use, for seeding the address box. Every
+    /// platform can connect from the panel; only Linux has a flag.
+    pub address: Option<String>,
 }
 
 /// What the panel knows about the wind.
@@ -205,6 +255,7 @@ pub struct ImageryState {
 #[derive(Debug, Default)]
 pub struct PanelState {
     pub layers: Vec<LayerEntry>,
+    pub vessel: VesselState,
     pub imagery: ImageryState,
     pub tides: TideState,
     pub draft: DraftState,
@@ -232,6 +283,14 @@ pub struct Ui {
     /// that in its own memory, keyed by the group's id, so there is nothing
     /// for this type to track.
     filter: String,
+    /// The NMEA address being typed, and whether it has been seeded from
+    /// whatever the platform was started with.
+    ///
+    /// Held here rather than in the app because it is a half-typed string
+    /// — interface state, not navigation state. Seeded once so that
+    /// `--nmea` shows up in the box and can be edited rather than retyped.
+    nmea_address: String,
+    nmea_seeded: bool,
 }
 
 /// A short, readable name for a style group.
@@ -289,6 +348,7 @@ impl Ui {
     pub fn show(&mut self, root: &mut egui::Ui, state: &PanelState) -> Vec<Action> {
         let PanelState {
             layers,
+            vessel,
             imagery,
             tides,
             draft,
@@ -325,6 +385,20 @@ impl Ui {
                 {
                     actions.push(Action::FitChart);
                 }
+                // The boat, beside the view's own position: with the panel
+                // closed this is the one control worth having, because
+                // "where am I" is the question a plotter exists to answer.
+                if vessel.available {
+                    let button = ui.add_enabled(vessel.fix.is_some(), egui::Button::new("Boat"));
+                    if button.clicked() {
+                        actions.push(Action::GoToBoat);
+                    }
+                    button.on_hover_text(if vessel.fix.is_some() {
+                        "Centre on the boat"
+                    } else {
+                        "No fix yet"
+                    });
+                }
                 ui.separator();
                 ui.label(status);
             });
@@ -352,6 +426,8 @@ impl Ui {
                             .desired_width(110.0),
                     );
                 });
+                ui.separator();
+                actions.extend(self.vessel_section(ui, vessel));
                 ui.separator();
 
                 // Imagery above the vector layers: it is the ground
@@ -503,6 +579,149 @@ impl Ui {
     }
 
     /// The wind block in the panel.
+    /// The boat: where it is, how fast, and whether the feed is healthy.
+    ///
+    /// Put first in the panel because it is the only section about the boat
+    /// rather than about the water. Everything else here describes the
+    /// world; this says where you are in it.
+    fn vessel_section(&mut self, ui: &mut egui::Ui, vessel: &VesselState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = vessel.visible;
+            let toggle = ui.add_enabled(vessel.available, egui::Checkbox::new(&mut on, "Boat"));
+            if toggle.clicked() {
+                actions.push(Action::SetVessel(on));
+            }
+            if !vessel.available {
+                toggle.on_hover_text("No GPS feed. Give an address below.");
+            }
+        });
+
+        // The address box, whether or not a feed is open. Changing boats,
+        // or reconnecting to a phone that got a new DHCP lease, has to be
+        // possible without restarting — and on Android there is no command
+        // line to have passed it on in the first place.
+        if !self.nmea_seeded {
+            self.nmea_seeded = true;
+            if let Some(address) = &vessel.address {
+                self.nmea_address = address.clone();
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.nmea_address)
+                    .hint_text("tcp://host:10110")
+                    .desired_width(150.0),
+            )
+            .on_hover_text(
+                "An NMEA 0183 feed over the network. A chartplotter or \
+                 multiplexer on the boat, or a phone running a GPS relay \
+                 app such as GPS2IP or Share GPS. udp://:10110 listens for \
+                 anything broadcasting to the network instead.",
+            );
+            let typed = !self.nmea_address.trim().is_empty();
+            if ui
+                .add_enabled(
+                    typed,
+                    egui::Button::new(if vessel.available {
+                        "Reconnect"
+                    } else {
+                        "Connect"
+                    }),
+                )
+                .clicked()
+            {
+                actions.push(Action::ConnectNmea(self.nmea_address.trim().to_owned()));
+            }
+            if vessel.available && ui.button("Off").clicked() {
+                actions.push(Action::DisconnectNmea);
+            }
+        });
+
+        if !vessel.available {
+            return actions;
+        }
+
+        // The link line always shows, fix or no fix: when there is no
+        // position, the reason is the whole content of this section.
+        let link = egui::RichText::new(&vessel.link).weak().small();
+        ui.label(if vessel.trouble {
+            link.color(egui::Color32::from_rgb(0xff, 0x6b, 0x5b))
+        } else {
+            link
+        });
+
+        if !vessel.visible {
+            return actions;
+        }
+
+        match &vessel.fix {
+            Some(fix) => {
+                let text = egui::RichText::new(fix).strong();
+                // A stale fix is the dangerous case: the numbers look
+                // exactly as confident when they are a minute old and the
+                // boat has moved a cable since.
+                ui.label(if vessel.stale {
+                    text.color(egui::Color32::from_rgb(0xff, 0xb3, 0x4d))
+                } else {
+                    text
+                });
+            }
+            None => {
+                ui.label(egui::RichText::new("waiting for a fix").weak());
+            }
+        }
+
+        for line in [&vessel.motion, &vessel.heading, &vessel.depth, &vessel.wind]
+            .into_iter()
+            .flatten()
+        {
+            ui.label(line);
+        }
+
+        if let Some(age) = &vessel.age {
+            let text = egui::RichText::new(age).weak().small();
+            ui.label(if vessel.stale {
+                text.color(egui::Color32::from_rgb(0xff, 0xb3, 0x4d))
+            } else {
+                text
+            });
+        }
+        if let Some(quality) = &vessel.quality {
+            ui.label(egui::RichText::new(quality).weak().small());
+        }
+
+        ui.horizontal(|ui| {
+            let mut follow = vessel.follow;
+            if ui
+                .add_enabled(
+                    vessel.fix.is_some(),
+                    egui::Checkbox::new(&mut follow, "Follow"),
+                )
+                .on_hover_text(
+                    "Keep the boat centred. Panning or zooming by hand \
+                     switches this off, so the chart never fights the hand \
+                     on it.",
+                )
+                .clicked()
+            {
+                actions.push(Action::SetFollow(follow));
+            }
+        });
+
+        if let Some(counts) = &vessel.counts {
+            ui.label(egui::RichText::new(counts).weak().small())
+                .on_hover_text(
+                    "Sentences understood, ignored as another kind, and \
+                     refused. A climbing refusal count means the wrong \
+                     port or a noisy link.",
+                );
+        }
+
+        actions
+    }
+
     fn wind_section(ui: &mut egui::Ui, wind: &WindState) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -1171,6 +1390,7 @@ mod font_tests {
                 ui,
                 &PanelState {
                     layers: entries.clone(),
+                    vessel: populated_vessel(),
                     imagery: imagery.clone(),
                     tides: populated_tides(),
                     draft: populated_draft(),
@@ -1240,6 +1460,32 @@ mod font_tests {
 
     /// A wind state as the panel sees it. The barbs themselves are the
     /// chart renderer's business now; what is left here is text.
+    /// A boat on a working feed, for the drawing tests.
+    ///
+    /// Every string populated, including the ones that only appear in
+    /// unusual states: the point of these tests is that a label which
+    /// cannot be rendered is caught here rather than on the water, and a
+    /// `None` renders nothing at all.
+    fn populated_vessel() -> VesselState {
+        VesselState {
+            available: true,
+            visible: true,
+            link: "connected to 192.168.1.50:10110".to_owned(),
+            trouble: false,
+            fix: Some("32°40.80'N  117°13.80'W".to_owned()),
+            motion: Some("5.2 kn   COG 184°".to_owned()),
+            heading: Some("HDG 190°".to_owned()),
+            depth: Some("9.4 m under the transducer".to_owned()),
+            wind: Some("12.0 kn apparent, 45° starboard".to_owned()),
+            age: Some("fix is current".to_owned()),
+            stale: false,
+            quality: Some("differential, 11 satellites".to_owned()),
+            follow: true,
+            counts: Some("812 read, 94 ignored, 0 refused".to_owned()),
+            address: Some("tcp://192.168.1.50:10110".to_owned()),
+        }
+    }
+
     fn populated_wind() -> WindState {
         WindState {
             available: true,
@@ -1292,6 +1538,7 @@ mod font_tests {
                 ui,
                 &PanelState {
                     layers: entries.clone(),
+                    vessel: populated_vessel(),
                     imagery: imagery.clone(),
                     tides: tides.clone(),
                     draft: populated_draft(),

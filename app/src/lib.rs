@@ -26,16 +26,18 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod charts;
+pub mod nmea;
 pub use charts::ChartWorker;
 
 use rutter_charts::{ChartSource, Collected, ImagerySource};
 use rutter_core::chart::TileId;
 use rutter_core::depth::{Draft, TideWindow};
+use rutter_core::nmea::Vessel;
 use rutter_core::tide::{Kind, Station};
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{
     Action, DraftState, ImageryState, LayerEntry, Overlay, PanelState, Renderer, TideMarker,
-    TideReading, TideState, Ui, WindState,
+    TideReading, TideState, Ui, VesselState, WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -46,6 +48,7 @@ use rutter_tides::TideStations;
 // Re-exported for the platform shims. They need a position and a viewport to
 // translate input into, and reaching past this crate to `rutter-core` for
 // them would make the layering a suggestion rather than a rule.
+pub use nmea::Endpoint as NmeaEndpoint;
 pub use rutter_core::weather::Forecast;
 pub use rutter_core::{LatLon as Position, View as Viewport};
 
@@ -131,6 +134,33 @@ const WIND_STALE_COLOUR: [f32; 4] = [0.54, 0.54, 0.54, 0.75];
 /// Past this a forecast is called stale, in the panel and in the drawing.
 const STALE_FORECAST_SECS: i64 = 6 * 3600;
 
+/// The boat's own mark.
+///
+/// Deliberately not the colour of anything else on the chart: this is the
+/// one symbol that must be findable instantly among a thousand soundings.
+const BOAT_COLOUR: [f32; 4] = [1.0, 0.35, 0.1, 1.0];
+/// The same mark, with a fix too old to steer by.
+const BOAT_STALE_COLOUR: [f32; 4] = [0.65, 0.42, 0.33, 0.9];
+
+/// How old a fix may be before it is shown as stale.
+///
+/// A GPS sends position once or twice a second, so eight seconds is several
+/// missed sentences rather than a hiccup. At six knots the boat has moved
+/// 25 m by then — enough to matter in a channel, which is the whole reason
+/// to say so rather than to draw the old position as though it were current.
+const FIX_STALE_SECS: i64 = 8;
+
+/// How old a fix may be before it stops steering the chart.
+///
+/// Longer than [`FIX_STALE_SECS`]: following a stale position is still
+/// better than the chart wandering off, but following a minute-old one is
+/// just wrong.
+const FOLLOW_STALE_SECS: i64 = 30;
+
+/// Above this the boat is making way and its course over ground means
+/// something. Below it, GPS course is noise.
+const UNDERWAY_KN: f64 = 0.5;
+
 /// The data files a platform found, however it found them.
 #[derive(Debug, Default)]
 pub struct Sources {
@@ -138,6 +168,9 @@ pub struct Sources {
     pub imagery: Option<ImagerySource>,
     pub tides: Option<TideStations>,
     pub weather: Option<Forecast>,
+    /// Where to read NMEA 0183 from, if anywhere. Parsed by the platform
+    /// from its own command line, because that is the layer that has one.
+    pub nmea: Option<nmea::Endpoint>,
 }
 
 /// Tide readings for one second, reused across that second's frames.
@@ -205,6 +238,19 @@ pub struct App {
     weather: Option<Forecast>,
     wind_visible: bool,
 
+    /// The GPS and instrument feed, being read on a thread of its own.
+    nmea: Option<nmea::Receiver>,
+    /// Why there is no feed, when the reason was a bad address typed into
+    /// the panel. Worth keeping: an address that will not parse is the
+    /// most likely failure and the least self-explanatory.
+    nmea_trouble: Option<String>,
+    vessel_visible: bool,
+    /// Whether the chart keeps itself centred on the boat.
+    ///
+    /// Off by default even with a feed: opening a chart that immediately
+    /// jumps somewhere else is startling, and the boat is one click away.
+    follow: bool,
+
     /// Last computed tide readings, and the second they were computed for.
     ///
     /// The curve and the high/low list cost about 0.6 ms together, which is
@@ -244,6 +290,10 @@ impl App {
             imagery: sources.imagery,
             tides: sources.tides,
             weather: sources.weather,
+            nmea: sources.nmea.and_then(nmea::Receiver::spawn),
+            // On whenever there is a feed, for the same reason the other
+            // layers are: the point of connecting one is to see the boat.
+            vessel_visible: true,
             // On when a forecast is present, same as the other layers.
             wind_visible: true,
             // Both on when the data is there: the reason to fetch imagery or
@@ -320,13 +370,62 @@ impl App {
 
     /// Bring every GPU-side thing in line with the view. Call before drawing.
     pub fn refresh(&mut self, renderer: &mut Renderer) {
-        // First: the chart refresh reads the tide window to colour the
+        // Before anything else: a new fix can move the view, and the tile
+        // set, the tide station and the overlay all follow from the view.
+        self.poll_nmea();
+        // Then: the chart refresh reads the tide window to colour the
         // under-keel check, so a stale cache would colour against last
         // second's tide.
         self.refresh_tide_cache();
         self.refresh_charts(renderer);
         self.refresh_imagery(renderer);
         self.refresh_overlay(renderer);
+    }
+
+    /// Take whatever the NMEA reader has produced, and follow the boat if
+    /// that is what was asked for.
+    ///
+    /// Centring is done here rather than in the reader because panning is a
+    /// view decision: the thread's job ends at "this is where the boat is".
+    fn poll_nmea(&mut self) {
+        let Some(nmea) = &mut self.nmea else {
+            return;
+        };
+        nmea.poll();
+
+        if !self.follow {
+            return;
+        }
+        let now = unix_now();
+        let Some(fix) = nmea.vessel().position else {
+            return;
+        };
+        if now - fix.at > FOLLOW_STALE_SECS {
+            return;
+        }
+        // Set rather than nudged: a follow that eased towards the boat
+        // would lag behind it at speed, and a plotter that is behind the
+        // boat is worse than one that is plainly centred on it.
+        self.view.centre = fix.value;
+    }
+
+    /// The boat's position and the way it is pointing, if there is a fix.
+    fn boat_mark(&self) -> Option<Overlay> {
+        let vessel = self.nmea.as_ref()?.vessel();
+        let fix = vessel.position?;
+        let age = unix_now() - fix.at;
+
+        let course = course_to_draw(vessel);
+
+        Some(Overlay::Boat {
+            at: chart::project(fix.value),
+            course_deg: course.map(|d| d as f32),
+            colour: if age > FIX_STALE_SECS {
+                BOAT_STALE_COLOUR
+            } else {
+                BOAT_COLOUR
+            },
+        })
     }
 
     /// Rebuild the chart's notation: station rings and wind barbs.
@@ -364,6 +463,13 @@ impl App {
                     colour: TIDE_COLOUR,
                 });
             }
+        }
+
+        // The boat last, so it is drawn over the notation rather than
+        // under it. Of everything on this chart it is the one mark that
+        // must never be hidden by another.
+        if self.vessel_visible {
+            marks.extend(self.boat_mark());
         }
 
         // Compared before uploading: a still view rebuilds the same marks
@@ -444,6 +550,7 @@ impl App {
     pub fn panel_state(&self, renderer: &Renderer, pixels_per_point: f32) -> PanelState {
         PanelState {
             layers: self.layer_entries.clone(),
+            vessel: self.vessel_state(),
             imagery: ImageryState {
                 available: self.imagery.is_some(),
                 visible: self.imagery_visible,
@@ -487,6 +594,12 @@ impl App {
     /// naive version drags at the wrong speed everywhere except the equator
     /// and drags the wrong way near the poles.
     pub fn pan_pixels(&mut self, dx: f64, dy: f64) {
+        // A drag means "look over there", which cannot coexist with the
+        // chart pulling itself back to the boat. Cancelled rather than
+        // fought: a view that springs back is the single most irritating
+        // thing a plotter can do.
+        self.follow = false;
+
         let pixels_per_world = 256.0 * 2f64.powf(self.view.zoom);
         let mut w = chart::project(self.view.centre);
         w.x -= dx / pixels_per_world;
@@ -726,6 +839,53 @@ impl App {
                     self.wind_visible = *on;
                     touched = true;
                 }
+                Action::ConnectNmea(address) => {
+                    match nmea::Endpoint::parse(address) {
+                        // Replacing the receiver drops the old one, which
+                        // is what stops its thread — see the Drop test in
+                        // `nmea`. Nothing here has to join it.
+                        Ok(endpoint) => {
+                            self.nmea = nmea::Receiver::spawn(endpoint);
+                            self.vessel_visible = true;
+                        }
+                        Err(e) => {
+                            // Kept rather than dropped: the panel shows
+                            // the reason where the link status goes, so a
+                            // typo explains itself.
+                            log::error!("NMEA: {address}: {e}");
+                            self.nmea = None;
+                            self.nmea_trouble = Some(format!("{address}: {e}"));
+                        }
+                    }
+                    touched = true;
+                }
+                Action::DisconnectNmea => {
+                    self.nmea = None;
+                    self.nmea_trouble = None;
+                    self.follow = false;
+                    touched = true;
+                }
+                Action::SetVessel(on) => {
+                    self.vessel_visible = *on;
+                    // Hiding the boat stops following it too. Following
+                    // something invisible is a view that moves for no
+                    // reason the chart can show.
+                    self.follow = self.follow && *on;
+                    touched = true;
+                }
+                Action::SetFollow(on) => {
+                    self.follow = *on;
+                    if *on {
+                        // Immediately, not on the next fix: a tick-box
+                        // that does nothing until the GPS next speaks
+                        // looks broken.
+                        touched |= self.go_to_boat();
+                    }
+                }
+                Action::GoToBoat => {
+                    self.follow = false;
+                    touched |= self.go_to_boat();
+                }
                 Action::SetTides(on) => {
                     self.tide_visible = *on;
                     touched = true;
@@ -800,7 +960,12 @@ impl App {
                 | Action::SelectTideStation(_)
                 | Action::SetDraftCheck(_)
                 | Action::SetDraft(_)
-                | Action::SetWind(_) => {}
+                | Action::SetWind(_)
+                | Action::SetVessel(_)
+                | Action::SetFollow(_)
+                | Action::GoToBoat
+                | Action::ConnectNmea(_)
+                | Action::DisconnectNmea => {}
             }
         }
 
@@ -817,12 +982,90 @@ impl App {
         changed
     }
 
-    /// Which station to predict for: the pinned one, or the closest to the
-    /// middle of the screen.
+    /// Centre on the boat, for a platform's own key binding.
     ///
-    /// Nearest-to-centre rather than nearest-to-boat because there is no
-    /// GPS yet. When there is, the boat's position is the better default and
-    /// this is the one line that changes.
+    /// Stops following, like the panel's button does: an explicit jump is
+    /// a look, not a mode.
+    pub fn go_to_boat_now(&mut self) -> bool {
+        self.follow = false;
+        self.go_to_boat()
+    }
+
+    /// Centre on the boat. False if there is nothing to centre on.
+    fn go_to_boat(&mut self) -> bool {
+        let Some(fix) = self.nmea.as_ref().and_then(|n| n.vessel().position) else {
+            return false;
+        };
+        // No staleness check here, unlike following: this was asked for
+        // explicitly, and "take me to where the boat last was" is a
+        // reasonable thing to want when the feed has dropped.
+        self.view.centre = fix.value;
+        true
+    }
+
+    /// The boat's position, if the fix is recent enough to act on.
+    ///
+    /// Used for choosing a tide station and nothing else so far. Separate
+    /// from the marker's own staleness test because the consequences
+    /// differ: a stale marker is drawn apologetically, while a stale fix
+    /// picking the tide station would silently predict for the wrong
+    /// harbour hours after the feed died.
+    fn fresh_fix(&self) -> Option<LatLon> {
+        let fix = self.nmea.as_ref()?.vessel().position?;
+        (unix_now() - fix.at <= FOLLOW_STALE_SECS).then_some(fix.value)
+    }
+
+    /// What the panel shows about the boat. See [`VesselState`].
+    fn vessel_state(&self) -> VesselState {
+        let Some(nmea) = &self.nmea else {
+            return VesselState {
+                link: self.nmea_trouble.clone().unwrap_or_default(),
+                trouble: self.nmea_trouble.is_some(),
+                ..VesselState::default()
+            };
+        };
+        let report = nmea.report();
+        let vessel = &report.vessel;
+        let now = unix_now();
+
+        let age = vessel.position.map(|fix| now - fix.at);
+        VesselState {
+            available: true,
+            visible: self.vessel_visible,
+            link: nmea.status(),
+            trouble: nmea.troubled(),
+            fix: vessel.position.map(|fix| format_position(fix.value)),
+            motion: motion_line(vessel),
+            heading: heading_line(vessel),
+            depth: vessel
+                .depth_m
+                .map(|d| format!("{:.1} m under the transducer", d.value)),
+            wind: vessel.apparent_wind.map(|w| apparent_wind_line(w.value)),
+            age: age.map(fix_age_line),
+            stale: age.is_some_and(|s| s > FIX_STALE_SECS),
+            quality: fix_quality_line(vessel),
+            follow: self.follow,
+            address: Some(format!(
+                "{}://{}",
+                nmea.endpoint().protocol_name().to_lowercase(),
+                nmea.endpoint().address()
+            )),
+            counts: (report.accepted + report.unsupported + report.rejected > 0).then(|| {
+                format!(
+                    "{} read, {} ignored, {} refused",
+                    report.accepted, report.unsupported, report.rejected
+                )
+            }),
+        }
+    }
+
+    /// Which station to predict for: the pinned one, the one nearest the
+    /// boat, or the one nearest the middle of the screen.
+    ///
+    /// The boat takes precedence over the view because the tide you want is
+    /// the tide where you are, not the tide wherever you happened to scroll
+    /// — but only while the fix is fresh, or a dead feed would pin the
+    /// prediction to a harbour you left hours ago.
     fn tide_station(&self) -> Option<&Station> {
         if let Some(id) = &self.tide_pinned {
             if let Some(found) = self.stations.iter().find(|s| &s.id == id) {
@@ -834,9 +1077,10 @@ impl App {
         // Linear, over a list in the dozens. Borrowed rather than cloned:
         // a station carries thirty-odd constituents and this is called
         // several times a frame.
+        let from = self.fresh_fix().unwrap_or(self.view.centre);
         self.stations.iter().min_by(|a, b| {
-            let da = self.view.centre.distance_to(LatLon::new(a.lat, a.lon));
-            let db = self.view.centre.distance_to(LatLon::new(b.lat, b.lon));
+            let da = from.distance_to(LatLon::new(a.lat, a.lon));
+            let db = from.distance_to(LatLon::new(b.lat, b.lon));
             da.partial_cmp(&db).unwrap_or(core::cmp::Ordering::Equal)
         })
     }
@@ -1082,8 +1326,113 @@ impl App {
 /// Degrees and decimal minutes, which is how a position is read aloud and
 /// written in a log — not decimal degrees, which no one on a boat uses.
 pub fn status_line(view: &View) -> String {
-    let (lat, lon) = (view.centre.lat, view.centre.lon);
+    let scale = chart::metres_per_pixel(view.centre.lat, view.tile_zoom());
+    format!(
+        "{}   z{:.1}   {:.0} m/px",
+        format_position(view.centre),
+        view.zoom,
+        scale
+    )
+}
 
+/// Speed and course over ground, as one line.
+///
+/// Either half can be missing: a GGA-only receiver gives a position and
+/// nothing about movement, and a VTG-only one the opposite.
+fn motion_line(vessel: &Vessel) -> Option<String> {
+    match (vessel.sog_kn, vessel.cog_deg) {
+        (Some(sog), Some(cog)) => Some(format!("{:.1} kn   COG {:03.0}°", sog.value, cog.value)),
+        (Some(sog), None) => Some(format!("{:.1} kn", sog.value)),
+        (None, Some(cog)) => Some(format!("COG {:03.0}°", cog.value)),
+        (None, None) => None,
+    }
+}
+
+/// Compass heading, but only when it is not just the course again.
+///
+/// They read the same on a motorboat in still water and differ the moment
+/// there is a tide on the beam — which is exactly when the difference is
+/// worth a line of its own. Showing both always would mean two numbers that
+/// agree, every time, until the one occasion they matter.
+fn heading_line(vessel: &Vessel) -> Option<String> {
+    let hdg = vessel.heading_deg?;
+    let differs = vessel.cog_deg.is_none_or(|cog| {
+        // Across north, 358 and 002 are four degrees apart, not 356.
+        let gap = (hdg.value - cog.value).abs() % 360.0;
+        gap.min(360.0 - gap) > 3.0
+    });
+    differs.then(|| format!("HDG {:03.0}°", hdg.value))
+}
+
+/// Apparent wind, named the way it is read on deck.
+///
+/// Degrees off the bow and the side it comes over, rather than the 0..360
+/// the sentence carries: nobody says "the wind is at 315 relative", they
+/// say "forty-five on the port bow".
+fn apparent_wind_line((angle, speed): (f64, f64)) -> String {
+    // Dead ahead and dead astern have no side, and claiming one would be
+    // the kind of confident nonsense that makes an instrument distrusted.
+    let side = if angle <= 1.0 || angle >= 359.0 || (179.0..=181.0).contains(&angle) {
+        ""
+    } else if angle < 180.0 {
+        " starboard"
+    } else {
+        " port"
+    };
+    let off_bow = if angle > 180.0 { 360.0 - angle } else { angle };
+    format!("{speed:.1} kn apparent, {off_bow:.0}°{side}")
+}
+
+/// How old the fix is, in the units it is worth hearing.
+fn fix_age_line(seconds: i64) -> String {
+    match seconds {
+        ..=1 => "fix is current".to_owned(),
+        s if s < 60 => format!("fix {s} s old"),
+        s => format!("fix {} min old", s / 60),
+    }
+}
+
+/// What kind of fix this is, and off how many satellites.
+///
+/// `None` for quality 0, which means the receiver is powered and searching.
+/// There is no fix to describe, and the panel already says there is none.
+fn fix_quality_line(vessel: &Vessel) -> Option<String> {
+    let kind = match vessel.fix_quality {
+        0 => return None,
+        1 => "GPS",
+        2 => "differential",
+        4 => "RTK fixed",
+        5 => "RTK float",
+        _ => "fix",
+    };
+    Some(match vessel.satellites {
+        Some(n) => format!("{kind}, {n} satellites"),
+        None => kind.to_owned(),
+    })
+}
+
+/// Which way to point the boat symbol.
+///
+/// Course over ground while the boat is moving, compass heading otherwise.
+/// A GPS computes COG from successive positions, so at rest it is the
+/// difference between two helpings of the same noise and spins freely — and
+/// a boat symbol spinning on its mooring reads as a broken instrument.
+fn course_to_draw(vessel: &Vessel) -> Option<f64> {
+    let moving = vessel.sog_kn.is_some_and(|s| s.value >= UNDERWAY_KN);
+    match (moving, vessel.cog_deg, vessel.heading_deg) {
+        (true, Some(cog), _) => Some(cog.value),
+        (_, _, Some(heading)) => Some(heading.value),
+        _ => None,
+    }
+}
+
+/// A position in degrees and decimal minutes.
+///
+/// Degrees and decimal minutes rather than decimal degrees, because that is
+/// what a chart's margin is ruled in, what a position is given over the
+/// radio in, and what NMEA itself carries. Decimal degrees would be easier
+/// to print and useless to read off against a paper chart.
+pub fn format_position(at: LatLon) -> String {
     let fmt = |value: f64, positive: char, negative: char| {
         let hemisphere = if value >= 0.0 { positive } else { negative };
         let magnitude = value.abs();
@@ -1091,15 +1440,7 @@ pub fn status_line(view: &View) -> String {
         let minutes = (magnitude - degrees) * 60.0;
         format!("{degrees:.0}°{minutes:05.2}'{hemisphere}")
     };
-
-    let scale = chart::metres_per_pixel(lat, view.tile_zoom());
-    format!(
-        "{}  {}   z{:.1}   {:.0} m/px",
-        fmt(lat, 'N', 'S'),
-        fmt(lon, 'E', 'W'),
-        view.zoom,
-        scale
-    )
+    format!("{}  {}", fmt(at.lat, 'N', 'S'), fmt(at.lon, 'E', 'W'))
 }
 
 /// Seconds since the Unix epoch, now.
@@ -1338,5 +1679,201 @@ mod tests {
             (1_735_689_600..4_102_444_800).contains(&now),
             "the clock says {now}"
         );
+    }
+
+    // ── The boat ────────────────────────────────────────────────────────
+
+    use rutter_core::nmea::Stamped;
+
+    /// A vessel with everything a full instrument feed would give.
+    fn underway() -> Vessel {
+        Vessel {
+            position: Some(Stamped::new(Position::new(32.68, -117.23), 1_000)),
+            sog_kn: Some(Stamped::new(5.2, 1_000)),
+            cog_deg: Some(Stamped::new(184.4, 1_000)),
+            heading_deg: Some(Stamped::new(190.0, 1_000)),
+            depth_m: Some(Stamped::new(9.4, 1_000)),
+            apparent_wind: Some(Stamped::new((45.0, 12.0), 1_000)),
+            satellites: Some(11),
+            fix_quality: 2,
+        }
+    }
+
+    #[test]
+    fn a_moored_boat_points_where_its_compass_says_and_not_where_gps_guesses() {
+        // The failure: a GPS computes course from successive positions, so
+        // a boat at rest produces a course from pure noise and the symbol
+        // spins. With a compass aboard, the compass wins.
+        let mut vessel = underway();
+        vessel.sog_kn = Some(Stamped::new(0.1, 1_000));
+        vessel.cog_deg = Some(Stamped::new(37.0, 1_000));
+
+        assert_eq!(
+            course_to_draw(&vessel),
+            Some(190.0),
+            "a stopped boat should use its heading"
+        );
+
+        // Making way, the course over ground is the one that matters: it is
+        // where the boat is actually going, leeway and tide included.
+        assert_eq!(course_to_draw(&underway()), Some(184.4));
+    }
+
+    #[test]
+    fn a_boat_with_neither_course_nor_heading_points_nowhere() {
+        // Rather than north. A symbol pointing north by default is a claim
+        // about the heading, and a wrong one.
+        let vessel = Vessel {
+            position: Some(Stamped::new(Position::new(32.68, -117.23), 1_000)),
+            ..Vessel::default()
+        };
+        assert_eq!(course_to_draw(&vessel), None);
+    }
+
+    #[test]
+    fn a_stopped_boat_with_no_compass_still_points_nowhere() {
+        let mut vessel = underway();
+        vessel.heading_deg = None;
+        vessel.sog_kn = Some(Stamped::new(0.0, 1_000));
+        assert_eq!(course_to_draw(&vessel), None);
+    }
+
+    #[test]
+    fn the_heading_line_appears_only_when_it_says_something_new() {
+        let mut vessel = underway();
+
+        // Six degrees of leeway: worth saying.
+        assert_eq!(heading_line(&vessel), Some("HDG 190°".to_owned()));
+
+        // Steering the course exactly: the second line would be noise.
+        vessel.heading_deg = Some(Stamped::new(184.4, 1_000));
+        assert_eq!(heading_line(&vessel), None);
+
+        // Across north, where the naive subtraction gives 358 and would
+        // have claimed a boat steering its course was 358 degrees off it.
+        vessel.cog_deg = Some(Stamped::new(359.0, 1_000));
+        vessel.heading_deg = Some(Stamped::new(1.0, 1_000));
+        assert_eq!(
+            heading_line(&vessel),
+            None,
+            "359 and 001 are two degrees apart, not 358"
+        );
+
+        // And a real difference across north is still reported.
+        vessel.heading_deg = Some(Stamped::new(20.0, 1_000));
+        assert_eq!(heading_line(&vessel), Some("HDG 020°".to_owned()));
+    }
+
+    #[test]
+    fn motion_survives_a_half_equipped_receiver() {
+        let mut vessel = underway();
+        assert_eq!(motion_line(&vessel), Some("5.2 kn   COG 184°".to_owned()));
+
+        vessel.cog_deg = None;
+        assert_eq!(motion_line(&vessel), Some("5.2 kn".to_owned()));
+
+        vessel.sog_kn = None;
+        assert_eq!(motion_line(&vessel), None);
+
+        vessel.cog_deg = Some(Stamped::new(7.0, 1_000));
+        assert_eq!(
+            motion_line(&vessel),
+            Some("COG 007°".to_owned()),
+            "a bearing is always three digits"
+        );
+    }
+
+    #[test]
+    fn apparent_wind_is_named_the_way_it_is_read_on_deck() {
+        assert_eq!(
+            apparent_wind_line((45.0, 12.0)),
+            "12.0 kn apparent, 45° starboard"
+        );
+        // 315 relative is 45 on the port bow, not 315 of anything.
+        assert_eq!(
+            apparent_wind_line((315.0, 12.0)),
+            "12.0 kn apparent, 45° port"
+        );
+        // Dead ahead and dead astern have no side to come over.
+        assert_eq!(apparent_wind_line((0.0, 8.0)), "8.0 kn apparent, 0°");
+        assert_eq!(apparent_wind_line((180.0, 8.0)), "8.0 kn apparent, 180°");
+    }
+
+    #[test]
+    fn the_fix_age_reads_in_the_units_it_is_worth_hearing() {
+        assert_eq!(fix_age_line(0), "fix is current");
+        assert_eq!(fix_age_line(1), "fix is current");
+        assert_eq!(fix_age_line(9), "fix 9 s old");
+        assert_eq!(fix_age_line(59), "fix 59 s old");
+        assert_eq!(fix_age_line(60), "fix 1 min old");
+        assert_eq!(fix_age_line(3_600), "fix 60 min old");
+    }
+
+    #[test]
+    fn a_searching_receiver_claims_no_fix_quality() {
+        // Quality 0 is a GGA from a receiver that is powered and has not
+        // found anything. Reporting it as a kind of fix would be a lie.
+        let vessel = Vessel {
+            fix_quality: 0,
+            satellites: Some(3),
+            ..underway()
+        };
+        assert_eq!(fix_quality_line(&vessel), None);
+
+        assert_eq!(
+            fix_quality_line(&underway()),
+            Some("differential, 11 satellites".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_position_reads_as_degrees_and_decimal_minutes() {
+        // What a chart's margin is ruled in and what a position is given
+        // over the radio in. The entrance to San Diego Bay.
+        assert_eq!(
+            format_position(Position::new(32.68, -117.23)),
+            "32°40.80'N  117°13.80'W"
+        );
+        // Southern and eastern hemispheres, and a position where the
+        // minutes need their leading zero.
+        assert_eq!(
+            format_position(Position::new(-33.8600, 151.2100)),
+            "33°51.60'S  151°12.60'E"
+        );
+        assert_eq!(
+            format_position(Position::new(32.005, -117.005)),
+            "32°00.30'N  117°00.30'W"
+        );
+    }
+
+    #[test]
+    fn the_status_line_still_carries_the_position_it_used_to() {
+        // The formatter was shared with the boat's readout; the view's own
+        // line must not have changed shape in the process.
+        let line = status_line(&view_at(32.68, -117.23, 12.0));
+        assert!(
+            line.starts_with("32°40.80'N  117°13.80'W"),
+            "status line reads {line:?}"
+        );
+        assert!(line.contains("z12.0"), "status line reads {line:?}");
+    }
+
+    #[test]
+    fn panning_stops_the_chart_following_the_boat() {
+        // The worst thing a plotter can do is fight the hand on it: a view
+        // that springs back to the boat the moment you let go makes it
+        // impossible to look ahead.
+        let mut app = App::new(Sources::default(), None);
+        app.follow = true;
+        app.pan_pixels(50.0, 0.0);
+        assert!(!app.follow, "a drag should cancel follow");
+    }
+
+    #[test]
+    fn there_is_nowhere_to_go_without_a_fix() {
+        let mut app = App::new(Sources::default(), None);
+        let before = app.view.centre;
+        assert!(!app.go_to_boat_now(), "claimed to have a boat to go to");
+        assert!(same_place(&app.view.centre, &before));
     }
 }

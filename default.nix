@@ -751,6 +751,13 @@ let
           cp build/charts/imagery.mbtiles "$assets/imagery.mbtiles"
           bundled="$bundled imagery.mbtiles"
         fi
+        # The GPS feed's address, if one was given. A file because the
+        # Android shim has no command line, and because raising a soft
+        # keyboard for the panel's address box is not done yet.
+        if [ -n "''${RUTTER_NMEA:-}" ]; then
+          printf '%s\n' "''${RUTTER_NMEA}" > "$assets/nmea.txt"
+          bundled="$bundled nmea.txt"
+        fi
         echo "assets:$bundled"
         du -sh "$assets" | awk '{print "  assets total:", $1}'
 
@@ -1315,6 +1322,20 @@ print('%.4f,%.4f,%.4f,%.4f' % (
         fi
         ;;
 
+      # ── A boat, for when there is not one ─────────────────────────────
+      #
+      # The GPS path cannot be checked by a unit test alone: "is the marker
+      # in the right place on the chart" needs a feed, a chart and a look.
+      # So this sends the sentences a real receiver would, and the app has
+      # no way to tell the difference.
+      nmea)
+        shift
+        echo "synthetic NMEA feed — in another terminal:"
+        echo "  rutter run --nmea udp://:10110"
+        echo
+        exec python3 "$RUTTER_ROOT/scripts/nmea-feed.py" "$@"
+        ;;
+
       imagery)
         shift
         # ── Aerial imagery ────────────────────────────────────────────────
@@ -1571,6 +1592,7 @@ print('%.4f,%.4f,%.4f,%.4f' % (
           '  imagery      fetch USGS aerial imagery for a chart or a box' \
           '  tides        fetch NOAA tide-station constituents near a position' \
           '  weather      fetch a GFS wind and temperature forecast' \
+          '  nmea         send a synthetic GPS feed, to test without a boat' \
           '  fmt          cargo fmt' \
           '  lint         cargo clippy' \
           '  adb          pass through to the SDK'"'"'s adb' \
@@ -1580,10 +1602,17 @@ print('%.4f,%.4f,%.4f,%.4f' % (
           '  an ENC .000 cell or ENC_ROOT directory, a Shapefile, GeoPackage,' \
           '  GeoJSON, or an existing MBTiles passed straight to `run`.' \
           "" \
+          'A GPS feed:' \
+          '  rutter nmea                    a synthetic boat, UDP to localhost' \
+          '  rutter run --nmea udp://:10110 listen for it (or for a real one)' \
+          '  rutter run --nmea tcp://host:10110   connect to a plotter or phone' \
+          "" \
           'Environment:' \
           '  RUTTER_ABI   android ABI to build (default ${defaultAbi})' \
           '               one of: ${lib.concatStringsSep ", " (builtins.attrNames androidAbis)}' \
-          '  RUTTER_ROOT  project root (default: the current directory)'
+          '  RUTTER_ROOT  project root (default: the current directory)' \
+          '  RUTTER_NMEA  a GPS address to bundle into the APK, since the' \
+          '               Android shim has no command line to pass it on'
         ;;
 
       *)

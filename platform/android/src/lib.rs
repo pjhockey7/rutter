@@ -38,6 +38,14 @@ const CHART_ASSET: &str = "noaa.mbtiles";
 const IMAGERY_ASSET: &str = "imagery.mbtiles";
 const TIDES_ASSET: &str = "tides.sqlite";
 const WEATHER_ASSET: &str = "weather.bin";
+/// One line naming a GPS feed, as `--nmea` takes on Linux.
+///
+/// A file because there is no command line here, and because the panel's
+/// address box needs a soft keyboard that this shim does not yet raise —
+/// so on Android the address has to arrive with the package. Written by
+/// `rutter apk` from `RUTTER_NMEA`, and absent in a package built without
+/// one, which is the normal case.
+const NMEA_ASSET: &str = "nmea.txt";
 
 // The only unsafe thing in the project, and unavoidable: the NDK's glue
 // finds this entry point by symbol name, so it cannot be mangled. Spelled
@@ -217,11 +225,28 @@ fn open_bundled_sources(app: &AndroidApp) -> Sources {
         }
     });
 
+    // Read rather than extracted-and-kept like the others: it is one
+    // short line, and a stale copy in the data directory would quietly
+    // override a new address in a reinstalled package.
+    let nmea = extract_asset(app, NMEA_ASSET)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| match rutter_app::NmeaEndpoint::parse(&text) {
+            Ok(endpoint) => {
+                log::info!("nmea: {} {}", endpoint.protocol_name(), endpoint.address());
+                Some(endpoint)
+            }
+            Err(e) => {
+                log::error!("{NMEA_ASSET}: {e}");
+                None
+            }
+        });
+
     Sources {
         charts,
         imagery,
         tides,
         weather,
+        nmea,
     }
 }
 
