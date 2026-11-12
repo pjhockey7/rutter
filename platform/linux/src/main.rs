@@ -264,9 +264,11 @@ impl Platform {
             return;
         };
 
+        let started = std::time::Instant::now();
         if let Some(renderer) = self.renderer.as_mut() {
             self.app.refresh(renderer);
         }
+        let refreshed = started.elapsed();
 
         // Built before the egui closure, because it reads the app while the
         // closure writes it.
@@ -334,6 +336,12 @@ impl Platform {
         };
         let frame = renderer.render_with_ui(&self.app.view, gui);
         let changed = self.app.apply(&actions, renderer);
+
+        log::debug!(
+            "frame: {:.1} ms total, {:.1} ms refresh",
+            started.elapsed().as_secs_f64() * 1000.0,
+            refreshed.as_secs_f64() * 1000.0
+        );
 
         if changed || wants_repaint {
             // egui reports when it wants drawing again — mid-animation, or

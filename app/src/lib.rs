@@ -43,6 +43,21 @@ pub struct Sources {
     pub tides: Option<TideStations>,
 }
 
+/// Tide readings for one second, reused across that second's frames.
+#[derive(Debug, Clone)]
+struct TideCache {
+    /// The Unix second these were computed for.
+    second: i64,
+    /// Which station they are for, so selecting another invalidates them.
+    station_id: String,
+    name: String,
+    now: String,
+    next: Vec<TideReading>,
+    curve: Vec<f32>,
+    now_at: f32,
+    window: TideWindow,
+}
+
 /// Everything the panel needs for one frame.
 ///
 /// Built from `&App` and owned, so that the egui closure can borrow the app
@@ -71,6 +86,15 @@ pub struct App {
     loaded: Vec<TileId>,
 
     tides: Option<TideStations>,
+    /// Every station, loaded once.
+    ///
+    /// Held in memory rather than queried per frame. `nearest` and `in_box`
+    /// are a SQL query each plus a second query per station for its
+    /// constituents, and the panel wanted all of that three times a frame —
+    /// about 1 ms of SQLite in the render path for eleven rows that never
+    /// change. A few dozen stations with thirty numbers apiece is nothing
+    /// to keep resident.
+    stations: Vec<Station>,
     tide_visible: bool,
     /// The station being predicted for. `None` means "whichever is nearest
     /// to the middle of the screen"; a tap on a marker pins it.
@@ -84,6 +108,13 @@ pub struct App {
     imagery: Option<ImagerySource>,
     imagery_visible: bool,
     imagery_loaded: Vec<TileId>,
+
+    /// Last computed tide readings, and the second they were computed for.
+    ///
+    /// The curve and the high/low list cost about 0.6 ms together, which is
+    /// worth having once a second and not sixty times. Markers are *not*
+    /// cached: they move with the view and are only a projection each.
+    tide_cache: Option<TideCache>,
 
     /// Panel presentation state — which groups are open, the filter text.
     pub ui: Ui,
@@ -123,6 +154,11 @@ impl App {
             draft_check: draft_m.is_some(),
             ..Self::default()
         };
+        app.stations = app
+            .tides
+            .as_ref()
+            .and_then(|db| db.all().ok())
+            .unwrap_or_default();
         app.rebuild_layer_entries();
         app
     }
@@ -179,6 +215,10 @@ impl App {
 
     /// Bring every GPU-side thing in line with the view. Call before drawing.
     pub fn refresh(&mut self, renderer: &mut Renderer) {
+        // First: the chart refresh reads the tide window to colour the
+        // under-keel check, so a stale cache would colour against last
+        // second's tide.
+        self.refresh_tide_cache();
         self.refresh_charts(renderer);
         self.refresh_imagery(renderer);
     }
@@ -273,11 +313,24 @@ impl App {
         let Some(source) = self.charts.as_mut() else {
             return;
         };
-        let got = source.collect(&self.view);
 
-        if got.tiles == self.loaded {
+        // The tile list first, and only then the geometry.
+        //
+        // This was the other way round — collect, then compare and discard —
+        // which meant every frame decoded and cloned the whole viewport's
+        // worth of lines, points and triangles before deciding it had not
+        // changed. On a regional chart that is 5 to 10 ms a frame spent
+        // producing something immediately thrown away, against a 16.6 ms
+        // budget, and it is why panning felt heavy. `refresh_imagery` had
+        // always done it in this order; the chart half had not.
+        let zoom = source.clamp_zoom(self.view.tile_zoom());
+        let (nw, se) = self.view.bounds();
+        let wanted = chart::tiles_in_view(nw, se, zoom);
+        if wanted == self.loaded {
             return;
         }
+
+        let got = source.collect(&self.view);
 
         if let Some(wanted) = got.over_budget {
             // Zoomed far outside the chart's range. Clear rather than leave
@@ -492,17 +545,102 @@ impl App {
     /// Nearest-to-centre rather than nearest-to-boat because there is no
     /// GPS yet. When there is, the boat's position is the better default and
     /// this is the one line that changes.
-    fn tide_station(&self) -> Option<Station> {
-        let db = self.tides.as_ref()?;
+    fn tide_station(&self) -> Option<&Station> {
         if let Some(id) = &self.tide_pinned {
-            let found = db.all().ok()?.into_iter().find(|s| &s.id == id);
-            if found.is_some() {
-                return found;
+            if let Some(found) = self.stations.iter().find(|s| &s.id == id) {
+                return Some(found);
             }
-            // Pinned to a station that is no longer in the database — fall
-            // through to the nearest rather than showing nothing.
+            // Pinned to a station that is no longer loaded — fall through to
+            // the nearest rather than showing nothing.
         }
-        db.nearest(self.view.centre).ok().flatten()
+        // Linear, over a list in the dozens. Borrowed rather than cloned:
+        // a station carries thirty-odd constituents and this is called
+        // several times a frame.
+        self.stations.iter().min_by(|a, b| {
+            let da = self.view.centre.distance_to(LatLon::new(a.lat, a.lon));
+            let db = self.view.centre.distance_to(LatLon::new(b.lat, b.lon));
+            da.partial_cmp(&db).unwrap_or(core::cmp::Ordering::Equal)
+        })
+    }
+
+    /// Recompute the tide readings if they are not for this second.
+    ///
+    /// Everything the panel shows about the tide — the curve, the next few
+    /// turning points, the window the under-keel check uses — comes from
+    /// here, computed once a second rather than once a frame.
+    fn refresh_tide_cache(&mut self) {
+        let now = unix_now();
+        let Some(station) = self.tide_station() else {
+            self.tide_cache = None;
+            return;
+        };
+
+        if self
+            .tide_cache
+            .as_ref()
+            .is_some_and(|c| c.second == now && c.station_id == station.id)
+        {
+            return;
+        }
+
+        // A window that starts in the recent past, so the curve shows where
+        // the water has come from as well as where it is going. Reading a
+        // tide is as much about the trend as the number.
+        const BEHIND: i64 = 3 * 3600;
+        const AHEAD: i64 = 21 * 3600;
+        const SAMPLES: i64 = 120;
+        let (from, to) = (now - BEHIND, now + AHEAD);
+
+        let curve: Vec<f32> = station
+            .curve(from, to, (to - from) / SAMPLES)
+            .into_iter()
+            .map(|(_, metres)| metres as f32)
+            .collect();
+
+        let next = station
+            .extremes(now, to)
+            .into_iter()
+            .take(4)
+            .map(|e| TideReading {
+                label: match e.kind {
+                    Kind::High => "High".to_owned(),
+                    Kind::Low => "Low".to_owned(),
+                },
+                when: format_utc_hhmm(e.unix),
+                away: format_away(e.unix - now),
+                height: format!("{:.2} m", e.height_m),
+                high: e.kind == Kind::High,
+            })
+            .collect();
+
+        // The under-keel window, over its own shorter span.
+        let ahead = now + Self::DRAFT_WINDOW_HOURS * 3600;
+        let lowest = station
+            .curve(now, ahead, 600)
+            .into_iter()
+            .map(|(_, metres)| metres)
+            .fold(f64::MAX, f64::min);
+
+        self.tide_cache = Some(TideCache {
+            second: now,
+            station_id: station.id.clone(),
+            name: station.name.clone(),
+            now: format!("{:+.2} m", station.height_at(now)),
+            next,
+            curve,
+            now_at: BEHIND as f32 / (AHEAD + BEHIND) as f32,
+            window: TideWindow {
+                now_m: station.height_at(now),
+                // A station with no usable curve would give f64::MAX, which
+                // would make every sounding look clear. Fall back to the
+                // present level, which is at worst pessimistic.
+                lowest_m: if lowest.is_finite() {
+                    lowest
+                } else {
+                    station.height_at(now)
+                },
+            },
+        });
     }
 
     /// The tide now and at the lowest point of the window.
@@ -511,25 +649,7 @@ impl App {
     /// `extremes`, because the window's lowest water may be its far end on
     /// a still-falling tide rather than a turning point inside it.
     fn tide_window(&self) -> Option<TideWindow> {
-        let station = self.tide_station()?;
-        let now = unix_now();
-        let ahead = now + Self::DRAFT_WINDOW_HOURS * 3600;
-
-        let lowest = station
-            .curve(now, ahead, 600)
-            .into_iter()
-            .map(|(_, metres)| metres)
-            .fold(f64::MAX, f64::min);
-
-        // A station with no usable curve would give f64::MAX, which would
-        // make everything look clear. Refuse instead.
-        if !lowest.is_finite() {
-            return None;
-        }
-        Some(TideWindow {
-            now_m: station.height_at(now),
-            lowest_m: lowest,
-        })
+        self.tide_cache.as_ref().map(|c| c.window)
     }
 
     /// Everything the panel needs to show about the under-keel check.
@@ -564,7 +684,7 @@ impl App {
         let mut state = TideState {
             available: true,
             visible: self.tide_visible,
-            stations: db.count().unwrap_or(0),
+            stations: self.stations.len(),
             attribution: db.attribution().map(str::to_owned),
             ..TideState::default()
         };
@@ -573,69 +693,36 @@ impl App {
             return state;
         }
 
-        // Markers for every station in view. The box is the viewport's, so
-        // stations behind the panel are included — the panel is an overlay
-        // and the chart continues under it.
+        // Markers every frame, from the in-memory list: eleven projections
+        // and a box test, which is cheap enough not to cache and has to
+        // follow the view anyway.
         let (nw, se) = self.view.bounds();
-        let pinned = self.tide_pinned.clone();
-        let selected_id = self.tide_station().map(|s| s.id);
-        if let Ok(stations) = db.in_box(nw, se) {
-            state.markers = stations
-                .iter()
-                .map(|s| {
-                    let (x, y) = self.view.screen_of(LatLon::new(s.lat, s.lon));
-                    TideMarker {
-                        // egui works in points, the view in physical pixels.
-                        x: (x / f64::from(pixels_per_point)) as f32,
-                        y: (y / f64::from(pixels_per_point)) as f32,
-                        id: s.id.clone(),
-                        label: s.name.clone(),
-                        selected: selected_id.as_deref() == Some(s.id.as_str())
-                            || pinned.as_deref() == Some(s.id.as_str()),
-                    }
-                })
-                .collect();
-        }
-
-        let Some(station) = self.tide_station() else {
-            return state;
-        };
-        let now = unix_now();
-
-        state.station = Some(station.name.clone());
-        state.now = Some(format!("{:+.2} m", station.height_at(now)));
-
-        // A window that starts in the recent past, so the curve shows where
-        // the water has come from as well as where it is going. Reading a
-        // tide is as much about the trend as the number.
-        const BEHIND: i64 = 3 * 3600;
-        const AHEAD: i64 = 21 * 3600;
-        const SAMPLES: i64 = 120;
-        let from = now - BEHIND;
-        let to = now + AHEAD;
-
-        state.curve = station
-            .curve(from, to, (to - from) / SAMPLES)
-            .into_iter()
-            .map(|(_, metres)| metres as f32)
-            .collect();
-        state.now_at = BEHIND as f32 / (AHEAD + BEHIND) as f32;
-
-        state.next = station
-            .extremes(now, to)
-            .into_iter()
-            .take(4)
-            .map(|e| TideReading {
-                label: match e.kind {
-                    Kind::High => "High".to_owned(),
-                    Kind::Low => "Low".to_owned(),
-                },
-                when: format_utc_hhmm(e.unix),
-                away: format_away(e.unix - now),
-                height: format!("{:.2} m", e.height_m),
-                high: e.kind == Kind::High,
+        let selected = self.tide_station().map(|s| s.id.as_str());
+        state.markers = self
+            .stations
+            .iter()
+            .filter(|s| s.lat >= se.lat && s.lat <= nw.lat && s.lon >= nw.lon && s.lon <= se.lon)
+            .map(|s| {
+                let (x, y) = self.view.screen_of(LatLon::new(s.lat, s.lon));
+                TideMarker {
+                    // egui works in points, the view in physical pixels.
+                    x: (x / f64::from(pixels_per_point)) as f32,
+                    y: (y / f64::from(pixels_per_point)) as f32,
+                    id: s.id.clone(),
+                    label: s.name.clone(),
+                    selected: selected == Some(s.id.as_str()),
+                }
             })
             .collect();
+
+        // The readings come from the once-a-second cache.
+        if let Some(cache) = &self.tide_cache {
+            state.station = Some(cache.name.clone());
+            state.now = Some(cache.now.clone());
+            state.next = cache.next.clone();
+            state.curve = cache.curve.clone();
+            state.now_at = cache.now_at;
+        }
 
         state
     }

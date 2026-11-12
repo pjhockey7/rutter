@@ -281,7 +281,18 @@ impl Harmonic {
 
     /// The node factor `f` and nodal phase correction `u`, degrees.
     pub fn nodal(self, a: &Astro) -> (f64, f64) {
-        let n = Nodal::at(a);
+        self.nodal_with(&Nodal::at(a))
+    }
+
+    /// The same, against an already-computed [`Nodal`].
+    ///
+    /// [`Nodal::at`] costs an `acos`, two `atan2`s and a pile of
+    /// trigonometry, and it is identical for every constituent at a given
+    /// instant — it describes where the Moon's node is, not which term is
+    /// being evaluated. Calling `nodal` per constituent therefore did that
+    /// work thirty-odd times per height, and a tide curve is hundreds of
+    /// heights. Hoisting it out is most of what made the panel cheap.
+    fn nodal_with(self, n: &Nodal) -> (f64, f64) {
         match self.row().correction {
             Correction::Solar => (1.0, 0.0),
             Correction::Lunar2 => (n.f_m2, n.u_m2),
@@ -447,12 +458,16 @@ impl Station {
     /// Height above chart datum, metres, at a Unix time.
     pub fn height_at(&self, unix: i64) -> f64 {
         let a = Astro::at(unix);
+        // Both of these are properties of the instant rather than of any
+        // one constituent, so they are computed once per height and not
+        // once per term. See [`Harmonic::nodal_with`].
+        let n = Nodal::at(&a);
         self.datum_m
             + self
                 .constituents
                 .iter()
                 .map(|c| {
-                    let (f, u) = c.harmonic.nodal(&a);
+                    let (f, u) = c.harmonic.nodal_with(&n);
                     let angle = (c.harmonic.equilibrium(&a) + u - c.phase_deg).to_radians();
                     f * c.amplitude_m * angle.cos()
                 })

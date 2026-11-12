@@ -71,8 +71,22 @@ expect_used = "warn"
 
 # Debug builds of a renderer are too slow to judge anything by, and release
 # builds take long enough to discourage running them. Optimise dependencies
-# even in debug: the app's own code stays fast to rebuild.
+# even in debug.
 [profile.dev.package."*"]
+opt-level = 2
+
+# And this project's own code too, which the line above does not cover.
+#
+# Without it `rutter run` froze for 0.8 to 2.8 seconds on every zoom: a new
+# tile set means decoding protobuf and triangulating a few thousand polygons,
+# and unoptimised that is seven to ten times slower than it needs to be. The
+# cost is a slower rebuild, which is the right trade for a renderer — there
+# is no point in a fast build of something too slow to judge.
+#
+# Not a release profile for `rutter run`, deliberately: release adds thin LTO
+# and one codegen unit, which makes an incremental rebuild far slower than
+# opt-level alone.
+[profile.dev]
 opt-level = 2
 
 [profile.release]
