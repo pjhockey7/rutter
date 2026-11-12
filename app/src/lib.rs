@@ -25,7 +25,10 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use rutter_charts::{ChartSource, ImagerySource};
+mod charts;
+pub use charts::ChartWorker;
+
+use rutter_charts::{ChartSource, Collected, ImagerySource};
 use rutter_core::chart::TileId;
 use rutter_core::depth::{Draft, TideWindow};
 use rutter_core::tide::{Kind, Station};
@@ -34,6 +37,11 @@ use rutter_render::{
     Action, DraftState, ImageryState, LayerEntry, Renderer, TideMarker, TideReading, TideState, Ui,
 };
 use rutter_tides::TideStations;
+
+// Re-exported for the platform shims. They need a position and a viewport to
+// translate input into, and reaching past this crate to `rutter-core` for
+// them would make the layering a suggestion rather than a rule.
+pub use rutter_core::{LatLon as Position, View as Viewport};
 
 /// The data files a platform found, however it found them.
 #[derive(Debug, Default)]
@@ -78,12 +86,23 @@ pub struct PanelState {
 pub struct App {
     pub view: View,
 
-    charts: Option<ChartSource>,
-    /// The tile set the renderer's chart buffer was built from.
+    /// The chart, being decoded on a thread of its own. See [`charts`].
+    charts: Option<ChartWorker>,
+    /// The layer selection. Empty means every layer.
     ///
-    /// Kept so that panning within one tile — most of a drag — does not
-    /// re-decode and re-upload geometry that has not changed.
+    /// Held here rather than on the source, which now lives on the worker:
+    /// the panel needs to read it and it travels with each request.
+    layers: Vec<String>,
+    /// The tile set currently on the GPU.
     loaded: Vec<TileId>,
+    /// The tile set last asked of the worker, which may not have arrived.
+    ///
+    /// Separate from `loaded` so that a viewport is asked for once and not
+    /// again every frame while the answer is in flight.
+    requested: Vec<TileId>,
+    /// The last answer, kept so that changing the draft can re-colour the
+    /// chart without decoding it again.
+    last: Option<Box<Collected>>,
 
     tides: Option<TideStations>,
     /// Every station, loaded once.
@@ -138,7 +157,7 @@ impl App {
 
     pub fn new(sources: Sources, draft_m: Option<f64>) -> Self {
         let mut app = Self {
-            charts: sources.charts,
+            charts: sources.charts.and_then(ChartWorker::spawn),
             imagery: sources.imagery,
             tides: sources.tides,
             // Both on when the data is there: the reason to fetch imagery or
@@ -264,6 +283,9 @@ impl App {
     pub fn forget_uploads(&mut self) {
         self.loaded.clear();
         self.imagery_loaded.clear();
+        // Also the outstanding request, or the chart would wait forever for
+        // an answer whose geometry went with the old renderer.
+        self.requested.clear();
     }
 
     /// Pan by a screen-space delta in pixels.
@@ -294,52 +316,82 @@ impl App {
     /// re-decoding gzip and protobuf for geometry already on the GPU is the
     /// kind of waste that shows up as a warm phone.
     fn refresh_charts(&mut self, renderer: &mut Renderer) {
-        // Settled before the geometry is built, because the verdict is
+        // Settled before any geometry is uploaded, because the verdict is
         // baked into vertex colours rather than applied at draw time.
+        //
+        // The tide is rounded to centimetres first, and that rounding is
+        // what stops this being expensive. The verdict is baked into vertex
+        // colours, so any change to it re-uploads every vertex in view —
+        // 400,000 of them on a busy chart. Comparing raw `f64` heights made
+        // that happen every second, because a second of tide is always a
+        // fraction of a millimetre of change. Chart datum and NOAA's own
+        // predictions are published to the centimetre, so rounding there
+        // loses nothing and the re-upload now happens only when a sounding
+        // could actually change verdict.
+        let centimetres = |m: f64| (m * 100.0).round() / 100.0;
         let check = (self.draft_check)
             .then(|| self.tide_window())
             .flatten()
             .map(|tide| rutter_render::DraftCheck {
                 draft: self.draft,
-                tide,
+                tide: TideWindow {
+                    now_m: centimetres(tide.now_m),
+                    lowest_m: centimetres(tide.lowest_m),
+                },
             });
-        if renderer.draft_check() != check {
+        let recolour = renderer.draft_check() != check;
+        if recolour {
             renderer.set_draft_check(check);
-            // The tile set has not changed, only how it is coloured, so the
-            // short-circuit below has to be defeated.
-            self.loaded.clear();
         }
 
-        let Some(source) = self.charts.as_mut() else {
+        let Some(worker) = self.charts.as_mut() else {
             return;
         };
 
-        // The tile list first, and only then the geometry.
-        //
-        // This was the other way round — collect, then compare and discard —
-        // which meant every frame decoded and cloned the whole viewport's
-        // worth of lines, points and triangles before deciding it had not
-        // changed. On a regional chart that is 5 to 10 ms a frame spent
-        // producing something immediately thrown away, against a 16.6 ms
-        // budget, and it is why panning felt heavy. `refresh_imagery` had
-        // always done it in this order; the chart half had not.
-        let zoom = source.clamp_zoom(self.view.tile_zoom());
+        // Ask for whatever the viewport now needs, if that is not already
+        // what was asked for. The tile list is cheap; the geometry behind it
+        // is what costs, and that happens on the worker.
+        let zoom = worker.clamp_zoom(self.view.tile_zoom());
         let (nw, se) = self.view.bounds();
         let wanted = chart::tiles_in_view(nw, se, zoom);
-        if wanted == self.loaded {
-            return;
+        if wanted != self.requested {
+            if !worker.request(&self.view, &self.layers) {
+                // The worker's thread has gone. Stop asking rather than
+                // leaving the chart frozen and silent about why.
+                log::error!("the chart worker has stopped; no further chart updates");
+                self.charts = None;
+                return;
+            }
+            self.requested = wanted;
         }
 
-        let got = source.collect(&self.view);
+        // Take an answer if one has arrived. Nothing waits on this: an
+        // unanswered request simply means the previous geometry stays on
+        // screen for another frame, which is the whole point.
+        if let Some(got) = worker.take_answer() {
+            self.apply_collected(renderer, &got);
+            self.last = Some(got);
+        } else if recolour {
+            // The draft changed but the chart did not. Re-upload what is
+            // already here rather than making the worker decode it again —
+            // only the colours differ.
+            if let Some(last) = self.last.take() {
+                self.apply_collected(renderer, &last);
+                self.last = Some(last);
+            }
+        }
+    }
 
-        if let Some(wanted) = got.over_budget {
+    /// Upload one answer and report what it contained.
+    fn apply_collected(&mut self, renderer: &mut Renderer, got: &Collected) {
+        if let Some(count) = got.over_budget {
             // Zoomed far outside the chart's range. Clear rather than leave
             // the previous zoom's geometry on screen pretending to be this
             // one.
-            log::debug!("charts: {wanted} tiles wanted, over budget — not drawing");
+            log::debug!("charts: {count} tiles wanted, over budget — not drawing");
             renderer.clear_chart();
             self.unfilled = 0;
-            self.loaded = got.tiles;
+            self.loaded = got.tiles.clone();
             return;
         }
 
@@ -376,9 +428,6 @@ impl App {
                 tally.foul,
                 tally.total()
             );
-            // `got`, not `self.unfilled`: the field is assigned at the end
-            // of this function, so reading it here would report the
-            // previous view's count.
             if got.unfilled > 0 {
                 log::debug!("under-keel: {} areas outlined but not shaded", got.unfilled);
             }
@@ -391,27 +440,65 @@ impl App {
         }
 
         self.unfilled = got.unfilled;
-        self.loaded = got.tiles;
+        self.loaded = got.tiles.clone();
     }
 
-    /// Rebuild the panel's layer list from the chart and the current
-    /// selection.
+    /// Change the layer selection. Returns true if it actually changed.
     ///
-    /// Only called when something changed, not per frame: a real ENC chart
-    /// has sixty-odd layers and allocating that list sixty times a second to
-    /// draw the same panel would be waste.
+    /// The selection lives here rather than on the source, which is on the
+    /// worker thread. It travels with each request, and a change forces the
+    /// next one by clearing what was last asked for — the tile set has not
+    /// moved, only what should be drawn from it.
+    fn set_layers(&mut self, layers: &[String]) -> bool {
+        if self.layers == layers {
+            return false;
+        }
+        self.layers = layers.to_vec();
+        self.requested.clear();
+        true
+    }
+
+    /// Show or hide one layer by name.
+    ///
+    /// An empty selection means "all layers", so switching one off from
+    /// that state has to expand to the full list first.
+    fn toggle_layer(&mut self, name: &str, visible: bool) -> bool {
+        let mut selection = if self.layers.is_empty() {
+            self.chart_layer_names()
+        } else {
+            self.layers.clone()
+        };
+
+        if visible {
+            if !selection.iter().any(|l| l == name) {
+                selection.push(name.to_owned());
+            }
+        } else {
+            selection.retain(|l| l != name);
+        }
+        self.set_layers(&selection)
+    }
+
+    /// Every layer the chart holds, in file order.
+    fn chart_layer_names(&self) -> Vec<String> {
+        self.charts
+            .as_ref()
+            .map(|w| w.metadata().layers.iter().map(|l| l.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
     fn rebuild_layer_entries(&mut self) {
         self.layer_entries.clear();
-        let Some(source) = &self.charts else {
+        let Some(worker) = &self.charts else {
             return;
         };
 
-        let selected = source.selected_layers();
         // An empty selection means "all visible", which is the state a
         // freshly opened chart is in.
+        let selected = self.layers.clone();
         let all_visible = selected.is_empty();
 
-        for layer in &source.metadata().layers {
+        for layer in &worker.metadata().layers {
             self.layer_entries.push(LayerEntry {
                 style: rutter_charts::style_for_layer(&layer.name),
                 visible: all_visible || selected.contains(&layer.name),
@@ -475,10 +562,10 @@ impl App {
             }
         }
 
-        let Some(source) = self.charts.as_mut() else {
+        if self.charts.is_none() {
             // Imagery and fit still work without a vector chart.
             return touched;
-        };
+        }
 
         let mut changed = touched;
         let mut fit = false;
@@ -486,30 +573,28 @@ impl App {
         for action in actions {
             match action {
                 Action::SetLayer { name, visible } => {
-                    changed |= source.toggle_layer(name, *visible);
+                    changed |= self.toggle_layer(name, *visible);
                 }
                 Action::SetStyle { style, visible } => {
                     // Every layer in the group, one at a time. Clearer than
                     // a bulk set, and toggle_layer already handles the
                     // "empty means all" expansion.
-                    let names: Vec<String> = source
-                        .metadata()
-                        .layers
-                        .iter()
-                        .filter(|l| rutter_charts::style_for_layer(&l.name) == *style)
-                        .map(|l| l.name.clone())
+                    let names: Vec<String> = self
+                        .chart_layer_names()
+                        .into_iter()
+                        .filter(|name| rutter_charts::style_for_layer(name) == *style)
                         .collect();
                     for name in names {
-                        changed |= source.toggle_layer(&name, *visible);
+                        changed |= self.toggle_layer(&name, *visible);
                     }
                 }
                 Action::ShowAll => {
-                    changed |= source.set_layers(&[]);
+                    changed |= self.set_layers(&[]);
                 }
                 Action::HideAll => {
                     // One name that cannot match anything. An empty list
                     // means "all", so it cannot express "none".
-                    changed |= source.set_layers(&["\0none".to_owned()]);
+                    changed |= self.set_layers(&["\0none".to_owned()]);
                 }
                 Action::FitChart => fit = true,
                 // All handled above, before the source was borrowed.
@@ -523,17 +608,13 @@ impl App {
         }
 
         if fit {
-            if let Some(b) = source.metadata().bounds {
-                self.view.centre = LatLon::new((b[1] + b[3]) / 2.0, (b[0] + b[2]) / 2.0);
-                self.view.zoom = f64::from(source.metadata().max_zoom);
-                changed = true;
-            }
+            changed |= self.fit_chart();
         }
 
         if changed {
-            // The tile set may be identical, so refresh_charts would
-            // short-circuit; force it to reupload.
-            self.loaded.clear();
+            // The tile set may be identical, so the request in
+            // `refresh_charts` would be skipped; force it to ask again.
+            self.requested.clear();
             self.rebuild_layer_entries();
         }
         changed

@@ -699,28 +699,49 @@ fn a_redundant_toggle_reports_no_change() {
 }
 
 #[test]
-fn changing_the_filter_invalidates_the_cache() {
-    // The bug this guards: tiles cached under the old filter keep their old
-    // geometry, so a picker appears to do nothing until the view moves.
+fn changing_the_filter_takes_effect_without_dropping_the_cache() {
+    // Two things at once, and they used to be in tension.
+    //
+    // The filter must actually apply — a picker that appears to do nothing
+    // until the view moves is the obvious bug. That was first achieved by
+    // emptying the decoded-tile cache on every filter change, which fixed
+    // the picker and made it cost a full re-decode and re-triangulation of
+    // the viewport: hundreds of milliseconds to show *less* chart.
+    //
+    // Tiles are now decoded with every layer and filtered when a view is
+    // assembled, so both hold. This test fails if either regresses.
     let mut source = ChartSource::open(FIXTURE, &[]).expect("open");
     let centre = LatLon::new((NORTH + SOUTH) / 2.0, (EAST + WEST) / 2.0);
     let view = View::new(centre, 12.0, 1280, 800);
 
-    source.collect(&view);
+    let everything = source.collect(&view).styles();
     assert!(
-        source.cached() > 0,
-        "tiles should be cached after a collect"
+        everything.len() > 1,
+        "the fixture should have several styles, got {everything:?}"
     );
+    let cached = source.cached();
+    assert!(cached > 0, "tiles should be cached after a collect");
 
-    source.set_layers(&["COALNE".to_owned()]);
+    assert!(source.set_layers(&["COALNE".to_owned()]));
     assert_eq!(
         source.cached(),
-        0,
-        "the cache must be dropped on a filter change"
+        cached,
+        "a filter change must not cost the decoded tiles"
     );
 
+    // And it still filters.
     let only_coast = source.collect(&view).styles();
     assert_eq!(only_coast, vec![ChartStyle::Coastline]);
+    assert_eq!(
+        source.cached(),
+        cached,
+        "nor should collecting under the new filter re-decode anything"
+    );
+
+    // Back to everything, also without re-decoding.
+    assert!(source.set_layers(&[]));
+    assert_eq!(source.collect(&view).styles(), everything);
+    assert_eq!(source.cached(), cached);
 }
 
 #[test]

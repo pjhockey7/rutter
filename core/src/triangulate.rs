@@ -429,10 +429,27 @@ fn is_ear(
         return false;
     }
 
+    // The candidate ear's bounding box, to reject most vertices with four
+    // comparisons instead of three cross products.
+    //
+    // This matters more than it looks. The test below is over every
+    // remaining vertex, so the clip is quadratic in the ring's length, and
+    // chart rings are not uniformly short: the median is about a dozen
+    // points but the longest run to six hundred, and those few dominate the
+    // whole tile's triangulation time. An ear is a small triangle inside a
+    // large ring, so nearly every vertex is outside its box.
+    let min_x = a.x.min(b.x).min(c.x);
+    let max_x = a.x.max(b.x).max(c.x);
+    let min_y = a.y.min(b.y).min(c.y);
+    let max_y = a.y.max(b.y).max(c.y);
+
     let n = remaining.len();
     for offset in 2..n - 1 {
         let index = remaining[(cursor + offset) % n];
         let p = ring[index];
+        if p.x < min_x || p.x > max_x || p.y < min_y || p.y > max_y {
+            continue;
+        }
         // The ear's own corners are allowed to coincide with other
         // vertices — chart rings touch themselves after simplification —
         // so only a *different* vertex falling inside disqualifies it.

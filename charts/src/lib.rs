@@ -115,6 +115,9 @@ fn value_attribute(style: ChartStyle) -> &'static [&'static str] {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChartTile {
     pub id: TileId,
+    /// The names of the layers this tile's features came from, indexed by
+    /// `StyledLine::layer` and friends.
+    pub layer_names: Vec<String>,
     /// Areas whose polygon could not be tiled exactly, so carry no fill.
     ///
     /// Reported rather than swallowed. The triangulator refuses a ring it
@@ -148,6 +151,7 @@ impl ChartTile {
     pub fn from_mvt(id: TileId, tile: &mvt::Tile, layers: &[&str]) -> Self {
         let mut out = Self {
             id,
+            layer_names: Vec::new(),
             unfilled: 0,
             areas: Vec::new(),
             lines: Vec::new(),
@@ -158,6 +162,11 @@ impl ChartTile {
             if !layers.is_empty() && !layers.contains(&layer.name.as_str()) {
                 continue;
             }
+
+            // Recorded so that `ChartSource::collect` can filter by layer
+            // without this tile being decoded again.
+            let layer_index = u16::try_from(out.layer_names.len()).unwrap_or(u16::MAX);
+            out.layer_names.push(layer.name.clone());
 
             let style = style_for_layer(&layer.name);
             let value_keys = value_attribute(style);
@@ -185,6 +194,7 @@ impl ChartTile {
                         out.points
                             .extend(points.iter().copied().map(|p| StyledPoint {
                                 style,
+                                layer: layer_index,
                                 at: to_world(p),
                                 value,
                             }));
@@ -194,6 +204,7 @@ impl ChartTile {
                             if line.len() >= 2 {
                                 out.lines.push(StyledLine {
                                     style,
+                                    layer: layer_index,
                                     points: line.iter().copied().map(to_world).collect(),
                                     value,
                                 });
@@ -209,6 +220,7 @@ impl ChartTile {
                                 if ring.len() >= 2 {
                                     out.lines.push(StyledLine {
                                         style,
+                                        layer: layer_index,
                                         points: ring.iter().copied().map(to_world).collect(),
                                         value,
                                     });
@@ -251,6 +263,7 @@ impl ChartTile {
                             }
                             out.areas.push(StyledArea {
                                 style,
+                                layer: layer_index,
                                 value,
                                 triangles,
                             });
@@ -363,7 +376,9 @@ impl ChartSource {
             return false;
         }
         self.layers = layers.to_vec();
-        self.clear_cache();
+        // Deliberately *not* clearing the cache. Tiles are decoded with
+        // every layer and filtered in `collect`, so a change of selection
+        // costs one re-upload of vertices and no decoding at all.
         true
     }
 
@@ -408,9 +423,19 @@ impl ChartSource {
             return Ok(&self.cache[self.cache.len() - 1].1);
         }
 
-        let names: Vec<&str> = self.layers.iter().map(String::as_str).collect();
+        // Decoded with every layer, whatever the current selection.
+        //
+        // The selection used to be applied here, which meant the cache was
+        // only valid for one selection and `set_layers` had to empty it.
+        // Hiding a layer then threw away every decoded tile and re-decoded
+        // and re-triangulated the whole viewport — hundreds of milliseconds
+        // to show *less*. Filtering happens in `collect` instead, and the
+        // cache survives.
+        //
+        // This costs nothing in the common case: the app opens with no
+        // selection, which already decoded everything.
         let decoded = match self.file.tile(id)? {
-            Some(tile) => ChartTile::from_mvt(id, &tile, &names),
+            Some(tile) => ChartTile::from_mvt(id, &tile, &[]),
             None => ChartTile {
                 id,
                 ..ChartTile::default()
@@ -484,13 +509,29 @@ impl ChartSource {
         // exactly this was dead weight. A test asserting the cache is
         // non-empty after a collect caught it.
         let ids = out.tiles.clone();
+        // Cloned before the loop, because `self.tile` borrows `self`
+        // mutably to fill the cache.
+        let selection = self.layers.clone();
         for id in ids {
             match self.tile(id) {
                 Ok(tile) => {
-                    out.areas.extend(tile.areas.iter().cloned());
+                    // Which of this tile's layers are wanted, worked out
+                    // once per tile rather than once per feature — a tile
+                    // holds thousands of features and a dozen layers.
+                    let wanted: Vec<bool> = tile
+                        .layer_names
+                        .iter()
+                        .map(|name| selection.is_empty() || selection.iter().any(|s| s == name))
+                        .collect();
+                    let keep = |layer: u16| wanted.get(usize::from(layer)).copied().unwrap_or(true);
+
+                    out.areas
+                        .extend(tile.areas.iter().filter(|a| keep(a.layer)).cloned());
                     out.unfilled += tile.unfilled;
-                    out.lines.extend(tile.lines.iter().cloned());
-                    out.points.extend(tile.points.iter().copied());
+                    out.lines
+                        .extend(tile.lines.iter().filter(|l| keep(l.layer)).cloned());
+                    out.points
+                        .extend(tile.points.iter().filter(|p| keep(p.layer)).copied());
                 }
                 Err(e) => out.failed.push((id, e.to_string())),
             }

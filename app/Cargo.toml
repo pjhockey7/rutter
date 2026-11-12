@@ -19,5 +19,11 @@ egui.workspace = true
 
 log.workspace = true
 
+[dev-dependencies]
+# The worker tests drive it against the charts crate's own fixture, and
+# integration tests see only dev-dependencies.
+rutter-charts.workspace = true
+rutter-core.workspace = true
+
 [lints]
 workspace = true

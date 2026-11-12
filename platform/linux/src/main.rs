@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use rutter_app::{App, Sources};
+use rutter_app::{App, Position, Sources, Viewport};
 use rutter_charts::{ChartSource, ImagerySource};
 use rutter_render::{Frame, GuiFrame, Renderer};
 use rutter_tides::TideStations;
@@ -36,7 +36,7 @@ const KEY_PAN: f64 = 80.0;
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let (sources, draft_m) = match load_sources() {
+    let (sources, draft_m, opening) = match load_sources() {
         Ok(pair) => pair,
         Err(message) => {
             eprintln!("rutter: {message}");
@@ -58,6 +58,7 @@ fn main() {
 
     let mut platform = Platform {
         app: App::new(sources, draft_m),
+        opening,
         ..Platform::default()
     };
     if let Err(e) = event_loop.run_app(&mut platform) {
@@ -82,12 +83,21 @@ fn default_path(path: &str) -> Option<String> {
 /// Hand-parsed rather than with clap: there are four options, and a
 /// dependency that has to cross-compile to four Android ABIs should buy more
 /// than this.
-fn load_sources() -> Result<(Sources, Option<f64>), String> {
+/// Where to open, when `--at` or `--zoom` says so.
+#[derive(Debug, Clone, Copy, Default)]
+struct Opening {
+    at: Option<Position>,
+    zoom: Option<f64>,
+}
+
+fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
     let mut args = std::env::args().skip(1);
     let mut chart_path = None;
     let mut imagery_path = None;
     let mut tide_path = None;
     let mut draft_m = None;
+    let mut at = None;
+    let mut zoom = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -123,6 +133,29 @@ fn load_sources() -> Result<(Sources, Option<f64>), String> {
                 }
                 draft_m = Some(metres);
             }
+            // Where to open. Worth a flag for development: reproducing a
+            // performance or drawing problem means getting the view over
+            // the same water every time, and `fit_chart` lands wherever
+            // the chart's own extent happens to be.
+            "--at" => {
+                let text = args.next().ok_or("--at needs <lat>,<lon>")?;
+                let (lat, lon) = text
+                    .split_once(',')
+                    .ok_or_else(|| format!("expected --at <lat>,<lon>, got '{text}'"))?;
+                let lat: f64 = lat
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad latitude '{lat}'"))?;
+                let lon: f64 = lon
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad longitude '{lon}'"))?;
+                at = Some(Position::new(lat, lon));
+            }
+            "--zoom" | "-z" => {
+                let text = args.next().ok_or("--zoom needs a number")?;
+                zoom = Some(text.parse().map_err(|_| format!("bad zoom '{text}'"))?);
+            }
             "--help" | "-h" => {
                 println!("usage: rutter [--charts FILE] [--imagery FILE] [--tides FILE]");
                 println!("              [--draft METRES]");
@@ -131,6 +164,8 @@ fn load_sources() -> Result<(Sources, Option<f64>), String> {
                 println!("  --imagery  aerial photography, from `rutter imagery`");
                 println!("  --tides    tide stations, from `rutter tides`");
                 println!("  --draft    your draft in metres; switches on the under-keel check");
+                println!("  --at       open here, as <lat>,<lon>, instead of the chart centre");
+                println!("  --zoom     open at this zoom");
                 println!();
                 println!("The first three default to what those commands write:");
                 println!("  {DEFAULT_CHARTS}");
@@ -226,6 +261,7 @@ fn load_sources() -> Result<(Sources, Option<f64>), String> {
             tides,
         },
         draft_m,
+        Opening { at, zoom },
     ))
 }
 
@@ -240,6 +276,8 @@ struct Platform {
     /// zoom about the pointer rather than the centre.
     cursor: Option<(f64, f64)>,
     dragging: bool,
+    /// What `--at` and `--zoom` asked for, applied once on first resume.
+    opening: Opening,
 }
 
 /// egui's context plus its winit translator.
@@ -337,10 +375,16 @@ impl Platform {
         let frame = renderer.render_with_ui(&self.app.view, gui);
         let changed = self.app.apply(&actions, renderer);
 
-        log::debug!(
-            "frame: {:.1} ms total, {:.1} ms refresh",
-            started.elapsed().as_secs_f64() * 1000.0,
-            refreshed.as_secs_f64() * 1000.0
+        // The refresh figure is the one that matters: it is the work the
+        // frame does itself, as opposed to waiting for vsync. A chart
+        // decode happening on the worker should not appear in it at all.
+        let refresh_ms = refreshed.as_secs_f64() * 1000.0;
+        if refresh_ms > 4.0 {
+            log::debug!("slow frame: {refresh_ms:.1} ms of refresh");
+        }
+        log::trace!(
+            "frame: {:.1} ms total, {refresh_ms:.1} ms refresh",
+            started.elapsed().as_secs_f64() * 1000.0
         );
 
         if changed || wants_repaint {
@@ -393,7 +437,14 @@ impl ApplicationHandler for Platform {
         self.app.resize(size.width, size.height);
         // Open on the chart rather than on the hard-coded default, so that
         // passing --charts shows the data instead of empty sea next to it.
+        // `--at` and `--zoom` override it.
         self.app.fit_chart();
+        if let Some(at) = self.opening.at {
+            self.app.view.centre = at;
+        }
+        if let Some(zoom) = self.opening.zoom {
+            self.app.view.zoom = zoom.clamp(Viewport::MIN_ZOOM, Viewport::MAX_ZOOM);
+        }
 
         // pollster rather than tokio: this is the one await in the whole
         // program, and it happens once at startup.

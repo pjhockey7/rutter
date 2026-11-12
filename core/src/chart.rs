@@ -403,6 +403,16 @@ impl ChartStyle {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyledLine {
     pub style: ChartStyle,
+    /// Which of the tile's layers this came from, as an index into
+    /// `ChartTile::layer_names`.
+    ///
+    /// An index and not a name: there are thousands of features per tile and
+    /// a dozen-odd layers, so a `String` each would be the largest thing in
+    /// the structure. It exists so that showing and hiding a layer is a
+    /// filter at draw time rather than a reason to re-decode the tile —
+    /// toggling one used to throw away every decoded tile and re-triangulate
+    /// the whole viewport.
+    pub layer: u16,
     pub points: Vec<WorldXY>,
     /// The depth this line is about, where the chart gave one: a contour's
     /// own value, or a depth area's shallowest.
@@ -424,6 +434,8 @@ pub struct StyledLine {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyledArea {
     pub style: ChartStyle,
+    /// Which of the tile's layers this came from. See [`StyledLine::layer`].
+    pub layer: u16,
     /// The area's shallowest depth, for a depth area. See [`StyledLine`].
     pub value: Option<f64>,
     /// Triangles covering the region, holes already excluded.
@@ -435,6 +447,8 @@ pub struct StyledArea {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StyledPoint {
     pub style: ChartStyle,
+    /// Which of the tile's layers this came from. See [`StyledLine::layer`].
+    pub layer: u16,
     pub at: WorldXY,
     pub value: Option<f64>,
 }

@@ -460,7 +460,19 @@ impl Renderer {
             // Fifo is the only mode guaranteed everywhere, and vsync is what
             // you want when the alternative is burning battery to render a
             // chart that is not moving.
-            present_mode: wgpu::PresentMode::Fifo,
+            // Fifo is vsync: present blocks until the next refresh, which
+            // is what a chart on a battery wants.
+            //
+            // RUTTER_NO_VSYNC exists for measurement. With Fifo every frame
+            // reads as 16.6 ms whether the GPU is idle or nearly drowning,
+            // so it is impossible to tell a cheap frame from an expensive
+            // one — which is exactly the question when judging whether a
+            // new layer costs too much.
+            present_mode: if std::env::var_os("RUTTER_NO_VSYNC").is_some() {
+                wgpu::PresentMode::AutoNoVsync
+            } else {
+                wgpu::PresentMode::Fifo
+            },
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -1619,6 +1631,7 @@ mod tests {
     fn line(points: Vec<WorldXY>) -> StyledLine {
         StyledLine {
             style: ChartStyle::Coastline,
+            layer: 0,
             points,
             value: None,
         }
@@ -1627,6 +1640,7 @@ mod tests {
     fn point(at: WorldXY) -> StyledPoint {
         StyledPoint {
             style: ChartStyle::Sounding,
+            layer: 0,
             at,
             value: None,
         }

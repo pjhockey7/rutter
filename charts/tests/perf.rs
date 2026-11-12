@@ -104,3 +104,84 @@ fn a_tile_set_change_does_not_freeze_the_app() {
         );
     }
 }
+
+#[test]
+fn where_triangulation_time_goes() {
+    use rutter_charts::mbtiles::MbTiles;
+    use rutter_charts::mvt;
+    use rutter_core::chart::{TileId, WorldXY};
+    use rutter_core::triangulate::triangulate;
+
+    let Some(p) = chart() else {
+        eprintln!("no chart");
+        return;
+    };
+    let file = MbTiles::open(p).unwrap();
+    let max = file.metadata().max_zoom;
+    let n = f64::from(1u32 << max);
+    let lat = 32.6836_f64.to_radians();
+    let x = ((-117.2206 + 180.0) / 360.0 * n) as u32;
+    let y = ((1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
+
+    let mut polys: Vec<(Vec<WorldXY>, Vec<Vec<WorldXY>>)> = Vec::new();
+    for dx in 0..3u32 {
+        for dy in 0..3u32 {
+            let id = TileId {
+                z: max,
+                x: x + dx,
+                y: y + dy,
+            };
+            let Some(tile) = file.tile(id).unwrap() else {
+                continue;
+            };
+            for layer in &tile.layers {
+                if !matches!(layer.name.as_str(), "DEPARE" | "LNDARE" | "DRGARE") {
+                    continue;
+                }
+                let grid = f64::from(TileId::grid_size(id.z));
+                let extent = f64::from(layer.extent.max(1));
+                let w = |p: [i32; 2]| WorldXY {
+                    x: (f64::from(id.x) + f64::from(p[0]) / extent) / grid,
+                    y: (f64::from(id.y) + f64::from(p[1]) / extent) / grid,
+                };
+                for f in &layer.features {
+                    if let mvt::Geometry::Polygons(ps) = &f.geometry {
+                        for poly in ps {
+                            polys.push((
+                                poly.exterior.iter().copied().map(w).collect(),
+                                poly.holes
+                                    .iter()
+                                    .map(|h| h.iter().copied().map(w).collect())
+                                    .collect(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sizes: Vec<usize> = polys.iter().map(|(e, _)| e.len()).collect();
+    sizes.sort_unstable();
+    let total: usize = sizes.iter().sum();
+    let pct = |q: f64| sizes[((sizes.len() as f64 - 1.0) * q) as usize];
+
+    let t = Instant::now();
+    let mut tris = 0;
+    for (e, h) in &polys {
+        tris += triangulate(e, h).len();
+    }
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    println!(
+        "{} polygons, {total} points total: median ring {} pts, p90 {} pts, max {} pts",
+        polys.len(),
+        pct(0.5),
+        pct(0.9),
+        sizes[sizes.len() - 1]
+    );
+    println!(
+        "  -> {tris} triangles in {ms:.1} ms ({:.1} us/polygon)",
+        ms * 1000.0 / polys.len() as f64
+    );
+}
