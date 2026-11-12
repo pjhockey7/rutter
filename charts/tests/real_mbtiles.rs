@@ -850,43 +850,67 @@ fn reads_real_usgs_imagery() {
         meta.attribution
     );
 
-    // The tile over the mouth of San Diego Bay.
-    let id = TileId {
-        z: 13,
-        x: 1428,
-        y: 3308,
-    };
-    let tile = source
-        .tile(id)
-        .expect("decode")
-        .expect("that tile was downloaded");
-
-    assert_eq!(tile.id, id);
-    assert_eq!((tile.width, tile.height), (256, 256));
+    // A tile the file actually holds, at its deepest zoom.
+    //
+    // Was a hard-coded address at z13 over San Diego Bay, which broke the
+    // moment the in-app download replaced this file with a different area
+    // at a different zoom range. The address was never the point — what is
+    // being tested is that a stored tile decodes to a real image — so the
+    // test now asks the file what it has rather than assuming.
+    let addresses = source
+        .tiles_at(meta.max_zoom)
+        .expect("the file should list its tiles");
     assert!(
-        tile.is_consistent(),
-        "RGBA buffer length must match the size"
+        !addresses.is_empty(),
+        "a file with no tiles at its own maximum zoom"
     );
 
-    // Aerial imagery of a harbour is not a blank frame. A decoder that
-    // silently produced zeros would pass every structural check above.
-    let distinct: std::collections::HashSet<[u8; 3]> = tile
-        .rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|p| [p[0], p[1], p[2]])
-        .collect();
-    assert!(
-        distinct.len() > 100,
-        "only {} distinct colours — this does not look like a photograph",
-        distinct.len()
-    );
+    // Sampled rather than taken from the first address, and only *one*
+    // has to look like a photograph. A tile of open water really is a
+    // single colour — the first attempt at this picked the first address
+    // in the file, got mid-ocean, and failed for being right.
+    let mut examined = 0;
+    let mut photographic = 0;
+    for &id in addresses.iter().take(24) {
+        let Some(tile) = source.tile(id).expect("decode") else {
+            continue;
+        };
+        examined += 1;
 
-    // Every pixel opaque: these are JPEGs with no alpha.
+        assert_eq!(tile.id, id);
+        assert_eq!((tile.width, tile.height), (256, 256));
+        assert!(
+            tile.is_consistent(),
+            "RGBA buffer length must match the size"
+        );
+        // Not *fully* transparent. Full opacity would be wrong to
+        // require: a tile at the edge of the service's coverage is
+        // genuinely part imagery and part nothing, which is why it comes
+        // back as PNG where the interior is JPEG. What must never be
+        // stored is a tile with no picture at all.
+        assert!(
+            tile.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0),
+            "{id:?} is a fully transparent tile — a no-data response was stored"
+        );
+
+        let distinct: std::collections::HashSet<[u8; 3]> = tile
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| [p[0], p[1], p[2]])
+            .collect();
+        if distinct.len() > 100 {
+            photographic += 1;
+        }
+    }
+
+    assert!(examined > 0, "none of the listed tiles could be read");
+    // A decoder that silently produced zeros would pass every structural
+    // check above and fail here.
     assert!(
-        tile.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
-        "imagery should decode fully opaque"
+        photographic > 0,
+        "none of {examined} tiles looked like a photograph"
     );
 }
 

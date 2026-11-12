@@ -261,6 +261,21 @@ fn open_bundled_sources(app: &AndroidApp) -> Sources {
         // normal case: a phone's own GPS is the obvious position source,
         // and the panel can still be pointed at the boat's instruments.
         gps: Some(rutter_app::DeviceGps::new(gps::open)),
+        fetcher: match rutter_fetch::Https::new() {
+            Ok(https) => Some(std::sync::Arc::new(https)),
+            Err(e) => {
+                log::error!("no tile fetcher: {e}");
+                None
+            }
+        },
+        // Downloads go into the app's own data directory — the one place a
+        // sandboxed app may write.
+        //
+        // The same file the bundled imagery was extracted to, because a
+        // download now *adds* to what is there rather than replacing it:
+        // fetching a harbour tops up the coverage the package shipped
+        // with instead of competing with it.
+        imagery_out: app.internal_data_path().map(|dir| dir.join(IMAGERY_ASSET)),
     }
 }
 

@@ -6,6 +6,7 @@ members = [
 	"charts",
 	"tides",
 	"render",
+	"fetch",
 	"platform/linux",
 	"platform/android",
 ]
@@ -29,6 +30,7 @@ rutter-charts = { path = "charts" }
 rutter-tides = { path = "tides" }
 rutter-render = { path = "render" }
 rutter-app = { path = "app" }
+rutter-fetch = { path = "fetch" }
 
 wgpu = "30.0"
 winit = "0.30"

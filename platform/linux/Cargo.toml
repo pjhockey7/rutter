@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 rutter-app.workspace = true
+# The HTTPS tile fetcher. Linked here rather than in rutter-app so the TLS
+# stack stays a platform's choice — see rutter_app::download.
+rutter-fetch.workspace = true
 rutter-charts.workspace = true
 rutter-render.workspace = true
 rutter-tides.workspace = true

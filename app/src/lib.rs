@@ -26,6 +26,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod charts;
+pub mod download;
 pub mod nmea;
 mod serial;
 pub use charts::ChartWorker;
@@ -37,9 +38,9 @@ use rutter_core::nmea::Vessel;
 use rutter_core::tide::{CurrentKind, CurrentStation, Kind, Station};
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{
-    Action, CurrentState, DownloadState, DraftState, FieldPatch, ImageryState, LayerEntry, Overlay,
-    PanelState, Renderer, TemperatureState, TideMarker, TideReading, TideState, TimeState, Ui,
-    VesselState, WindState,
+    Action, CurrentState, DownloadProgress, DownloadState, DraftState, FieldPatch, ImageryState,
+    LayerEntry, Overlay, PanelState, Renderer, TemperatureState, TideMarker, TideReading,
+    TideState, TimeState, Ui, VesselState, WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -50,6 +51,7 @@ use rutter_tides::TideStations;
 // Re-exported for the platform shims. They need a position and a viewport to
 // translate input into, and reaching past this crate to `rutter-core` for
 // them would make the layering a suggestion rather than a rule.
+pub use download::{Downloader, FetchOutcome, Job as DownloadJob, Progress, Stage, TileFetcher};
 pub use nmea::{DeviceGps, Endpoint as NmeaEndpoint, FixSource};
 pub use rutter_core::nmea::Fix;
 pub use rutter_core::weather::Forecast;
@@ -214,6 +216,8 @@ struct Download {
     area: Option<(LatLon, LatLon)>,
     min_zoom: u8,
     max_zoom: u8,
+    /// Where to write it.
+    out: std::path::PathBuf,
 }
 
 impl Default for Download {
@@ -225,6 +229,7 @@ impl Default for Download {
             // out a slipway.
             min_zoom: 6,
             max_zoom: 16,
+            out: std::path::PathBuf::from(DEFAULT_IMAGERY_OUT),
         }
     }
 }
@@ -238,6 +243,29 @@ impl Default for Download {
 /// two gigabytes onto a phone.
 const IMAGERY_TILE_BYTES: u64 = 26_000;
 const CHART_TILE_BYTES: u64 = 1_400;
+
+/// Where the imagery comes from.
+///
+/// USGS's own basemap, and the same endpoint `rutter imagery` fetches from
+/// so a file built on the boat and one built on a desktop are
+/// interchangeable. Row before column — `{y}` then `{x}` — because that is
+/// what the ArcGIS REST tile endpoint takes, and getting it the other way
+/// round returns a plausible tile of the wrong place.
+///
+/// Public domain, and chosen partly for that: Google and Bing forbid
+/// caching outright, and Esri's World Imagery permits it only under terms
+/// a boat with no signal cannot rely on.
+const IMAGERY_TILES: &str = "https://basemap.nationalmap.gov/arcgis/rest/services\
+/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}";
+
+/// The credit the file carries. Not required by the licence; shown anyway.
+const IMAGERY_CREDIT: &str = "Imagery: USGS National Map / USDA NAIP (public domain)";
+
+/// Where a download writes, when nothing says otherwise.
+///
+/// Beside the other data files on a desktop. A platform with somewhere
+/// better — an Android app's own data directory — sets it instead.
+const DEFAULT_IMAGERY_OUT: &str = "build/charts/imagery.mbtiles";
 
 /// How far a vector chart is worth tiling, when none is open to ask.
 ///
@@ -291,6 +319,16 @@ pub struct Sources {
     /// Where to read NMEA 0183 from, if anywhere. Parsed by the platform
     /// from its own command line, because that is the layer that has one.
     pub nmea: Option<nmea::Endpoint>,
+    /// How to fetch a tile over the network, where the platform offers a
+    /// way. `None` means the download tool can cost an area but not get
+    /// it, and the panel says so.
+    pub fetcher: Option<std::sync::Arc<dyn download::TileFetcher>>,
+    /// Where a download should write its MBTiles file.
+    ///
+    /// A platform's business, because it is the one thing here that is a
+    /// filesystem question: a desktop writes beside its other data and a
+    /// sandboxed app has exactly one directory it may write to.
+    pub imagery_out: Option<std::path::PathBuf>,
     /// How to open the device's own GPS, where the platform has one.
     ///
     /// Used when no `nmea` address was given, and reachable from the panel
@@ -396,6 +434,16 @@ pub struct App {
     /// The device's own GPS, kept so the panel can switch back to it after
     /// a network feed has been tried.
     gps: Option<nmea::DeviceGps>,
+
+    /// How to fetch tiles, if this platform can.
+    fetcher: Option<std::sync::Arc<dyn download::TileFetcher>>,
+    /// The download in progress, if any. One at a time on purpose: two at
+    /// once would compete for the same slow link and finish later than
+    /// running them in turn.
+    downloading: Option<download::Downloader>,
+    /// Where a finished download left its file, so the panel can say what
+    /// to do next.
+    downloaded: Option<String>,
     /// Why there is no feed, when the reason was a bad address typed into
     /// the panel. Worth keeping: an address that will not parse is the
     /// most likely failure and the least self-explanatory.
@@ -455,6 +503,13 @@ impl App {
                 (None, None) => None,
             },
             gps: sources.gps,
+            fetcher: sources.fetcher,
+            download: Download {
+                out: sources
+                    .imagery_out
+                    .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_IMAGERY_OUT)),
+                ..Download::default()
+            },
             // On whenever there is a feed, for the same reason the other
             // layers are: the point of connecting one is to see the boat.
             vessel_visible: true,
@@ -573,6 +628,7 @@ impl App {
         // Before anything else: a new fix can move the view, and the tile
         // set, the tide station and the overlay all follow from the view.
         self.poll_nmea();
+        self.poll_download();
         // Then: the chart refresh reads the tide window to colour the
         // under-keel check, so a stale cache would colour against last
         // second's tide.
@@ -1024,6 +1080,132 @@ impl App {
         }
     }
 
+    /// Take whatever the download has reported.
+    ///
+    /// Public for the same reason [`Self::refresh_tide_cache`] is: it is
+    /// called every frame by `refresh`, and anything that wants the
+    /// download without a renderer needs a way in.
+    ///
+    /// Also notices when one finishes, and reopens the imagery so the
+    /// tiles just fetched appear without a restart — which is most of the
+    /// point of fetching them on the device.
+    pub fn poll_download(&mut self) {
+        let Some(downloading) = &mut self.downloading else {
+            return;
+        };
+        if !downloading.poll() {
+            return;
+        }
+
+        let progress = downloading.progress().clone();
+        if !progress.finished() {
+            return;
+        }
+
+        let part = downloading.job().out.clone();
+        let target = self.download.out.clone();
+        let stored = progress.stored;
+        self.downloading = None;
+
+        if stored == 0 {
+            // Nothing to fold in, and a stray part file left behind would
+            // be mistaken for a resumable download later.
+            let _ = std::fs::remove_file(&part);
+            return;
+        }
+
+        // The reader has to let go before the merge: both files are
+        // SQLite and the target is the one this has open. Dropped here
+        // rather than at the start of the download so the imagery stays
+        // on screen for the whole of it.
+        self.imagery = None;
+        self.imagery_loaded.clear();
+
+        if let Err(e) = rutter_charts::mbtiles::merge(&part, &target) {
+            log::error!("merging {} into {}: {e}", part.display(), target.display());
+            self.downloaded = Some(format!("could not merge the download: {e}"));
+            return;
+        }
+
+        let path = target;
+
+        // Opened straight away. A download that needs the app restarted
+        // before it shows anything would feel broken however well it
+        // worked.
+        match ImagerySource::open(&path) {
+            Ok(source) => {
+                let (lowest, highest) = {
+                    let meta = source.metadata();
+                    (meta.min_zoom, meta.max_zoom)
+                };
+                log::info!(
+                    "imagery: reopened {} — zoom {lowest}..{highest}",
+                    path.display()
+                );
+                self.imagery = Some(source);
+                self.imagery_visible = true;
+                // The residency list describes tiles from a file that is
+                // no longer the open one.
+                self.imagery_loaded.clear();
+                self.downloaded = Some(format!(
+                    "added {} tiles — now z{lowest}..{highest}",
+                    thousands(stored as u64)
+                ));
+            }
+            Err(e) => {
+                log::error!("{}: {e}", path.display());
+                self.downloaded = Some(format!("{}: {e}", path.display()));
+            }
+        }
+    }
+
+    /// Start fetching the marked area. False if there is nothing to fetch
+    /// or no way to fetch it.
+    pub fn start_download(&mut self) -> bool {
+        let (Some(area), Some(fetcher)) = (self.download.area, self.fetcher.clone()) else {
+            return false;
+        };
+        if self.downloading.is_some() {
+            return false;
+        }
+
+        // Written beside the real file, never into it. A download that
+        // wrote straight to the imagery you already have destroys it —
+        // fetching one harbour would wipe a whole coast, which is exactly
+        // what happened the first time this ran. The part file is folded
+        // in when it finishes, so coverage accumulates.
+        let job = download::Job {
+            area,
+            min_zoom: self.download.min_zoom,
+            max_zoom: self.download.max_zoom,
+            out: part_file(&self.download.out),
+            url_template: IMAGERY_TILES.to_owned(),
+            name: "USGS imagery".to_owned(),
+            attribution: Some(IMAGERY_CREDIT.to_owned()),
+            format: "jpg".to_owned(),
+        };
+
+        self.downloaded = None;
+        self.downloading = download::Downloader::start(job, fetcher);
+        self.downloading.is_some()
+    }
+
+    /// Stop the download in progress.
+    pub fn cancel_download(&mut self) {
+        if let Some(downloading) = &self.downloading {
+            downloading.cancel();
+        }
+    }
+
+    /// Whether an imagery file is open at all.
+    ///
+    /// Exposed because the only other route to it is `panel_state`, which
+    /// needs a renderer — and whether a finished download opened what it
+    /// fetched is worth being able to check without a GPU.
+    pub fn panel_imagery_available(&self) -> bool {
+        self.imagery.is_some()
+    }
+
     /// Mark what is on screen as the area to fetch.
     pub fn mark_view_for_download(&mut self) {
         self.download.area = Some(self.view.bounds());
@@ -1057,9 +1239,40 @@ impl App {
             min_zoom: self.download.min_zoom.clamp(limits.0, limits.1),
             max_zoom: self.download.max_zoom.clamp(limits.0, limits.1),
             zoom_limits: limits,
-            // Not yet: fetching imagery here needs an HTTP client in the
-            // build, and fetching charts needs an S-57 reader as well.
-            in_app: false,
+            // Imagery can be fetched wherever a platform supplied a
+            // fetcher. Charts cannot anywhere: they need GDAL and
+            // tippecanoe, so the command is still the route for those.
+            in_app: self.fetcher.is_some(),
+            progress: self.downloading.as_ref().map(|d| {
+                let p = d.progress();
+                DownloadProgress {
+                    fraction: p.fraction(),
+                    counted: format!(
+                        "{} of {} tiles",
+                        thousands(p.done as u64),
+                        thousands(p.total as u64)
+                    ),
+                    stage: match &p.stage {
+                        download::Stage::Preparing => "preparing".to_owned(),
+                        download::Stage::Fetching { zoom } => format!("fetching zoom {zoom}"),
+                        download::Stage::Finishing => "writing the file".to_owned(),
+                        download::Stage::Done => "done".to_owned(),
+                        download::Stage::Cancelled => "stopped".to_owned(),
+                        download::Stage::Failed(why) => why.clone(),
+                    },
+                    size: bytes_roughly(p.bytes),
+                    // Only when there are any, and separately: a download
+                    // over open water is mostly missing tiles and that is
+                    // correct, while a climbing failure count is the
+                    // network rather than the coverage.
+                    missing: (p.missing > 0)
+                        .then(|| format!("{} with no imagery", thousands(p.missing as u64))),
+                    failed: (p.failed > 0)
+                        .then(|| format!("{} failed", thousands(p.failed as u64))),
+                    running: !p.finished(),
+                }
+            }),
+            outcome: self.downloaded.clone(),
             ..DownloadState::default()
         };
 
@@ -1535,6 +1748,13 @@ impl App {
                     self.set_download_zoom(*min, *max);
                     touched = true;
                 }
+                Action::StartDownload => {
+                    touched |= self.start_download();
+                }
+                Action::CancelDownload => {
+                    self.cancel_download();
+                    touched = true;
+                }
                 // Neither of these touches the geometry any more: the
                 // charted depth is in the vertex and the boat is in a
                 // uniform, so switching the check on or changing the draft
@@ -1619,7 +1839,9 @@ impl App {
                 | Action::SetTimeLinked(_)
                 | Action::UseViewAsDownloadArea
                 | Action::ClearDownloadArea
-                | Action::SetDownloadZoom(..) => {}
+                | Action::SetDownloadZoom(..)
+                | Action::StartDownload
+                | Action::CancelDownload => {}
             }
         }
 
@@ -2159,6 +2381,17 @@ fn imagery_plan(loaded: &[chart::TileId], wanted: &[chart::TileId]) -> ImageryPl
     } else {
         ImageryPlan::Upload
     }
+}
+
+/// Where a download writes before it is folded into the real file.
+///
+/// Beside the target rather than in a temporary directory, so the merge is
+/// a rename-speed operation on the same filesystem and so an interrupted
+/// download leaves its part file somewhere findable.
+fn part_file(target: &std::path::Path) -> std::path::PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    target.with_file_name(name)
 }
 
 /// How many tiles cover a box across a range of zooms.
@@ -2809,6 +3042,8 @@ mod tests {
                 weather: None,
                 nmea: None,
                 gps: None,
+                fetcher: None,
+                imagery_out: None,
             },
             None,
         );
@@ -2863,6 +3098,8 @@ mod tests {
                 weather: None,
                 nmea: None,
                 gps: None,
+                fetcher: None,
+                imagery_out: None,
             },
             None,
         );

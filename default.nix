@@ -1322,6 +1322,25 @@ print('%.4f,%.4f,%.4f,%.4f' % (
         fi
         ;;
 
+      # ── What is in a tile file, and getting rid of what is not wanted ──
+      #
+      # A download marks a rectangle on screen, and a rectangle reaches
+      # inland. Marking a zoomed-out view once fetched 617 MB across
+      # twenty-three degrees of longitude, most of it desert.
+      tiles)
+        shift
+        if [ $# -eq 0 ]; then
+          echo "usage: rutter tiles <file.mbtiles> [--box s,w,n,e] [--zoom min,max] [--blanks] [--dry-run]" >&2
+          echo >&2
+          echo "  rutter tiles build/charts/imagery.mbtiles" >&2
+          echo "  rutter tiles build/charts/imagery.mbtiles --box 32.4,-118.8,33.8,-117.0" >&2
+          echo >&2
+          echo "With no flags it only reports. Close the app first." >&2
+          exit 64
+        fi
+        exec cargo run -q -p rutter-charts --example tiles -- "$@"
+        ;;
+
       # ── A boat, for when there is not one ─────────────────────────────
       #
       # The GPS path cannot be checked by a unit test alone: "is the marker
@@ -1507,7 +1526,13 @@ print('%.4f,%.4f,%.4f,%.4f' % (
           echo 'BEGIN;'
           while read -r z x y row; do
             f="$work/$z-$x-$y.jpg"
-            if [ -s "$f" ]; then
+            # Checked for being a JPEG, not merely for existing. The
+            # endpoint answers an area it has no imagery of with HTTP 200
+            # and an 872-byte transparent PNG rather than a 404, so curl's
+            # -f never sees it and a download over open water fills the
+            # file with blanks that are counted as successes. Half the
+            # tiles of one real download were these.
+            if [ -s "$f" ] && [ "$(head -c 3 "$f" | od -An -tx1 | tr -d ' ')" = "ffd8ff" ]; then
               printf "INSERT OR REPLACE INTO tiles VALUES (%s, %s, %s, readfile('%s'));\n" "$z" "$x" "$row" "$f"
               got=$((got + 1))
             else
@@ -1593,6 +1618,7 @@ print('%.4f,%.4f,%.4f,%.4f' % (
           '  tides        fetch NOAA tide and tidal-current constituents' \
           '  weather      fetch a GFS wind and temperature forecast' \
           '  nmea         send a synthetic GPS feed, to test without a boat' \
+          '  tiles        what is in a tile file, and trim what you do not want' \
           '  fmt          cargo fmt' \
           '  lint         cargo clippy' \
           '  adb          pass through to the SDK'"'"'s adb' \

@@ -16,7 +16,7 @@ time slider driving all of the above · NMEA 0183 over TCP, UDP and serial ·
 phone GPS through JNI · own-ship marker with course and heading · follow mode
 · Linux and Android builds · a portable glibc 2.17 binary.
 
-354 tests, clippy and fmt clean on host and `aarch64-linux-android`.
+375 tests, clippy and fmt clean on host and `aarch64-linux-android`.
 
 ## Tier 1 — not a plotter without these
 
@@ -89,20 +89,34 @@ today and the app does not.
 The pipeline runs on a desktop with GDAL and tippecanoe, which is why the
 boat cannot fetch its own charts.
 
-- [ ] **Download tool: fetch the marked area in-app.** Half done. The Tools
-      tab marks the current view as an area, reports its span in miles and
-      estimates the tiles and bytes per zoom range — a 22 × 12 nmi box is
-      5,038 imagery tiles at about 125 MB, against 40 chart tiles at 0.1 MB
-      — and prints the exact `rutter` commands to run. What is missing is
-      the fetching itself: there is no HTTP client in the build at all (no
-      TLS stack anywhere in the tree), so that is a real dependency decision
-      before imagery can be pulled on the device. Vector charts additionally
-      need the S-57 reader below.
+- [x] **Download tool: fetch the marked area in-app.** Done for imagery.
+      The Tools tab marks the current view, reports its span in miles,
+      estimates tiles and bytes per zoom range — a 22 × 12 nmi box is 5,038
+      imagery tiles at about 125 MB, against 40 chart tiles at 0.1 MB — then
+      fetches it with a progress bar, a Stop button, and reopens the result
+      so the new imagery appears without a restart.
 
-      The area is the viewport, marked with a button, rather than a box
-      dragged on the chart — it needs no new input plumbing in either
-      platform shim and cannot produce a degenerate box. Drag-to-select is
-      worth adding later for marking an area you are not looking at.
+      Fetching goes through `TileFetcher`, a trait in `rutter-app`, with the
+      HTTPS implementation isolated in its own `rutter-fetch` crate: `ureq`
+      with rustls pinned to the `ring` provider, which cross-compiles for
+      Android as it stands. Swapping Android to `HttpsURLConnection` over
+      JNI later — for the device's own certificate store, and to survive a
+      marina's captive portal — is one trait impl and touches nothing else.
+
+      The area is the viewport, marked with a button or the `m` key, rather
+      than a box dragged on the chart: no new input plumbing in either
+      platform shim and no way to produce a degenerate box. Drag-to-select
+      is still worth adding for marking an area you are not looking at.
+
+      Downloads **add** to the imagery you have rather than replacing it:
+      the fetch writes a `.part` file and merges it in, widening the zoom
+      range and bounds. The first version wrote straight to the open file
+      and destroyed 35 MB of harbour detail the first time it ran.
+
+      Still missing: **vector charts**, which need the S-57 reader below —
+      the Tools tab prints the `rutter noaa` command for those. And
+      **resuming**: a download creates its part file fresh, so a cancelled
+      one re-fetches rather than filling in its gaps.
 
 - [ ] **S-57 reader and MVT encoder in Rust.** The keystone. Drops GDAL and
       tippecanoe from the pipeline, and is the only thing that makes in-app
@@ -141,8 +155,16 @@ trusted.
 - [ ] **Imagery decode off the main thread.** JPEG decoding still happens in
       the frame. The chart worker already shows the pattern to copy.
 
+- [ ] **Trim downloads from inside the app.** `rutter tiles` does it from
+      the command line — report by zoom, trim to a box, drop blanks, with a
+      `--dry-run` — but a download marks a rectangle on a screen and a
+      rectangle reaches inland, so the place to undo that is next to the
+      button that did it.
+
 - [ ] **More than one chart and one imagery file.** One of each is open at a
-      time, so coverage cannot be built up in pieces as you cruise.
+      time, so coverage cannot be built up in pieces as you cruise — and an
+      in-app download now has to write a whole new file rather than adding
+      to what is there, which makes this matter more than it did.
 
 - [ ] **Search by name.** No way to find a harbour, a buoy or a tide station
       except by panning to it.

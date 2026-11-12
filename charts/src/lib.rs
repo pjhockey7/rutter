@@ -36,6 +36,7 @@ pub mod imagery;
 pub mod mbtiles;
 pub mod mvt;
 
+pub use imagery::is_blank_tile;
 pub use imagery::ImagerySource;
 pub use mbtiles::{MbTiles, Metadata};
 

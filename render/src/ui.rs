@@ -78,6 +78,10 @@ pub enum Action {
     ClearDownloadArea,
     /// Change the zoom range to fetch, as `(min, max)`.
     SetDownloadZoom(u8, u8),
+    /// Start fetching the marked area.
+    StartDownload,
+    /// Stop the download in progress.
+    CancelDownload,
     /// How strongly the temperature wash is painted, 0..1.
     SetTemperatureOpacity(f32),
     /// Look at a time this many seconds from now. Zero is now.
@@ -137,9 +141,38 @@ pub struct DownloadState {
     pub chart_estimate: Option<String>,
     /// The commands that would do it, ready to be typed.
     pub commands: Vec<String>,
-    /// Whether the app can do the fetching itself yet. False for now, and
-    /// the panel says why rather than offering a button that does nothing.
+    /// Whether this platform can fetch. False means the commands below
+    /// are the only route, and the panel says so rather than offering a
+    /// button that does nothing.
     pub in_app: bool,
+    /// The download in progress: how far along, and what to call it.
+    ///
+    /// `None` when nothing is running — which is not the same as nothing
+    /// having run, see `outcome`.
+    pub progress: Option<DownloadProgress>,
+    /// What the last finished download came to, once it is over.
+    pub outcome: Option<String>,
+}
+
+/// A download in flight, as the panel needs it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DownloadProgress {
+    /// 0 to 1.
+    pub fraction: f32,
+    /// "1,284 of 5,038 tiles", already counted and separated.
+    pub counted: String,
+    /// What it is doing: "fetching zoom 16", "writing the file".
+    pub stage: String,
+    /// Bytes so far, in a readable unit.
+    pub size: String,
+    /// Tiles the service had none of, and tiles that failed. Shown only
+    /// when non-zero, and separately, because "no imagery there" and
+    /// "the network is failing" are different problems.
+    pub missing: Option<String>,
+    pub failed: Option<String>,
+    /// Whether it is still going. False once it has stopped, however it
+    /// stopped — the bar stays on screen showing the final state.
+    pub running: bool,
 }
 
 /// What the panel knows about the air temperature.
@@ -415,20 +448,12 @@ pub enum Tab {
     Water,
     /// Wind and air temperature.
     Weather,
-    /// Fetching more chart, and in time routes and tracks.
-    Tools,
 }
 
 impl Tab {
     /// In the order they appear, which is roughly how often they are
     /// wanted: the boat first, the tools last.
-    const ALL: [Self; 5] = [
-        Self::Boat,
-        Self::Chart,
-        Self::Water,
-        Self::Weather,
-        Self::Tools,
-    ];
+    const ALL: [Self; 4] = [Self::Boat, Self::Chart, Self::Water, Self::Weather];
 
     /// Plain words, not icon glyphs. egui's default font covers Latin text
     /// and little else, so an anchor or a cloud renders as an empty box —
@@ -439,7 +464,6 @@ impl Tab {
             Self::Chart => "Chart",
             Self::Water => "Water",
             Self::Weather => "Weather",
-            Self::Tools => "Tools",
         }
     }
 
@@ -449,7 +473,6 @@ impl Tab {
             Self::Chart => "Aerial imagery and the chart's own layers",
             Self::Water => "Tide heights and tidal currents",
             Self::Weather => "Wind and air temperature",
-            Self::Tools => "Download more chart for an area",
         }
     }
 }
@@ -483,6 +506,11 @@ pub struct Ui {
     nmea_seeded: bool,
     /// Which tab is showing.
     tab: Tab,
+    /// Whether the tools panel is open. Its own panel on the opposite
+    /// side, so it can be watched while the layers are adjusted — a
+    /// download runs for minutes and you should not have to close it to
+    /// turn the imagery on.
+    tools_open: bool,
 }
 
 /// A short, readable name for a style group.
@@ -575,6 +603,13 @@ impl Ui {
                     self.open = !self.open;
                 }
                 if ui
+                    .selectable_label(self.tools_open, "Tools")
+                    .on_hover_text("Download chart and imagery for an area")
+                    .clicked()
+                {
+                    self.tools_open = !self.tools_open;
+                }
+                if ui
                     .button("Fit")
                     .on_hover_text("Centre on the chart")
                     .clicked()
@@ -599,6 +634,20 @@ impl Ui {
                 ui.label(status);
             });
         });
+
+        // Tools in a panel of its own, on the other side. It is not a
+        // layer and does not belong behind a button called Layers —
+        // downloading a chart is something you do *to* the app rather than
+        // a thing drawn on it.
+        if self.tools_open {
+            egui::Panel::right("tools")
+                .default_size(300.0)
+                .show(root, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        actions.extend(Self::tools_section(ui, download));
+                    });
+                });
+        }
 
         // The time strip, always visible. It is not a setting tucked in a
         // panel: it changes what every other layer is claiming, and a
@@ -648,9 +697,6 @@ impl Ui {
                         actions.extend(Self::wind_section(ui, wind));
                         ui.separator();
                         actions.extend(Self::temperature_section(ui, temperature));
-                    }
-                    Tab::Tools => {
-                        actions.extend(Self::tools_section(ui, download));
                     }
                 }
             });
@@ -727,10 +773,64 @@ impl Ui {
         }
 
         if download.in_app {
-            // Not reachable yet; the state says so rather than this hiding
-            // the possibility.
+            ui.add_space(6.0);
+            match &download.progress {
+                Some(progress) => {
+                    ui.add(
+                        egui::ProgressBar::new(progress.fraction)
+                            .text(progress.counted.clone())
+                            .animate(progress.running),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&progress.stage).weak().small());
+                        ui.label(egui::RichText::new(&progress.size).weak().small());
+                    });
+                    // Both counts, and only when they are not zero: a
+                    // download over open water is mostly missing tiles and
+                    // that is correct, while a climbing failure count
+                    // means the network rather than the coverage.
+                    for line in [&progress.missing, &progress.failed].into_iter().flatten() {
+                        ui.label(egui::RichText::new(line).weak().small());
+                    }
+                    if progress.running && ui.button("Stop").clicked() {
+                        actions.push(Action::CancelDownload);
+                    }
+                }
+                None => {
+                    if ui
+                        .button("Download")
+                        .on_hover_text(
+                            "Fetches the imagery for this area and opens it \
+                             when it is done. Stoppable at any point, and \
+                             what has been fetched is kept.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(Action::StartDownload);
+                    }
+                }
+            }
+            if let Some(outcome) = &download.outcome {
+                ui.label(egui::RichText::new(outcome).weak().small());
+            }
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Fetching is not wired up here yet.").weak());
+            ui.label(
+                egui::RichText::new("Charts still need the desktop pipeline:")
+                    .weak()
+                    .small(),
+            )
+            .on_hover_text(
+                "Imagery is pre-rendered tiles over HTTPS, so it can be \
+                 fetched here. Vector charts come from S-57 cells through \
+                 GDAL and tippecanoe, which are not on a phone.",
+            );
+            for command in download.commands.iter().filter(|c| c.contains("noaa")) {
+                ui.add(
+                    egui::TextEdit::singleline(&mut command.clone())
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+            }
         } else {
             ui.add_space(6.0);
             ui.label(
@@ -2203,7 +2303,17 @@ mod font_tests {
                 "rutter imagery --box 32.4000,-118.8000,33.8000,-117.0000 --min-zoom 6 --zoom 16"
                     .to_owned(),
             ],
-            in_app: false,
+            in_app: true,
+            progress: Some(DownloadProgress {
+                fraction: 0.37,
+                counted: "1,862 of 5,038 tiles".to_owned(),
+                stage: "fetching zoom 16".to_owned(),
+                size: "46 MB".to_owned(),
+                missing: Some("214 with no imagery".to_owned()),
+                failed: None,
+                running: true,
+            }),
+            outcome: None,
         }
     }
 

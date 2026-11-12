@@ -15,6 +15,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rutter-app.workspace = true
+# The HTTPS tile fetcher. Cross-compiles for every Android ABI with
+# rustls pinned to `ring`; swapping it for `HttpsURLConnection` over JNI
+# is a `TileFetcher` impl away if the device's own certificate store or a
+# marina's captive portal ever demands it.
+rutter-fetch.workspace = true
 rutter-charts.workspace = true
 rutter-render.workspace = true
 rutter-tides.workspace = true

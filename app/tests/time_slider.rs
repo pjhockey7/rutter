@@ -40,6 +40,8 @@ fn with_stations() -> Option<App> {
             weather: None,
             nmea: None,
             gps: None,
+            fetcher: None,
+            imagery_out: None,
         },
         Some(2.0),
     ))

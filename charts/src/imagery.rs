@@ -30,6 +30,40 @@ pub struct ImagerySource {
     capacity: usize,
 }
 
+/// Whether a tile carries no picture at all.
+///
+/// A tile service answers an area it has no imagery for in one of two
+/// ways. A 404 is the easy case. The other — which the USGS endpoint
+/// uses — is **HTTP 200 with a fully transparent image**, and that one is
+/// invisible: it stores, it decodes, it draws nothing, and it counts as a
+/// success. One real download stored 6,150 of them.
+///
+/// The test is exactly "is every pixel fully transparent", and it has to
+/// be, because the obvious shortcuts are both wrong:
+///
+/// * **Size** does not separate them. The blanks are 872 bytes and the
+///   smallest real tile measured is 2,010 — a ten-byte margin.
+/// * **Format** does not either. Real tiles at the edge of coverage are
+///   PNG precisely *because* they are part imagery and part transparent,
+///   and a jpeg-only rule discarded 848 of them.
+///
+/// Only called for formats that can carry alpha; a JPEG cannot be blank
+/// in this sense and is never decoded for it.
+pub fn is_blank_tile(bytes: &[u8]) -> bool {
+    // JPEG has no alpha channel, so it always carries something.
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return false;
+    }
+
+    let Ok(image) = image::load_from_memory(bytes) else {
+        // Undecodable is not blank — it is broken, and the caller counts
+        // that differently.
+        return false;
+    };
+    let rgba = image.to_rgba8();
+    rgba.pixels().all(|p| p.0[3] == 0)
+}
+
 impl ImagerySource {
     /// Decoded tiles held in memory. See the note on `cache`.
     pub const DEFAULT_CAPACITY: usize = 64;
@@ -59,6 +93,16 @@ impl ImagerySource {
 
     pub fn metadata(&self) -> &Metadata {
         self.file.metadata()
+    }
+
+    /// Every tile address the file holds at a zoom level.
+    ///
+    /// Passed through from the underlying file. Useful for reporting what
+    /// a download actually got, and for tests that should ask what is in
+    /// a file rather than assume — a hard-coded tile address stops being
+    /// true the first time the file is rebuilt over a different area.
+    pub fn tiles_at(&self, zoom: u8) -> Result<Vec<TileId>, mbtiles::Error> {
+        self.file.tiles_at(zoom)
     }
 
     pub fn clamp_zoom(&self, zoom: u8) -> u8 {

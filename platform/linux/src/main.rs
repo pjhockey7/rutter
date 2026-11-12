@@ -205,6 +205,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  [ and ]         step the shown time by 30 minutes");
                 println!("  n               back to now");
                 println!("  i               show or hide the aerial imagery");
+                println!("  m               mark this view for download (Tools tab)");
                 println!("  Escape          quit");
                 std::process::exit(0);
             }
@@ -312,6 +313,21 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
             tides,
             weather,
             nmea,
+            // The HTTPS fetcher, so the Tools tab can actually download.
+            // A failure here is not fatal: everything else works, and the
+            // panel shows the download as unavailable rather than the app
+            // refusing to start.
+            fetcher: match rutter_fetch::Https::new() {
+                Ok(https) => Some(std::sync::Arc::new(https)),
+                Err(e) => {
+                    eprintln!("rutter: no tile fetcher — {e}");
+                    None
+                }
+            },
+            // Default: beside the other data files. The download
+            // replaces whatever is there, which on a desktop is what you
+            // want — `rutter imagery` does the same.
+            imagery_out: None,
             // Linux has no system location service worth the name:
             // GeoClue is a D-Bus daemon that mostly asks Mozilla where
             // your WiFi is, which is not navigation. A GPS on a laptop is
@@ -645,6 +661,16 @@ impl ApplicationHandler for Platform {
                     // The imagery, which is the layer most often wanted
                     // off and on: a photograph is wonderful for finding a
                     // slipway and in the way when reading soundings.
+                    // Marking the view for download. Deliberately *not*
+                    // bound to starting one: a keystroke that begins a
+                    // hundred-megabyte transfer is not a keystroke anyone
+                    // wants to hit by accident. The Tools tab has the
+                    // button, with the size written next to it.
+                    Key::Character("m" | "M") => {
+                        self.app.mark_view_for_download();
+                        log::info!("marked this view for download — see the Tools tab");
+                        changed = true;
+                    }
                     Key::Character("i" | "I") => {
                         let on = self.app.toggle_imagery();
                         log::info!("imagery {}", if on { "on" } else { "off" });

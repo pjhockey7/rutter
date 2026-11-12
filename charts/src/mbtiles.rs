@@ -110,12 +110,15 @@ pub enum Error {
     NotRaster(String),
     /// A raster tile would not decode.
     Image(image::ImageError),
+    /// A file could not be created or removed. Only writing can hit this.
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Database(e) => write!(f, "{e}"),
+            Self::Io(e) => write!(f, "{e}"),
             Self::NotMbTiles(what) => {
                 write!(f, "not an MBTiles file: no {what}")
             }
@@ -304,6 +307,298 @@ impl MbTiles {
             .query_row("SELECT count(*) FROM tiles", [], |r| r.get(0))?;
         Ok(n as u64)
     }
+}
+
+/// Writing an MBTiles file, a tile at a time.
+///
+/// Reading has always been here; writing arrived when the app grew the
+/// ability to fetch its own imagery. The schema is the same one
+/// `rutter imagery` creates from the shell, and deliberately so: a file
+/// built on the boat and a file built on a desktop have to be
+/// interchangeable, or you cannot pre-load one and top it up with the
+/// other.
+///
+/// One connection, one writer. SQLite will take concurrent readers but
+/// serialises writes anyway, so fetching in parallel and inserting from a
+/// single thread is both simpler and no slower.
+#[derive(Debug)]
+pub struct Writer {
+    db: rusqlite::Connection,
+    /// Tiles inserted since the last commit. Batched because a commit per
+    /// tile means an fsync per tile, which on a phone's flash turns a
+    /// five-thousand-tile download into a very long afternoon.
+    pending: usize,
+}
+
+impl Writer {
+    /// How many tiles go in one transaction.
+    const BATCH: usize = 256;
+
+    /// Create a new file, replacing any existing one.
+    ///
+    /// Replacing rather than appending: a half-written file from an
+    /// interrupted download that then got added to would be a file nobody
+    /// could reason about. Resuming is worth having later, and it wants
+    /// explicit intent rather than being the accident of reopening.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        if path.exists() {
+            std::fs::remove_file(path).map_err(Error::Io)?;
+        }
+
+        let db = rusqlite::Connection::open(path)?;
+
+        // The schema every MBTiles reader expects, including this crate's
+        // own. Spelled out rather than copied from a template so the
+        // indexes are not forgotten: without the unique index on
+        // (zoom_level, tile_column, tile_row), `INSERT OR REPLACE` cannot
+        // replace anything and a retried tile is stored twice.
+        db.execute_batch(
+            "CREATE TABLE metadata (name text, value text);
+             CREATE UNIQUE INDEX metadata_name ON metadata (name);
+             CREATE TABLE tiles (zoom_level integer, tile_column integer,
+                                 tile_row integer, tile_data blob);
+             CREATE UNIQUE INDEX tile_index ON tiles
+                                 (zoom_level, tile_column, tile_row);",
+        )?;
+
+        // Write-ahead logging and a relaxed sync. Both are safe for this
+        // job and both matter on a phone: the file is a cache that can be
+        // rebuilt by downloading again, so trading durability-on-power-loss
+        // for a few hundred fewer fsyncs is the right way round.
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+        db.execute_batch("BEGIN")?;
+
+        Ok(Self { db, pending: 0 })
+    }
+
+    /// Store one tile's bytes, exactly as the server sent them.
+    ///
+    /// Stored unmodified: a JPEG from USGS is already compressed and
+    /// re-encoding it would cost quality for nothing.
+    pub fn insert(&mut self, id: TileId, bytes: &[u8]) -> Result<(), Error> {
+        self.db
+            .prepare_cached(
+                "INSERT OR REPLACE INTO tiles \
+                 (zoom_level, tile_column, tile_row, tile_data) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(rusqlite::params![id.z, id.x, tms_row(id), bytes])?;
+
+        self.pending += 1;
+        if self.pending >= Self::BATCH {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Commit what is pending and open a new transaction.
+    pub fn commit(&mut self) -> Result<(), Error> {
+        self.db.execute_batch("COMMIT; BEGIN")?;
+        self.pending = 0;
+        Ok(())
+    }
+
+    /// Write the metadata rows and close the file.
+    ///
+    /// Done at the end rather than the start, because the zoom range and
+    /// the bounds are only known once the fetching is over — a download
+    /// that stopped early should describe what it actually holds rather
+    /// than what was asked for.
+    pub fn finish(mut self, metadata: &Metadata) -> Result<(), Error> {
+        self.commit()?;
+
+        let mut rows: Vec<(&str, String)> = vec![
+            ("name", metadata.name.clone()),
+            ("format", metadata.format.clone()),
+            ("type", "baselayer".to_owned()),
+            ("minzoom", metadata.min_zoom.to_string()),
+            ("maxzoom", metadata.max_zoom.to_string()),
+        ];
+        if let Some([west, south, east, north]) = metadata.bounds {
+            rows.push((
+                "bounds",
+                format!("{west:.6},{south:.6},{east:.6},{north:.6}"),
+            ));
+        }
+        if let Some(credit) = &metadata.attribution {
+            rows.push(("attribution", credit.clone()));
+        }
+
+        for (name, value) in rows {
+            self.db.execute(
+                "INSERT OR REPLACE INTO metadata VALUES (?1, ?2)",
+                rusqlite::params![name, value],
+            )?;
+        }
+
+        self.db.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Tiles stored so far.
+    pub fn count(&self) -> Result<u64, Error> {
+        let n: i64 = self
+            .db
+            .query_row("SELECT count(*) FROM tiles", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+}
+
+/// Fold one MBTiles file's tiles into another, and delete the first.
+///
+/// What makes a download *add* coverage instead of replacing it. The
+/// alternative — writing straight to the file you already have — destroys
+/// it: a download of one harbour would wipe a whole coast, and the first
+/// time that happened here it cost 35 MB of harbour detail that had taken
+/// an afternoon to fetch.
+///
+/// `target` is created if it does not exist. Tiles already there are
+/// overwritten by the new ones, which is the right way round: a tile
+/// fetched today is newer than one fetched last year.
+///
+/// Neither file may be open elsewhere. SQLite would mostly cope, but
+/// "mostly" is not a basis for the file that holds the chart — the caller
+/// closes its reader first.
+pub fn merge(part: &Path, target: &Path) -> Result<(), Error> {
+    // Opened read-write and created if absent, so the first download into
+    // a fresh install works the same way as the tenth.
+    let db = rusqlite::Connection::open(target)?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS metadata (name text, value text);
+         CREATE UNIQUE INDEX IF NOT EXISTS metadata_name ON metadata (name);
+         CREATE TABLE IF NOT EXISTS tiles (zoom_level integer, tile_column integer,
+                                           tile_row integer, tile_data blob);
+         CREATE UNIQUE INDEX IF NOT EXISTS tile_index ON tiles
+                                           (zoom_level, tile_column, tile_row);",
+    )?;
+
+    // One statement rather than a read-and-insert loop: SQLite copies the
+    // blobs itself without them passing through this process, which for
+    // half a gigabyte of imagery is the difference between seconds and
+    // minutes.
+    let attached = part.to_string_lossy().replace('\'', "''");
+    db.execute_batch(&format!("ATTACH '{attached}' AS incoming"))?;
+
+    let merged = db.execute_batch(
+        "BEGIN;
+         INSERT OR REPLACE INTO tiles
+            SELECT zoom_level, tile_column, tile_row, tile_data FROM incoming.tiles;
+         COMMIT;",
+    );
+    // Detached whether or not the insert worked, or the handle keeps the
+    // part file open and it cannot be removed.
+    let detached = db.execute_batch("DETACH incoming");
+    merged?;
+    detached?;
+
+    // The metadata has to describe the union, not the newcomer. A file
+    // holding z6 to z16 that claimed z6 to z12 because the last download
+    // stopped there would have its detail become unreachable: the reader
+    // clamps requests to the stated range.
+    let (min_zoom, max_zoom): (Option<i64>, Option<i64>) = db.query_row(
+        "SELECT min(zoom_level), max(zoom_level) FROM tiles",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if let (Some(low), Some(high)) = (min_zoom, max_zoom) {
+        for (name, value) in [("minzoom", low), ("maxzoom", high)] {
+            db.execute(
+                "INSERT OR REPLACE INTO metadata VALUES (?1, ?2)",
+                rusqlite::params![name, value.to_string()],
+            )?;
+        }
+    }
+
+    // Anything the target has no answer for is taken from the newcomer:
+    // on a first download that supplies the name, format and credit, and
+    // afterwards it leaves them alone.
+    let incoming_meta = read_metadata_rows(part)?;
+    for (name, value) in incoming_meta {
+        if name == "bounds" || name == "minzoom" || name == "maxzoom" {
+            continue;
+        }
+        db.execute(
+            "INSERT OR IGNORE INTO metadata VALUES (?1, ?2)",
+            rusqlite::params![name, value],
+        )?;
+    }
+
+    widen_bounds(&db, part)?;
+
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").ok();
+    drop(db);
+
+    std::fs::remove_file(part).map_err(Error::Io)?;
+    Ok(())
+}
+
+/// Every metadata row of a file, without opening it as a chart.
+fn read_metadata_rows(path: &Path) -> Result<Vec<(String, String)>, Error> {
+    let db = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut stmt = db.prepare("SELECT name, value FROM metadata")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Grow the target's declared bounds to contain the newcomer's.
+///
+/// Only ever grows. A download of one harbour must not shrink the bounds
+/// of a file covering a coast — a reader that trusts the bounds would then
+/// refuse to look at imagery that is sitting right there.
+fn widen_bounds(db: &rusqlite::Connection, part: &Path) -> Result<(), Error> {
+    let parse = |text: &str| -> Option<[f64; 4]> {
+        let mut values = text.split(',').map(str::trim).map(str::parse::<f64>);
+        let mut out = [0.0; 4];
+        for slot in &mut out {
+            *slot = values.next()?.ok()?;
+        }
+        Some(out)
+    };
+
+    let incoming = read_metadata_rows(part)?
+        .into_iter()
+        .find(|(name, _)| name == "bounds")
+        .and_then(|(_, value)| parse(&value));
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+
+    let existing = db
+        .query_row(
+            "SELECT value FROM metadata WHERE name = 'bounds'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| parse(&value));
+
+    // West, south, east, north.
+    let widened = match existing {
+        Some(have) => [
+            have[0].min(incoming[0]),
+            have[1].min(incoming[1]),
+            have[2].max(incoming[2]),
+            have[3].max(incoming[3]),
+        ],
+        None => incoming,
+    };
+
+    db.execute(
+        "INSERT OR REPLACE INTO metadata VALUES ('bounds', ?1)",
+        rusqlite::params![format!(
+            "{:.6},{:.6},{:.6},{:.6}",
+            widened[0], widened[1], widened[2], widened[3]
+        )],
+    )?;
+    Ok(())
 }
 
 /// Slippy y to TMS row.
