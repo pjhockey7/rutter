@@ -462,6 +462,85 @@ impl Forecast {
             .min_by_key(|(_, offset)| offset.abs())
     }
 
+    /// When a step is valid for, in Unix seconds.
+    pub fn valid_at(&self, step: &Step) -> i64 {
+        self.run + i64::from(step.hour) * 3600
+    }
+
+    /// The first and last times this forecast speaks for.
+    ///
+    /// The range a time slider may offer: past the last step there is no
+    /// wind to show, and showing the last step forever would present a
+    /// three-day-old guess as a forecast for next week.
+    pub fn span(&self) -> Option<(i64, i64)> {
+        let first = self.steps.first()?;
+        let last = self.steps.last()?;
+        Some((self.valid_at(first), self.valid_at(last)))
+    }
+
+    /// The two steps either side of a time, and how far between them.
+    ///
+    /// `None` outside the forecast's span — deliberately, rather than
+    /// clamping to an end. A slider dragged past the horizon must show
+    /// nothing, because the alternative is the last step pretending to be
+    /// a forecast for a time nobody modelled.
+    ///
+    /// The fraction is 0 at the earlier step and 1 at the later one. When
+    /// the time lands exactly on a step, both are that step.
+    fn bracket(&self, unix: i64) -> Option<(&Step, &Step, f32)> {
+        let (first, last) = self.span()?;
+        if unix < first || unix > last {
+            return None;
+        }
+        // Steps are in file order, which the writer emits ascending. Linear
+        // over at most a couple of dozen is nothing, and a binary search
+        // would need the order to be an invariant rather than a habit.
+        let mut before = self.steps.first()?;
+        for step in &self.steps {
+            if self.valid_at(step) <= unix {
+                before = step;
+            } else {
+                let (a, b) = (self.valid_at(before), self.valid_at(step));
+                // Guard the division rather than assume strictly
+                // increasing hours: a malformed file with two steps at the
+                // same hour would otherwise divide by zero.
+                let span = (b - a) as f32;
+                let fraction = if span > 0.0 {
+                    (unix - a) as f32 / span
+                } else {
+                    0.0
+                };
+                return Some((before, step, fraction.clamp(0.0, 1.0)));
+            }
+        }
+        Some((before, before, 0.0))
+    }
+
+    /// Wind at a place and a time, interpolated between forecast hours.
+    ///
+    /// Interpolated in *components*, not in speed and direction. Halfway
+    /// between a wind from 350 and one from 010 is a wind from 0; the
+    /// arithmetic mean of the bearings is 180, pointing exactly backwards.
+    /// Keeping u and v separate all the way from the GRIB file to here is
+    /// what makes this a two-line function instead of a special case.
+    pub fn wind_at(&self, unix: i64, at: crate::LatLon) -> Option<Wind> {
+        let (before, after, fraction) = self.bracket(unix)?;
+        let a = before.wind.sample(at)?;
+        let b = after.wind.sample(at)?;
+        Some(Wind::from_components(
+            a.u + (b.u - a.u) * fraction,
+            a.v + (b.v - a.v) * fraction,
+        ))
+    }
+
+    /// Air temperature at a place and a time, Celsius.
+    pub fn temperature_at(&self, unix: i64, at: crate::LatLon) -> Option<f32> {
+        let (before, after, fraction) = self.bracket(unix)?;
+        let a = before.temperature.sample(at)?;
+        let b = after.temperature.sample(at)?;
+        Some(a + (b - a) * fraction)
+    }
+
     /// The area covered, as north-west and south-east corners.
     pub fn bounds(&self) -> Option<(crate::LatLon, crate::LatLon)> {
         let g = &self.steps.first()?.temperature;
@@ -789,5 +868,173 @@ mod tests {
     fn temperature_converts() {
         approx(kelvin_to_celsius(273.15) as f64, 0.0, 1e-4);
         approx(kelvin_to_celsius(293.15) as f64, 20.0, 1e-4);
+    }
+
+    // ── Time interpolation ──────────────────────────────────────────────
+
+    /// A forecast whose wind swings across north between two hours.
+    ///
+    /// The case that decides whether the interpolation is done in the
+    /// right space: from 350 degrees to from 010 degrees. Halfway is from
+    /// 000; the mean of the bearings is 180, which points at the opposite
+    /// horizon.
+    fn a_backing_forecast() -> Forecast {
+        let grid = |v: f32| Grid::new(33.0, -118.0, 0.5, 0.5, 3, 3, vec![v; 9]).expect("grid");
+        // A wind *from* 350 is blowing towards 170: u = sin(170), v = cos(170).
+        let from = |bearing_deg: f32, speed: f32| {
+            let towards = (bearing_deg + 180.0).to_radians();
+            (speed * towards.sin(), speed * towards.cos())
+        };
+        let (u0, v0) = from(350.0, 10.0);
+        let (u1, v1) = from(10.0, 10.0);
+        Forecast {
+            run: 1_772_323_200,
+            steps: vec![
+                Step {
+                    hour: 0,
+                    wind: WindField::new(grid(u0), grid(v0)).expect("wind"),
+                    temperature: grid(16.0),
+                },
+                Step {
+                    hour: 3,
+                    wind: WindField::new(grid(u1), grid(v1)).expect("wind"),
+                    temperature: grid(16.0),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn the_span_is_the_first_and_last_hour() {
+        let f = a_forecast();
+        let (first, last) = f.span().expect("a span");
+        assert_eq!(first, f.run);
+        assert_eq!(last, f.run + 3 * 3600);
+    }
+
+    #[test]
+    fn wind_interpolates_between_the_hours() {
+        // The old `nearest` snapped to a step, so the wind jumped every 90
+        // minutes. A slider needs it continuous.
+        let f = a_forecast();
+        let at = LatLon::new(32.5, -117.5);
+
+        let speed = |offset: i64| {
+            f.wind_at(f.run + offset, at)
+                .expect("inside the forecast")
+                .speed_kn()
+        };
+
+        // 5 m/s at hour 0, 10 at hour 3, so 7.5 at the midpoint.
+        let start = speed(0);
+        let middle = speed(90 * 60);
+        let end = speed(3 * 3600);
+        assert!((start - 9.7).abs() < 0.1, "hour 0 was {start} kn");
+        assert!((end - 19.4).abs() < 0.1, "hour 3 was {end} kn");
+        assert!(
+            (middle - (start + end) / 2.0).abs() < 0.1,
+            "the midpoint was {middle}, not halfway between {start} and {end}"
+        );
+
+        // And monotonic across the whole span, with no step.
+        let mut last = 0.0;
+        for minutes in 0..=180 {
+            let now = speed(minutes * 60);
+            assert!(
+                now >= last - 1e-3,
+                "the wind went backwards at {minutes} min"
+            );
+            last = now;
+        }
+    }
+
+    #[test]
+    fn a_wind_backing_through_north_does_not_reverse_halfway() {
+        // The whole reason the grids store u and v rather than speed and
+        // direction. Interpolating bearings would put this wind on the
+        // nose at the midpoint.
+        let f = a_backing_forecast();
+        let at = LatLon::new(32.5, -117.5);
+        let middle = f
+            .wind_at(f.run + 90 * 60, at)
+            .expect("inside")
+            .direction_from_deg();
+
+        // From 350 to from 010 is 20 degrees of backing; halfway is north.
+        let off_north = middle.min(360.0 - middle);
+        assert!(
+            off_north < 1.0,
+            "halfway the wind came from {middle} degrees"
+        );
+
+        // And the speed must not sag through the turn by more than the
+        // geometry demands: two 10 kn winds 20 degrees apart average to
+        // 10*cos(10) = 9.85.
+        let speed = f.wind_at(f.run + 90 * 60, at).expect("inside").speed_kn();
+        let ends = f.wind_at(f.run, at).expect("inside").speed_kn();
+        assert!(
+            speed > ends * 0.98,
+            "the wind sagged from {ends} to {speed} through the turn"
+        );
+    }
+
+    #[test]
+    fn temperature_interpolates_too() {
+        let f = a_forecast();
+        let at = LatLon::new(32.5, -117.5);
+        let start = f.temperature_at(f.run, at).expect("inside");
+        let middle = f.temperature_at(f.run + 90 * 60, at).expect("inside");
+        assert!((start - 16.0).abs() < 1e-3, "hour 0 was {start}");
+        assert!((middle - 16.5).abs() < 1e-3, "the midpoint was {middle}");
+    }
+
+    #[test]
+    fn nothing_is_claimed_outside_the_forecast() {
+        // A slider dragged past the horizon has to show nothing. Clamping
+        // to the last step would present a modelled hour as a forecast for
+        // a time nobody modelled, which is the one thing a forecast layer
+        // must not do.
+        let f = a_forecast();
+        let at = LatLon::new(32.5, -117.5);
+        assert_eq!(f.wind_at(f.run - 1, at), None, "before the run");
+        assert_eq!(
+            f.wind_at(f.run + 3 * 3600 + 1, at),
+            None,
+            "past the horizon"
+        );
+        assert_eq!(f.temperature_at(f.run + 10 * 3600, at), None);
+
+        // And outside the *area*, in time but not in place.
+        assert_eq!(f.wind_at(f.run, LatLon::new(0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn a_single_step_forecast_still_answers_for_its_own_hour() {
+        // A fetch where only one hour was published. The bracket has
+        // nothing to interpolate towards, and must not divide by zero.
+        let grid = |v: f32| Grid::new(33.0, -118.0, 0.5, 0.5, 3, 3, vec![v; 9]).expect("grid");
+        let f = Forecast {
+            run: 1_772_323_200,
+            steps: vec![Step {
+                hour: 6,
+                wind: WindField::new(grid(5.0), grid(0.0)).expect("wind"),
+                temperature: grid(16.0),
+            }],
+        };
+        let at = LatLon::new(32.5, -117.5);
+        let valid = f.run + 6 * 3600;
+        assert!(f.wind_at(valid, at).is_some(), "its own hour");
+        assert_eq!(f.wind_at(valid - 1, at), None);
+        assert_eq!(f.wind_at(valid + 1, at), None);
+    }
+
+    #[test]
+    fn an_empty_forecast_has_no_span_and_no_wind() {
+        let f = Forecast {
+            run: 1_772_323_200,
+            steps: Vec::new(),
+        };
+        assert_eq!(f.span(), None);
+        assert_eq!(f.wind_at(f.run, LatLon::new(32.5, -117.5)), None);
     }
 }

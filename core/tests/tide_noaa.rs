@@ -65,7 +65,7 @@ fn parse(text: &str) -> Reference {
                     .unwrap_or_else(|| panic!("{} is not a known constituent", at(name)));
                 station.constituents.push(Constituent {
                     harmonic,
-                    amplitude_m: field
+                    amplitude: field
                         .next()
                         .expect(&at("amplitude"))
                         .parse()
@@ -187,9 +187,9 @@ fn the_fixture_is_whole() {
         .station
         .constituents
         .iter()
-        .map(|c| c.amplitude_m)
+        .map(|c| c.amplitude)
         .fold(f64::MIN, f64::max);
-    assert_eq!(m2.amplitude_m, biggest, "M2 should be the largest term");
+    assert_eq!(m2.amplitude, biggest, "M2 should be the largest term");
 
     let spans = windows(&r.heights);
     assert!(

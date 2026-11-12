@@ -68,10 +68,61 @@ pub enum Action {
     DisconnectNmea,
     /// Use the device's own GPS instead of a network feed.
     UseDeviceGps,
+    /// Show or hide the tidal currents.
+    SetCurrents(bool),
+    /// Look at a time this many seconds from now. Zero is now.
+    SetTimeOffset(i64),
+    /// Back to now.
+    NowTime,
     /// Keep the chart centred on the boat as it moves.
     SetFollow(bool),
     /// Centre on the boat once, without following it.
     GoToBoat,
+}
+
+/// What the panel knows about the tidal currents.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CurrentState {
+    /// Whether the database carries any harmonic current stations.
+    pub available: bool,
+    pub visible: bool,
+    /// How many are in the file.
+    pub stations: usize,
+    /// The nearest station's name.
+    pub station: Option<String>,
+    /// What it is doing at the time being shown: "1.4 kn flooding, 355°".
+    pub now: Option<String>,
+    /// The next few slacks and peaks.
+    pub next: Vec<String>,
+    /// How many of the stations in view are subordinate and so not
+    /// predicted. Worth saying: NOAA publishes ten times as many of those
+    /// as harmonic ones, and a chart with two arrows on it looks broken
+    /// until you know why.
+    pub subordinate_nearby: usize,
+}
+
+/// What the panel knows about the time being shown.
+///
+/// The chart can be shown at a time other than now — a slider drives the
+/// tide, the currents, the under-keel check, the wind and the temperature
+/// together. The boat's own position is *not* driven by it and cannot be:
+/// a GPS says where the boat is, not where it will be.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TimeState {
+    /// Seconds from now. Zero is now; negative is the past.
+    pub offset_secs: i64,
+    /// How far the slider may be dragged, in seconds from now.
+    pub min_secs: i64,
+    pub max_secs: i64,
+    /// The time being shown, as `14:30Z`.
+    pub shown: String,
+    /// How far from now, as `in 3h 20m`. Empty at now.
+    pub away: String,
+    /// Whether the slider is at now.
+    pub at_now: bool,
+    /// Whether the forecast covers the time being shown. False past the
+    /// model's horizon, where the tide still works and the wind does not.
+    pub wind_covers_this: bool,
 }
 
 /// What the panel knows about the boat's own position.
@@ -267,6 +318,8 @@ pub struct PanelState {
     pub vessel: VesselState,
     pub imagery: ImageryState,
     pub tides: TideState,
+    pub currents: CurrentState,
+    pub time: TimeState,
     pub draft: DraftState,
     pub wind: WindState,
     /// The top strip's text: position, zoom, scale.
@@ -360,6 +413,8 @@ impl Ui {
             vessel,
             imagery,
             tides,
+            currents,
+            time,
             draft,
             wind,
             status,
@@ -412,6 +467,13 @@ impl Ui {
                 ui.label(status);
             });
         });
+
+        // The time strip, always visible. It is not a setting tucked in a
+        // panel: it changes what every other layer is claiming, and a
+        // chart showing a tide three hours from now while looking exactly
+        // like one showing the tide now would be a genuinely dangerous
+        // thing to leave hidden.
+        actions.extend(Self::time_strip(root, time));
 
         if !self.open {
             return actions;
@@ -488,6 +550,8 @@ impl Ui {
 
                 ui.separator();
                 actions.extend(Self::tide_section(ui, tides));
+                ui.separator();
+                actions.extend(Self::current_section(ui, currents));
                 ui.separator();
                 actions.extend(Self::wind_section(ui, wind));
                 ui.separator();
@@ -758,6 +822,136 @@ impl Ui {
                      refused. A climbing refusal count means the wrong \
                      port or a noisy link.",
                 );
+        }
+
+        actions
+    }
+
+    /// The time being shown, and the slider that moves it.
+    fn time_strip(root: &mut egui::Ui, time: &TimeState) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if time.min_secs >= time.max_secs {
+            return actions;
+        }
+
+        egui::Panel::bottom("time").show(root, |ui| {
+            ui.horizontal(|ui| {
+                // "Now" first and always enabled when it would do
+                // something: getting back to the present must never be a
+                // hunt through a panel.
+                if ui
+                    .add_enabled(!time.at_now, egui::Button::new("Now"))
+                    .on_hover_text("Back to the present")
+                    .clicked()
+                {
+                    actions.push(Action::NowTime);
+                }
+
+                let mut offset = time.offset_secs;
+                let slider = egui::Slider::new(&mut offset, time.min_secs..=time.max_secs)
+                    .show_value(false)
+                    .custom_formatter(|v, _| format!("{:+.1} h", v / 3600.0));
+                if ui.add(slider).changed() {
+                    actions.push(Action::SetTimeOffset(offset));
+                }
+
+                // The time itself, emphasised when it is not now. A
+                // readout that looks the same whether or not you have
+                // moved is the one failure this control must not have.
+                let shown = egui::RichText::new(&time.shown).monospace();
+                ui.label(if time.at_now {
+                    shown
+                } else {
+                    shown
+                        .strong()
+                        .color(egui::Color32::from_rgb(0x6c, 0xc6, 0xff))
+                });
+                if !time.away.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&time.away)
+                            .small()
+                            .color(egui::Color32::from_rgb(0x6c, 0xc6, 0xff)),
+                    );
+                }
+                if !time.wind_covers_this {
+                    ui.label(
+                        egui::RichText::new("no forecast this far out")
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text(
+                        "The tide and the currents are astronomical and work \
+                         for any time at all. The wind and temperature are a \
+                         model run with a horizon — fetch more hours with \
+                         `rutter weather --hours`.",
+                    );
+                }
+            });
+        });
+
+        actions
+    }
+
+    /// The tidal currents: which way the water is going, and when it turns.
+    fn current_section(ui: &mut egui::Ui, currents: &CurrentState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = currents.visible;
+            let toggle = ui.add_enabled(
+                currents.available,
+                egui::Checkbox::new(&mut on, "Tidal currents"),
+            );
+            if toggle.clicked() {
+                actions.push(Action::SetCurrents(on));
+            }
+            if currents.available {
+                ui.label(
+                    egui::RichText::new(format!("{} stations", currents.stations))
+                        .weak()
+                        .small(),
+                );
+            } else {
+                toggle.on_hover_text(
+                    "No current stations loaded. Fetch some with \
+                     `rutter tides --box <s>,<w>,<n>,<e>`.",
+                );
+            }
+        });
+
+        if !currents.available || !currents.visible {
+            return actions;
+        }
+
+        if let Some(station) = &currents.station {
+            ui.label(egui::RichText::new(station).strong());
+        }
+        if let Some(now) = &currents.now {
+            ui.label(now).on_hover_text(
+                "Where the water is going, not where it comes from — the \
+                 opposite convention to a wind, and the one every chart \
+                 uses for a current. Arrow length is speed.",
+            );
+        }
+        for line in &currents.next {
+            ui.label(egui::RichText::new(line).weak().small());
+        }
+
+        if currents.subordinate_nearby > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} more stations nearby, not predicted",
+                    currents.subordinate_nearby
+                ))
+                .weak()
+                .small(),
+            )
+            .on_hover_text(
+                "NOAA publishes most current stations as time and speed \
+                 offsets against a reference station rather than as \
+                 harmonic constituents. Predicting those needs a different \
+                 method, which this does not do yet.",
+            );
         }
 
         actions
@@ -1432,6 +1626,8 @@ mod font_tests {
                 &PanelState {
                     layers: entries.clone(),
                     vessel: populated_vessel(),
+                    currents: populated_currents(),
+                    time: populated_time(),
                     imagery: imagery.clone(),
                     tides: populated_tides(),
                     draft: populated_draft(),
@@ -1530,6 +1726,36 @@ mod font_tests {
         }
     }
 
+    /// Currents running, for the drawing tests.
+    fn populated_currents() -> CurrentState {
+        CurrentState {
+            available: true,
+            visible: true,
+            stations: 2,
+            station: Some("San Diego Bay Entrance".to_owned()),
+            now: Some("1.4 kn flood, setting 355°".to_owned()),
+            next: vec![
+                "14:22Z slack  in 1h 10m".to_owned(),
+                "17:08Z 2.1 kn ebb  in 3h 56m".to_owned(),
+            ],
+            subordinate_nearby: 23,
+        }
+    }
+
+    /// The slider moved off now, which is the state worth drawing: at now
+    /// half of this strip is blank.
+    fn populated_time() -> TimeState {
+        TimeState {
+            offset_secs: 3 * 3600 + 20 * 60,
+            min_secs: -12 * 3600,
+            max_secs: 24 * 3600,
+            shown: "17:50Z".to_owned(),
+            away: "in 3h 20m".to_owned(),
+            at_now: false,
+            wind_covers_this: false,
+        }
+    }
+
     fn populated_wind() -> WindState {
         WindState {
             available: true,
@@ -1583,6 +1809,8 @@ mod font_tests {
                 &PanelState {
                     layers: entries.clone(),
                     vessel: populated_vessel(),
+                    currents: populated_currents(),
+                    time: populated_time(),
                     imagery: imagery.clone(),
                     tides: tides.clone(),
                     draft: populated_draft(),

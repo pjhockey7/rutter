@@ -1590,7 +1590,7 @@ print('%.4f,%.4f,%.4f,%.4f' % (
           '  charts       <source> <out.mbtiles> — turn chart data into tiles' \
           '  noaa         fetch NOAA ENC charts (US waters) and tile them' \
           '  imagery      fetch USGS aerial imagery for a chart or a box' \
-          '  tides        fetch NOAA tide-station constituents near a position' \
+          '  tides        fetch NOAA tide and tidal-current constituents' \
           '  weather      fetch a GFS wind and temperature forecast' \
           '  nmea         send a synthetic GPS feed, to test without a boat' \
           '  fmt          cargo fmt' \

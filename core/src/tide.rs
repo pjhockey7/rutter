@@ -428,8 +428,13 @@ impl Nodal {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constituent {
     pub harmonic: Harmonic,
-    /// Amplitude in metres.
-    pub amplitude_m: f64,
+    /// Amplitude, in whatever the station measures.
+    ///
+    /// Metres of height for a tide station; knots along the major axis for
+    /// a current station. The harmonic arithmetic does not care which —
+    /// it is the same sum either way, which is why [`harmonic_sum`] is
+    /// shared and why this field is not named for a unit.
+    pub amplitude: f64,
     /// Phase lag on the equilibrium argument at Greenwich, degrees.
     ///
     /// NOAA calls this `phase_GMT`. It is a lag, so it is subtracted.
@@ -454,24 +459,34 @@ pub struct Station {
     pub constituents: Vec<Constituent>,
 }
 
+/// The harmonic sum at an instant: `Σ f·A·cos(V + u − κ)`.
+///
+/// The whole of tidal prediction, in six lines. Shared between heights and
+/// currents because it is literally the same calculation — a tide station
+/// and a current station differ in what the amplitude *means*, not in how
+/// the terms combine. Sharing it means the node factors, the epoch and the
+/// quadrant handling are validated once rather than twice.
+pub fn harmonic_sum(constituents: &[Constituent], unix: i64) -> f64 {
+    let a = Astro::at(unix);
+    // Both of these are properties of the instant rather than of any one
+    // constituent, so they are computed once per sum and not once per
+    // term. See [`Harmonic::nodal_with`] — hoisting this out was a sixfold
+    // speedup.
+    let n = Nodal::at(&a);
+    constituents
+        .iter()
+        .map(|c| {
+            let (f, u) = c.harmonic.nodal_with(&n);
+            let angle = (c.harmonic.equilibrium(&a) + u - c.phase_deg).to_radians();
+            f * c.amplitude * angle.cos()
+        })
+        .sum()
+}
+
 impl Station {
     /// Height above chart datum, metres, at a Unix time.
     pub fn height_at(&self, unix: i64) -> f64 {
-        let a = Astro::at(unix);
-        // Both of these are properties of the instant rather than of any
-        // one constituent, so they are computed once per height and not
-        // once per term. See [`Harmonic::nodal_with`].
-        let n = Nodal::at(&a);
-        self.datum_m
-            + self
-                .constituents
-                .iter()
-                .map(|c| {
-                    let (f, u) = c.harmonic.nodal_with(&n);
-                    let angle = (c.harmonic.equilibrium(&a) + u - c.phase_deg).to_radians();
-                    f * c.amplitude_m * angle.cos()
-                })
-                .sum::<f64>()
+        self.datum_m + harmonic_sum(&self.constituents, unix)
     }
 
     /// Sample the curve at a fixed step, yielding `(unix, metres)`.
@@ -554,6 +569,228 @@ pub struct Extreme {
     pub unix: i64,
     pub height_m: f64,
     pub kind: Kind,
+}
+
+/// A tidal current station: a flood axis plus its constituents.
+///
+/// NOAA publishes about 4,500 of these, and they are predicted by exactly
+/// the same harmonic sum as a tide height — the amplitudes are knots along
+/// the channel instead of metres of rise. Which is why this type shares
+/// [`harmonic_sum`] and [`Constituent`] rather than restating them.
+///
+/// ## Why this is a station and not a field
+///
+/// A current follows the channel it is in. Two stations a mile apart can
+/// have the flood running in quite different directions, and halfway
+/// between them the water may be going sideways or there may be no water
+/// at all. So this predicts the current *at a place NOAA measured one* and
+/// nothing is interpolated between them: an arrow per station, which is
+/// what a tidal current chart has always been.
+///
+/// A genuine gridded flow field needs a hydrodynamic model — NOAA's WCOFS
+/// covers this coast — and is a quite separate thing to ingest.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CurrentStation {
+    /// NOAA's identifier, e.g. "PCT0031". Not the same namespace as the
+    /// tide stations' numeric ids.
+    pub id: String,
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Where the flood sets, degrees true.
+    ///
+    /// The flood is the rising-tide direction, usually up a channel or
+    /// into a harbour. The harmonic sum is signed along this axis.
+    pub flood_deg: f64,
+    /// Where the ebb sets, degrees true.
+    ///
+    /// Usually the reciprocal of the flood, but NOAA publishes it
+    /// separately because in a bend it is not: the water takes the inside
+    /// of the curve going one way and the outside coming back.
+    pub ebb_deg: f64,
+    /// Depth of the bin this prediction describes, metres below the
+    /// surface. `None` for a surface station.
+    ///
+    /// Worth carrying because a deep bin in a stratified estuary can be
+    /// running the other way from the surface, and a boat cares about the
+    /// surface.
+    pub depth_m: Option<f64>,
+    /// A constant set, knots, added to the harmonic sum.
+    ///
+    /// Zero at nearly every station. Not zero in a river, where the net
+    /// seaward flow never reverses however the tide runs — and a predictor
+    /// that dropped it would show slack water in a current that is still
+    /// setting a knot and a half.
+    pub mean_kn: f64,
+    /// Amplitudes in knots along the flood axis. See [`Constituent`].
+    pub constituents: Vec<Constituent>,
+}
+
+/// What the water is doing at an instant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Current {
+    /// How fast, knots. Never negative — the direction carries the sign.
+    pub speed_kn: f64,
+    /// Where the water is going, degrees true.
+    ///
+    /// Where it is *going*, not where it comes from. The opposite
+    /// convention to wind, and deliberately so: this is the convention for
+    /// a current on every chart and in every tidal atlas, and quietly
+    /// flipping it would put a two-knot set on the wrong bow.
+    pub toward_deg: f64,
+    /// Whether this is the flood. False on the ebb, and on slack water,
+    /// where the direction means little anyway.
+    pub flooding: bool,
+}
+
+impl CurrentStation {
+    /// Speed along the flood axis, knots. Positive floods, negative ebbs.
+    ///
+    /// The raw signed quantity, before it is turned into a direction. Kept
+    /// public because the turning points are found on it: a maximum of the
+    /// signed speed is peak flood, a minimum is peak ebb, and a zero is
+    /// slack water, and all three are obvious on the signed value and
+    /// awkward on the absolute one.
+    pub fn along_axis_kn(&self, unix: i64) -> f64 {
+        self.mean_kn + harmonic_sum(&self.constituents, unix)
+    }
+
+    /// The current at a Unix time.
+    pub fn current_at(&self, unix: i64) -> Current {
+        let along = self.along_axis_kn(unix);
+        let flooding = along >= 0.0;
+        Current {
+            speed_kn: along.abs(),
+            toward_deg: if flooding {
+                self.flood_deg
+            } else {
+                self.ebb_deg
+            },
+            flooding,
+        }
+    }
+
+    /// Sample the signed along-axis speed, yielding `(unix, knots)`.
+    pub fn curve(&self, from: i64, to: i64, step_secs: i64) -> Vec<(i64, f64)> {
+        if step_secs <= 0 || to < from {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut t = from;
+        while t <= to {
+            out.push((t, self.along_axis_kn(t)));
+            t += step_secs;
+        }
+        out
+    }
+
+    /// Slack waters and peak flows over a window, in time order.
+    ///
+    /// Both kinds, because they answer different questions. Slack is when
+    /// to pass through a narrows; peak flood and ebb are what you fight or
+    /// ride, and when. A tidal current table prints exactly these four
+    /// events a day, in this order.
+    pub fn events(&self, from: i64, to: i64) -> Vec<CurrentEvent> {
+        /// Fifteen minutes, as for the tide: comfortably inside the period
+        /// of M8, the fastest term NOAA publishes.
+        const STEP: i64 = 15 * 60;
+        const EPS: i64 = 60;
+
+        if to <= from {
+            return Vec::new();
+        }
+
+        let slope = |t: i64| {
+            (self.along_axis_kn(t + EPS) - self.along_axis_kn(t - EPS)) / (2.0 * EPS as f64)
+        };
+
+        // Bisect for a sign change in whatever `f` is, to the second.
+        let refine = |f: &dyn Fn(i64) -> f64, mut lo: i64, mut hi: i64| {
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if f(lo).signum() == f(mid).signum() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            hi
+        };
+
+        let mut out: Vec<CurrentEvent> = Vec::new();
+        let mut t = from;
+        let (mut prev_slope, mut prev_value) = (slope(t), self.along_axis_kn(t));
+
+        while t < to {
+            let next_t = (t + STEP).min(to);
+            let next_slope = slope(next_t);
+            let next_value = self.along_axis_kn(next_t);
+
+            // A turning point in the signed speed: peak flood or peak ebb.
+            if prev_slope.signum() != next_slope.signum() {
+                let at = refine(&slope, t, next_t);
+                let along = self.along_axis_kn(at);
+                out.push(CurrentEvent {
+                    unix: at,
+                    speed_kn: along.abs(),
+                    toward_deg: if along >= 0.0 {
+                        self.flood_deg
+                    } else {
+                        self.ebb_deg
+                    },
+                    kind: if along >= 0.0 {
+                        CurrentKind::MaxFlood
+                    } else {
+                        CurrentKind::MaxEbb
+                    },
+                });
+            }
+
+            // A zero crossing: slack water. In a river with a net flow
+            // there may be none at all, which is correct and is why this
+            // is a sign test rather than an assumed four-a-day.
+            if prev_value.signum() != next_value.signum() {
+                let value = |t: i64| self.along_axis_kn(t);
+                let at = refine(&value, t, next_t);
+                out.push(CurrentEvent {
+                    unix: at,
+                    speed_kn: 0.0,
+                    // At slack the water is not going anywhere, so naming a
+                    // direction would be inventing one. The flood axis is
+                    // reported for orientation and the speed says it is
+                    // nothing.
+                    toward_deg: self.flood_deg,
+                    kind: CurrentKind::Slack,
+                });
+            }
+
+            t = next_t;
+            prev_slope = next_slope;
+            prev_value = next_value;
+        }
+
+        out.sort_by_key(|e| e.unix);
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentKind {
+    /// The strongest flood of this cycle.
+    MaxFlood,
+    /// The strongest ebb.
+    MaxEbb,
+    /// The current has stopped and is about to turn.
+    Slack,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentEvent {
+    pub unix: i64,
+    /// Knots. Zero at slack.
+    pub speed_kn: f64,
+    pub toward_deg: f64,
+    pub kind: CurrentKind,
 }
 
 #[cfg(test)]
@@ -767,7 +1004,7 @@ mod tests {
             datum_m: 3.0,
             constituents: vec![Constituent {
                 harmonic: Harmonic::from_name("M2").expect("in table"),
-                amplitude_m: 2.0,
+                amplitude: 2.0,
                 phase_deg: 0.0,
             }],
         }
@@ -850,12 +1087,12 @@ mod tests {
             constituents: vec![
                 Constituent {
                     harmonic: Harmonic::from_name("M2").expect("in table"),
-                    amplitude_m: 2.0,
+                    amplitude: 2.0,
                     phase_deg: 0.0,
                 },
                 Constituent {
                     harmonic: Harmonic::from_name("S2").expect("in table"),
-                    amplitude_m: 0.7,
+                    amplitude: 0.7,
                     phase_deg: 0.0,
                 },
             ],

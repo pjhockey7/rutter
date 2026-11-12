@@ -118,7 +118,7 @@ fn reads_stations_and_their_constituents() {
     assert_eq!(sd.constituents.len(), 4);
     // Largest first, which is what the query asks for.
     assert_eq!(sd.constituents[0].harmonic.name(), "M2");
-    assert!(sd.constituents[0].amplitude_m > sd.constituents[1].amplitude_m);
+    assert!(sd.constituents[0].amplitude > sd.constituents[1].amplitude);
     assert!((sd.datum_m - 0.8961).abs() < 1e-9);
 
     let _ = std::fs::remove_file(&path);
@@ -477,4 +477,60 @@ fn every_real_station_predicts_a_plausible_tide() {
             );
         }
     }
+}
+
+// ── Tidal currents ──────────────────────────────────────────────────────
+
+#[test]
+fn current_stations_load_and_predict() {
+    // The real file this project is developed against. Skipped rather than
+    // failed when it is absent, like the other fixtures here: a fresh
+    // clone has no `build/` until `rutter tides` has been run.
+    let path = "../build/charts/tides.sqlite";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("no {path}; skipping");
+        return;
+    }
+    let db = TideStations::open(path).expect("open");
+    let currents = db.currents().expect("currents");
+    assert!(
+        !currents.is_empty(),
+        "no current stations — did the fetcher write them?"
+    );
+
+    for station in &currents {
+        assert!(
+            !station.constituents.is_empty(),
+            "{} has no terms",
+            station.id
+        );
+        assert!(
+            (0.0..360.0).contains(&station.flood_deg),
+            "{} floods towards {}",
+            station.id,
+            station.flood_deg
+        );
+        assert!((0.0..360.0).contains(&station.ebb_deg));
+        assert!(
+            station.lat.abs() <= 90.0 && station.lon.abs() <= 180.0,
+            "{} is not on Earth",
+            station.id
+        );
+
+        // A current that never exceeds a hundredth of a knot over a day is
+        // not a current, and almost certainly a unit mistake.
+        let from = 1_772_323_200;
+        let peak = station
+            .curve(from, from + 86_400, 600)
+            .into_iter()
+            .map(|(_, v)| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(peak > 0.01, "{} peaks at {peak:.4} kn in a day", station.id);
+        assert!(
+            peak < 15.0,
+            "{} peaks at {peak:.1} kn, which is a tide race",
+            station.id
+        );
+    }
+    println!("{} current stations", currents.len());
 }

@@ -31,8 +31,8 @@
 pub mod ui;
 
 pub use ui::{
-    Action, DraftState, ImageryState, LayerEntry, PanelState, TideMarker, TideReading, TideState,
-    Ui, VesselState, WindState,
+    Action, CurrentState, DraftState, ImageryState, LayerEntry, PanelState, TideMarker,
+    TideReading, TideState, TimeState, Ui, VesselState, WindState,
 };
 
 use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};
@@ -137,12 +137,34 @@ fn fill_colour_for(style: ChartStyle, value: Option<f64>) -> Option<[f32; 4]> {
     }
 }
 
+/// Whether a style's value really is a depth below chart datum.
+///
+/// A light's HEIGHT is a height *above* datum and a buoy has no depth at
+/// all, so running either through the under-keel arithmetic would paint
+/// confident nonsense. This is the gate that stops it.
+fn judgeable(style: ChartStyle) -> bool {
+    matches!(
+        style,
+        ChartStyle::Sounding
+            | ChartStyle::Danger
+            | ChartStyle::DepthArea
+            | ChartStyle::DepthContour
+    )
+}
+
 /// Fill colour for a clearance verdict.
 ///
 /// `Clear` returns `None` on purpose. With the check on, the answer wanted
 /// is "where can I not go", and shading the safe water as well would bury
 /// that in green. Leaving it unshaded keeps the chart and the imagery
 /// readable everywhere the question does not apply.
+///
+/// The shader does the shading now, so nothing calls this at runtime — but
+/// it is still the *specification* of that palette, and
+/// `the_shader_palette_matches_the_rust_one` reads the constants out of
+/// `chart.wgsl` and checks them against it. Deleting this would leave the
+/// shader's colours unchecked.
+#[cfg(test)]
 fn clearance_fill_for(clearance: Clearance) -> Option<[f32; 4]> {
     match clearance {
         Clearance::Clear => None,
@@ -181,7 +203,52 @@ fn mark_scale(style: ChartStyle) -> f32 {
 struct Vertex {
     /// Offset from this buffer's reference point, in normalised world units.
     offset: [f32; 2],
+    /// A further offset, scaled on the GPU by how emphatic the feature's
+    /// clearance verdict is. Zero for everything except the arms of a
+    /// sounding's cross, which is the one mark whose *size* carries
+    /// meaning and so could not simply be recoloured when the tide moved.
+    arm: [f32; 2],
+    /// The colour to use when the under-keel check does not apply — the
+    /// style's own colour, or a depth area's band.
     colour: [f32; 4],
+    /// Charted depth below datum, metres, or [`NO_DEPTH`] for a feature
+    /// the check must not judge. See `chart.wgsl`.
+    depth: f32,
+}
+
+/// What a vertex carries in `depth` when it is not a depth.
+///
+/// Must match `NO_DEPTH` in `chart.wgsl`; the shader treats anything at or
+/// below it as unjudgeable. A sentinel rather than NaN because WGSL makes
+/// no promises about NaN comparisons.
+const NO_DEPTH: f32 = -1.0e8;
+
+impl Vertex {
+    /// A vertex with no clearance meaning: the tile grid, a coastline, a
+    /// light's height, a buoy.
+    fn plain(offset: [f32; 2], colour: [f32; 4]) -> Self {
+        Self {
+            offset,
+            arm: [0.0, 0.0],
+            colour,
+            depth: NO_DEPTH,
+        }
+    }
+
+    /// A vertex the under-keel check may judge, carrying its charted depth.
+    fn judged(offset: [f32; 2], colour: [f32; 4], depth: Option<f64>) -> Self {
+        Self {
+            offset,
+            arm: [0.0, 0.0],
+            colour,
+            depth: depth.map_or(NO_DEPTH, |d| d as f32),
+        }
+    }
+
+    fn with_arm(mut self, arm: [f32; 2]) -> Self {
+        self.arm = arm;
+        self
+    }
 }
 
 #[repr(C)]
@@ -241,6 +308,27 @@ struct ViewUniform {
     scale: [f32; 2],
     /// This buffer's reference point relative to the view centre.
     origin: [f32; 2],
+    /// The under-keel check: `[on, needed_m, tide_now_m, tide_lowest_m]`.
+    ///
+    /// Four floats rather than four fields so the struct is one 32-byte
+    /// block with no padding to get wrong. See `chart.wgsl`.
+    check: [f32; 4],
+}
+
+impl ViewUniform {
+    /// The check, as the shader wants it.
+    fn check_of(draft_check: Option<DraftCheck>) -> [f32; 4] {
+        match draft_check {
+            Some(check) => [
+                1.0,
+                check.draft.needed_m() as f32,
+                check.tide.now_m as f32,
+                check.tide.lowest_m as f32,
+            ],
+            // Nothing is judged, so the other three are never read.
+            None => [0.0, 0.0, 0.0, 0.0],
+        }
+    }
 }
 
 /// A mark anchored to a chart position but drawn at a fixed screen size.
@@ -273,6 +361,23 @@ pub enum Overlay {
         course_deg: Option<f32>,
         colour: [f32; 4],
     },
+    /// A tidal current: an arrow the way the water is going.
+    ///
+    /// Length carries the speed, which is the opposite choice from a wind
+    /// barb's feathers — and deliberate. A current is read as "which way
+    /// and roughly how hard", often at a glance while looking for the
+    /// channel, and a long arrow says that faster than a count of
+    /// feathers. The exact number is in the panel.
+    Current {
+        at: chart::WorldXY,
+        speed_kn: f32,
+        /// Where the water is *going*, degrees true. The opposite
+        /// convention to a wind, which is named for where it comes from —
+        /// and the convention every chart and tidal atlas uses for a
+        /// current.
+        toward_deg: f32,
+        colour: [f32; 4],
+    },
     /// A meteorological wind barb: half 5 kn, full 10, pennant 50.
     Barb {
         at: chart::WorldXY,
@@ -287,7 +392,10 @@ pub enum Overlay {
 impl Overlay {
     fn at(&self) -> chart::WorldXY {
         match self {
-            Self::Ring { at, .. } | Self::Barb { at, .. } | Self::Boat { at, .. } => *at,
+            Self::Ring { at, .. }
+            | Self::Barb { at, .. }
+            | Self::Boat { at, .. }
+            | Self::Current { at, .. } => *at,
         }
     }
 }
@@ -308,6 +416,34 @@ struct Feathers {
 /// Below this there is no direction worth drawing, and the symbol is a bare
 /// circle rather than a shaft.
 const CALM_KN: f32 = 2.5;
+
+/// Below this a current is slack and has no direction worth drawing.
+///
+/// Much lower than [`CALM_KN`], because a tenth of a knot of wind is
+/// nothing and a tenth of a knot of current is still half a mile in five
+/// hours. Slack water is genuinely close to zero.
+const SLACK_KN: f32 = 0.1;
+
+/// Arrow length in pixels for a current, slack to strong.
+///
+/// Clamped at both ends: a 4-knot race and a 6-knot one are both "more
+/// than you can motor against", and an arrow that kept growing would run
+/// across the chart saying nothing extra.
+const CURRENT_SHORTEST_PX: f32 = 12.0;
+const CURRENT_LONGEST_PX: f32 = 38.0;
+/// The speed at which an arrow reaches its full length.
+const CURRENT_FULL_SCALE_KN: f32 = 3.0;
+
+/// How long to draw a current arrow.
+fn current_length_px(speed_kn: f32) -> f32 {
+    // `partial_cmp` rather than a comparison, so a NaN from a malformed
+    // station reads as slack instead of as an arrow off the screen.
+    let fraction = (speed_kn / CURRENT_FULL_SCALE_KN).clamp(0.0, 1.0);
+    if fraction.is_nan() {
+        return CURRENT_SHORTEST_PX;
+    }
+    CURRENT_SHORTEST_PX + (CURRENT_LONGEST_PX - CURRENT_SHORTEST_PX) * fraction
+}
 
 fn feathers(speed_kn: f32) -> Feathers {
     // Rounded to the nearest five, which is the resolution the symbol has.
@@ -436,7 +572,10 @@ pub struct Renderer {
     /// `None` means draw the chart in its own colours.
     draft_check: Option<DraftCheck>,
     /// What the last chart upload judged, for the panel to report.
-    tally: Tally,
+    /// Charted depths of the features in view that the under-keel check
+    /// may judge, kept so the panel's tally can be recomputed when the
+    /// tide moves without touching the vertex buffers.
+    judged: Vec<f64>,
 }
 
 #[derive(Debug)]
@@ -653,7 +792,9 @@ impl Renderer {
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x2,
-                        1 => Float32x4,
+                        1 => Float32x2,
+                        2 => Float32x4,
+                        3 => Float32,
                     ],
                 })],
             },
@@ -694,14 +835,16 @@ impl Renderer {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some("vs_fill"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x2,
-                        1 => Float32x4,
+                        1 => Float32x2,
+                        2 => Float32x4,
+                        3 => Float32,
                     ],
                 })],
             },
@@ -996,7 +1139,7 @@ impl Renderer {
             // with a guessed draft would paint confident red over a chart
             // nobody asked a question about.
             draft_check: None,
-            tally: Tally::default(),
+            judged: Vec::new(),
         })
     }
 
@@ -1268,6 +1411,10 @@ impl Renderer {
                     (layer.origin.x - centre.x) as f32,
                     (layer.origin.y - centre.y) as f32,
                 ],
+                // Written every frame along with the origin, which is what
+                // makes the under-keel check free to change: a new tide is
+                // 32 bytes, not a chart.
+                check: ViewUniform::check_of(self.draft_check),
             };
             self.queue
                 .write_buffer(&layer.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -1340,28 +1487,22 @@ impl Renderer {
         self.draft_check
     }
 
-    /// What the last `set_chart` judged.
-    pub fn clearance_tally(&self) -> Tally {
-        self.tally
-    }
-
-    /// The verdict for one feature, or `None` if the check does not apply.
+    /// How the features in view are judged, for the panel.
     ///
-    /// It applies only to styles whose value really is a depth below chart
-    /// datum. A light's HEIGHT is a height above it and a buoy has no depth
-    /// at all, so running them through the same arithmetic would paint
-    /// confident nonsense.
-    fn clearance_of(&self, style: ChartStyle, value: Option<f64>) -> Option<Clearance> {
-        let check = self.draft_check?;
-        let charted = value?;
-        matches!(
-            style,
-            ChartStyle::Sounding
-                | ChartStyle::Danger
-                | ChartStyle::DepthArea
-                | ChartStyle::DepthContour
-        )
-        .then(|| depth::assess(&check.draft, charted, &check.tide))
+    /// Recomputed on demand rather than stored, because the verdict now
+    /// lives in the shader: `set_chart` keeps only the list of charted
+    /// depths, and this walks it against whatever the tide is now. A few
+    /// thousand comparisons, which is nothing next to the re-upload that
+    /// keeping it in step used to cost.
+    pub fn clearance_tally(&self) -> Tally {
+        let mut tally = Tally::default();
+        let Some(check) = self.draft_check else {
+            return tally;
+        };
+        for &charted in &self.judged {
+            tally.count(depth::assess(&check.draft, charted, &check.tide));
+        }
+        tally
     }
 
     pub fn set_chart(
@@ -1380,59 +1521,57 @@ impl Renderer {
         // land and depth areas arrive before the marks that sit on them.
         // Preserving it here is the whole reason this takes a slice rather
         // than something unordered.
-        // Judged once per feature, not per vertex: the verdict is a
-        // property of the feature's depth, and a polyline can be hundreds
-        // of vertices.
-        let mut tally = Tally::default();
+        //
+        // The verdict itself is *not* computed here any more. A vertex
+        // carries its charted depth and the shader decides, so that moving
+        // the tide costs a uniform write rather than a re-upload of
+        // 413,000 vertices. What is kept is the list of depths the panel's
+        // tally counts, which is recomputed on demand instead.
+        self.judged.clear();
 
         // Fills go in their own buffer but share this origin, so one pan
         // updates both uniforms consistently. Getting that wrong would
         // slide the shading off its own coastline.
         let mut fill_vertices: Vec<Vertex> = Vec::new();
         for area in areas {
-            let colour = match self.clearance_of(area.style, area.value) {
-                // With the check on, a depth area is shaded by verdict and
-                // nothing else: its own depth band is exactly the
-                // information the verdict already folds in.
-                Some(verdict) => clearance_fill_for(verdict),
-                None => fill_colour_for(area.style, area.value),
-            };
-            let Some(colour) = colour else {
+            let judgeable = judgeable(area.style);
+            // A fill is emitted whenever it has *either* a band colour or a
+            // depth the check could shade. Skipping the ones with no band
+            // colour would mean a depth area vanishing when the check was
+            // switched off, which is the wrong failure — and deciding it
+            // here is the only part that cannot move to the shader,
+            // because a triangle that was never uploaded cannot appear.
+            let band = fill_colour_for(area.style, area.value);
+            if band.is_none() && !(judgeable && area.value.is_some()) {
                 continue;
-            };
+            }
+            // Transparent rather than skipped: the shader will paint it if
+            // the verdict says so, and leave it invisible if not.
+            let colour = band.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+            let depth = judgeable.then_some(area.value).flatten();
             for triangle in &area.triangles {
                 for corner in triangle {
-                    fill_vertices.push(Vertex {
-                        offset: offset(*corner),
-                        colour,
-                    });
+                    fill_vertices.push(Vertex::judged(offset(*corner), colour, depth));
                 }
             }
         }
 
         for line in lines {
-            let colour = match self.clearance_of(line.style, line.value) {
-                Some(verdict) => {
-                    // Depth areas are the picture; contours are the same
-                    // information as a boundary. Both are counted so the
-                    // panel's tally is of features judged, not of dots.
-                    tally.count(verdict);
-                    colour_for_clearance(verdict)
-                }
-                None => colour_for(line.style),
-            };
+            let colour = colour_for(line.style);
+            let depth = judgeable(line.style).then_some(line.value).flatten();
+            if let Some(d) = depth {
+                // Remembered so the panel's tally can be recomputed when
+                // the tide moves. Depth areas are the picture; contours are
+                // the same information as a boundary. Both are counted, so
+                // the tally is of features judged rather than of dots.
+                self.judged.push(d);
+            }
             // A polyline of n points is n-1 separate segments under
             // LineList. A line strip topology would halve this, but it
             // cannot express several disconnected polylines in one draw.
             for pair in line.points.windows(2) {
-                vertices.push(Vertex {
-                    offset: offset(pair[0]),
-                    colour,
-                });
-                vertices.push(Vertex {
-                    offset: offset(pair[1]),
-                    colour,
-                });
+                vertices.push(Vertex::judged(offset(pair[0]), colour, depth));
+                vertices.push(Vertex::judged(offset(pair[1]), colour, depth));
             }
         }
 
@@ -1444,41 +1583,28 @@ impl Renderer {
         let arm = point_arm(lines, points);
         for p in points {
             let c = offset(p.at);
-            let (colour, emphasis) = match self.clearance_of(p.style, p.value) {
-                Some(verdict) => {
-                    tally.count(verdict);
-                    // Modest now that the area fills carry the signal. The
-                    // crosses were enlarged to 2.2x when they were the only
-                    // way to see a verdict; with the water itself shaded
-                    // they only need to be findable, not shouty — and a
-                    // sounding is still the more precise statement, since
-                    // one 1.2 m spot inside a 1.8-3.6 m band is invisible
-                    // in the band's own colour.
-                    let emphasis = match verdict {
-                        Clearance::Clear => 1.0,
-                        Clearance::TightAtLow => 1.2,
-                        Clearance::Foul => 1.5,
-                    };
-                    (colour_for_clearance(verdict), emphasis)
-                }
-                None => (colour_for(p.style), 1.0),
-            };
-            let a = arm * mark_scale(p.style) * emphasis;
+            let colour = colour_for(p.style);
+            let depth = judgeable(p.style).then_some(p.value).flatten();
+            if let Some(d) = depth {
+                self.judged.push(d);
+            }
+            // The arm goes in its own attribute and is scaled on the GPU,
+            // which is what lets a verdict change the size of a mark
+            // without the geometry being rebuilt. Emphasis is modest now
+            // that the area fills carry the signal — the crosses were 2.2x
+            // when they were the only way to see a verdict — but a
+            // sounding is still the more precise statement, since one 1.2 m
+            // spot inside an 1.8-3.6 m band is invisible in the band's own
+            // colour. So the size still says something.
+            let a = arm * mark_scale(p.style);
             for (dx, dy) in [(a, 0.0), (0.0, a)] {
-                vertices.push(Vertex {
-                    offset: [c[0] - dx, c[1] - dy],
-                    colour,
-                });
-                vertices.push(Vertex {
-                    offset: [c[0] + dx, c[1] + dy],
-                    colour,
-                });
+                vertices.push(Vertex::judged(c, colour, depth).with_arm([-dx, -dy]));
+                vertices.push(Vertex::judged(c, colour, depth).with_arm([dx, dy]));
             }
         }
 
         self.charts.origin = origin;
         self.charts.count = vertices.len() as u32;
-        self.tally = tally;
 
         self.fills.origin = origin;
         self.fills.count = fill_vertices.len() as u32;
@@ -1748,6 +1874,56 @@ impl Renderer {
                     }
                 }
 
+                Overlay::Current {
+                    speed_kn,
+                    toward_deg,
+                    colour,
+                    ..
+                } => {
+                    /// Half-width of the arrowhead, pixels.
+                    const HEAD: f32 = 5.0;
+                    /// How far back from the point the barbs start.
+                    const HEAD_BACK: f32 = 9.0;
+
+                    if speed_kn
+                        .partial_cmp(&SLACK_KN)
+                        .is_none_or(|o| o == core::cmp::Ordering::Less)
+                    {
+                        // Slack water. A small open circle, the same way a
+                        // calm wind is drawn, because an arrow of no length
+                        // pointing nowhere would still look like a claim.
+                        for i in 0..RING_SEGMENTS {
+                            let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            let b = (i + 1) as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+                            segment(
+                                [4.0 * a.cos(), 4.0 * a.sin()],
+                                [4.0 * b.cos(), 4.0 * b.sin()],
+                                colour,
+                            );
+                        }
+                        continue;
+                    }
+
+                    // `shaft` gives the unit vector for a bearing in
+                    // screen pixels. A current names where it is going, so
+                    // the arrow runs from the station outwards along it.
+                    let along = shaft(toward_deg);
+                    let across = (along.1, -along.0);
+                    let point =
+                        |d: f32, w: f32| [along.0 * d + across.0 * w, along.1 * d + across.1 * w];
+
+                    let length = current_length_px(speed_kn);
+                    let tip = point(length, 0.0);
+
+                    // Drawn from the station, not centred on it: the
+                    // station is where the current was measured, and an
+                    // arrow straddling it would put half the flow
+                    // upstream of the place it describes.
+                    segment([0.0, 0.0], tip, colour);
+                    segment(tip, point(length - HEAD_BACK, HEAD), colour);
+                    segment(tip, point(length - HEAD_BACK, -HEAD), colour);
+                }
+
                 Overlay::Boat {
                     course_deg, colour, ..
                 } => {
@@ -1915,15 +2091,17 @@ impl Renderer {
         // f32 stay small no matter where on the planet the boat is.
         let centre = chart::project(view.centre);
 
+        // The grid is not chart data, so it carries no depth and the
+        // under-keel check must never touch it.
         let line = |out: &mut Vec<Vertex>, ax: f64, ay: f64, bx: f64, by: f64, colour| {
-            out.push(Vertex {
-                offset: [(ax - centre.x) as f32, (ay - centre.y) as f32],
+            out.push(Vertex::plain(
+                [(ax - centre.x) as f32, (ay - centre.y) as f32],
                 colour,
-            });
-            out.push(Vertex {
-                offset: [(bx - centre.x) as f32, (by - centre.y) as f32],
+            ));
+            out.push(Vertex::plain(
+                [(bx - centre.x) as f32, (by - centre.y) as f32],
                 colour,
-            });
+            ));
         };
 
         let z = view.tile_zoom();
@@ -2372,5 +2550,302 @@ mod palette_tests {
         ] {
             assert!(mark_scale(style) > 0.0, "{style:?} would be invisible");
         }
+    }
+
+    // ── The under-keel check, now that the shader does it ───────────────
+    //
+    // Two implementations of a navigation rule is a real risk, and the
+    // ordinary way it goes wrong is not someone writing bad WGSL — it is
+    // someone changing `rutter_core::depth::assess` and never thinking
+    // about the shader again. These two tests exist to make that fail
+    // loudly instead of quietly painting the wrong water green.
+
+    /// `chart.wgsl`, read at compile time so a test can check it.
+    const SHADER: &str = include_str!("chart.wgsl");
+
+    /// Pull `const NAME = vec4<f32>(a, b, c, d);` out of the shader.
+    fn shader_colour(name: &str) -> [f32; 4] {
+        let line = SHADER
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(&format!("const {name} ")))
+            .unwrap_or_else(|| panic!("{name} is not declared in chart.wgsl"));
+        let inside = line
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(args, _)| args)
+            .unwrap_or_else(|| panic!("{name} is not a vec4 literal: {line}"));
+        let parts: Vec<f32> = inside
+            .split(',')
+            .map(|v| v.trim().parse().unwrap_or_else(|_| panic!("{name}: {v}")))
+            .collect();
+        assert_eq!(parts.len(), 4, "{name} has {} components", parts.len());
+        [parts[0], parts[1], parts[2], parts[3]]
+    }
+
+    /// Pull a scalar `const NAME: f32 = value;` out of the shader.
+    fn shader_scalar(name: &str) -> f32 {
+        let line = SHADER
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(&format!("const {name}:")))
+            .unwrap_or_else(|| panic!("{name} is not declared in chart.wgsl"));
+        line.split_once('=')
+            .map(|(_, v)| v.trim().trim_end_matches(';'))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{name} is not a scalar literal: {line}"))
+    }
+
+    #[test]
+    fn the_shader_palette_matches_the_rust_one() {
+        // Colour is the whole output of this feature. A shader constant
+        // edited to a slightly different amber, or a Rust one changed
+        // without the shader, would show as a chart that disagrees with
+        // its own legend — and nothing else would complain.
+        assert_eq!(
+            shader_colour("CLEAR_LINE"),
+            colour_for_clearance(Clearance::Clear)
+        );
+        assert_eq!(
+            shader_colour("TIGHT_LINE"),
+            colour_for_clearance(Clearance::TightAtLow)
+        );
+        assert_eq!(
+            shader_colour("FOUL_LINE"),
+            colour_for_clearance(Clearance::Foul)
+        );
+
+        assert_eq!(
+            Some(shader_colour("TIGHT_FILL")),
+            clearance_fill_for(Clearance::TightAtLow)
+        );
+        assert_eq!(
+            Some(shader_colour("FOUL_FILL")),
+            clearance_fill_for(Clearance::Foul)
+        );
+        // Clear water is unshaded, which in a shader means transparent
+        // rather than absent.
+        assert_eq!(clearance_fill_for(Clearance::Clear), None);
+        assert_eq!(shader_colour("CLEAR_FILL"), [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_no_depth_sentinel_matches_the_shader() {
+        // If these drift apart the shader either judges features that are
+        // not depths — painting a light's height as foul water — or stops
+        // judging real soundings. Both are silent.
+        assert_eq!(shader_scalar("NO_DEPTH"), NO_DEPTH);
+        // And it has to be below any depth a chart could really state.
+        // The Challenger Deep is 10,935 m, so a million metres is four
+        // orders of magnitude of headroom. A constant assertion, which is
+        // the point: it documents the requirement and fails the build if
+        // someone brings the sentinel up into the range of real data.
+        const _: () = assert!(NO_DEPTH < -1.0e6);
+    }
+
+    /// A literal transliteration of `verdict_of` in `chart.wgsl`.
+    ///
+    /// Kept beside the shader it copies, and compared against the core
+    /// rule by the test below. This does not catch both being edited
+    /// wrongly in the same way — but it does catch the failure that
+    /// actually happens, which is `assess` changing and the shader not.
+    fn shader_verdict(depth: f32, check: [f32; 4]) -> Option<Clearance> {
+        if check[0] == 0.0 || depth <= NO_DEPTH {
+            return None;
+        }
+        let needed = check[1] + shader_scalar("TIE_MARGIN");
+        if depth + check[2] < needed {
+            return Some(Clearance::Foul);
+        }
+        if depth + check[3] < needed {
+            return Some(Clearance::TightAtLow);
+        }
+        Some(Clearance::Clear)
+    }
+
+    #[test]
+    fn clearance_matches_the_core_rule() {
+        // Over a grid that covers the cases that matter: drying heights
+        // (negative charted depths), the exact boundary where water equals
+        // draft, a deep-keeled yacht, a dinghy, and a falling tide.
+        let drafts = [
+            Draft {
+                draft_m: 0.3,
+                safety_m: 0.0,
+            },
+            Draft {
+                draft_m: 1.8,
+                safety_m: 0.5,
+            },
+            Draft {
+                draft_m: 2.0,
+                safety_m: 0.0,
+            },
+            Draft {
+                draft_m: 3.4,
+                safety_m: 1.0,
+            },
+        ];
+        let tides = [
+            TideWindow {
+                now_m: 0.0,
+                lowest_m: 0.0,
+            },
+            TideWindow {
+                now_m: 1.7,
+                lowest_m: 0.2,
+            },
+            TideWindow {
+                now_m: 0.5,
+                lowest_m: -0.4,
+            },
+            TideWindow {
+                now_m: 2.3,
+                lowest_m: 2.3,
+            },
+        ];
+
+        let mut checked = 0;
+        for draft in drafts {
+            for tide in tides {
+                let check = ViewUniform::check_of(Some(DraftCheck { draft, tide }));
+                // Tenth-metre steps from well below datum to well below
+                // the keel of anything.
+                for tenths in -30..300 {
+                    let charted = f64::from(tenths) / 10.0;
+                    let core = depth::assess(&draft, charted, &tide);
+                    let shader = shader_verdict(charted as f32, check)
+                        .unwrap_or_else(|| panic!("{charted} m went unjudged"));
+
+                    // How far this case is from a decision boundary. The
+                    // two arithmetics can only differ within a millimetre
+                    // of one, so away from them they must agree exactly.
+                    let needed = draft.needed_m();
+                    let slack = (charted + tide.now_m - needed)
+                        .abs()
+                        .min((charted + tide.lowest_m - needed).abs());
+
+                    if slack > 0.01 {
+                        assert_eq!(
+                            shader, core,
+                            "charted {charted} m, draft {draft:?}, tide {tide:?}"
+                        );
+                    } else {
+                        // At a boundary the shader may be one step more
+                        // severe, never less. A depth check that rounds in
+                        // the boat's favour is the one failure this whole
+                        // feature exists to avoid.
+                        assert!(
+                            severity(shader) >= severity(core),
+                            "shader was {shader:?} where the rule says {core:?}: \
+                             charted {charted} m, draft {draft:?}, tide {tide:?}"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 5_000, "only {checked} cases");
+    }
+
+    /// How bad a verdict is, so "never less severe" can be asserted.
+    fn severity(clearance: Clearance) -> u8 {
+        match clearance {
+            Clearance::Clear => 0,
+            Clearance::TightAtLow => 1,
+            Clearance::Foul => 2,
+        }
+    }
+
+    #[test]
+    fn a_tie_falls_against_the_boat() {
+        // Exactly enough water, to the millimetre. The rule in core calls
+        // that clear; the shader calls it foul, deliberately, because f32
+        // cannot be trusted to agree with f64 at the boundary and the safe
+        // direction to be wrong is the pessimistic one.
+        let draft = Draft {
+            draft_m: 2.0,
+            safety_m: 0.0,
+        };
+        let tide = TideWindow {
+            now_m: 2.0,
+            lowest_m: 2.0,
+        };
+        let check = ViewUniform::check_of(Some(DraftCheck { draft, tide }));
+
+        assert_eq!(depth::assess(&draft, 0.0, &tide), Clearance::Clear);
+        assert_eq!(shader_verdict(0.0, check), Some(Clearance::Foul));
+
+        // A centimetre of real clearance and they agree again, so the
+        // pessimism is confined to the boundary.
+        assert_eq!(shader_verdict(0.01, check), Some(Clearance::Clear));
+        assert_eq!(depth::assess(&draft, 0.01, &tide), Clearance::Clear);
+    }
+
+    #[test]
+    fn the_check_being_off_judges_nothing() {
+        let check = ViewUniform::check_of(None);
+        for charted in [-2.0_f32, 0.0, 1.0, 50.0] {
+            assert_eq!(shader_verdict(charted, check), None);
+        }
+    }
+
+    #[test]
+    fn a_feature_with_no_depth_is_never_judged() {
+        // A light's HEIGHT is above datum, not below it. Judging one would
+        // paint a lighthouse as foul water.
+        let check = ViewUniform::check_of(Some(DraftCheck {
+            draft: Draft {
+                draft_m: 2.0,
+                safety_m: 0.5,
+            },
+            tide: TideWindow {
+                now_m: 0.0,
+                lowest_m: 0.0,
+            },
+        }));
+        assert_eq!(shader_verdict(NO_DEPTH, check), None);
+        assert_eq!(shader_verdict(NO_DEPTH - 1.0, check), None);
+        // And the styles that carry a real depth are the only ones gated in.
+        assert!(judgeable(ChartStyle::Sounding));
+        assert!(judgeable(ChartStyle::DepthArea));
+        assert!(judgeable(ChartStyle::DepthContour));
+        assert!(judgeable(ChartStyle::Danger));
+        assert!(
+            !judgeable(ChartStyle::Light),
+            "a light's height is not a depth"
+        );
+        assert!(!judgeable(ChartStyle::Buoy));
+        assert!(!judgeable(ChartStyle::Coastline));
+        assert!(!judgeable(ChartStyle::Land));
+    }
+
+    #[test]
+    fn a_vertex_carries_its_depth_or_says_it_has_none() {
+        assert_eq!(Vertex::plain([0.0, 0.0], [1.0; 4]).depth, NO_DEPTH);
+        assert_eq!(Vertex::judged([0.0, 0.0], [1.0; 4], None).depth, NO_DEPTH);
+        assert_eq!(Vertex::judged([0.0, 0.0], [1.0; 4], Some(4.5)).depth, 4.5);
+        // Drying heights are negative and must survive as negatives, not
+        // be mistaken for the sentinel.
+        let drying = Vertex::judged([0.0, 0.0], [1.0; 4], Some(-1.2));
+        assert_eq!(drying.depth, -1.2);
+        assert!(drying.depth > NO_DEPTH);
+    }
+
+    #[test]
+    fn the_arm_is_zero_unless_it_is_set() {
+        // Everything but a sounding's cross must be unaffected by the
+        // emphasis scaling, or the whole chart would breathe with the tide.
+        assert_eq!(Vertex::plain([1.0, 2.0], [1.0; 4]).arm, [0.0, 0.0]);
+        assert_eq!(
+            Vertex::judged([1.0, 2.0], [1.0; 4], Some(3.0)).arm,
+            [0.0, 0.0]
+        );
+        assert_eq!(
+            Vertex::judged([1.0, 2.0], [1.0; 4], Some(3.0))
+                .with_arm([0.5, -0.5])
+                .arm,
+            [0.5, -0.5]
+        );
     }
 }

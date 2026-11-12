@@ -202,6 +202,8 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  scroll or +/-   zoom");
                 println!("  0               fit the chart");
                 println!("  b               centre on the boat");
+                println!("  [ and ]         step the shown time by 30 minutes");
+                println!("  n               back to now");
                 println!("  Escape          quit");
                 std::process::exit(0);
             }
@@ -633,6 +635,12 @@ impl ApplicationHandler for Platform {
                     // on the water it is where you look back to after
                     // every detour across the chart.
                     Key::Character("b" | "B") => changed = self.app.go_to_boat_now(),
+                    // Time. The same control as the slider at the bottom,
+                    // because a half-hour step is easier to hit with a key
+                    // than with a drag, and because the slider spans a day.
+                    Key::Character("[") => changed = self.app.nudge_time(-30 * 60),
+                    Key::Character("]") => changed = self.app.nudge_time(30 * 60),
+                    Key::Character("n" | "N") => changed = self.app.set_time_offset(0),
                     _ => changed = false,
                 }
                 if changed {

@@ -34,11 +34,11 @@ use rutter_charts::{ChartSource, Collected, ImagerySource};
 use rutter_core::chart::TileId;
 use rutter_core::depth::{Draft, TideWindow};
 use rutter_core::nmea::Vessel;
-use rutter_core::tide::{Kind, Station};
+use rutter_core::tide::{CurrentKind, CurrentStation, Kind, Station};
 use rutter_core::{chart, LatLon, View};
 use rutter_render::{
-    Action, DraftState, ImageryState, LayerEntry, Overlay, PanelState, Renderer, TideMarker,
-    TideReading, TideState, Ui, VesselState, WindState,
+    Action, CurrentState, DraftState, ImageryState, LayerEntry, Overlay, PanelState, Renderer,
+    TideMarker, TideReading, TideState, TimeState, Ui, VesselState, WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -130,6 +130,12 @@ fn barb_lattice(view: &Viewport, base_deg: f64) -> Vec<Position> {
 /// Matching the panel's own tide colour, so a ring on the chart and a high
 /// water in the panel are visibly the same subject.
 const TIDE_COLOUR: [f32; 4] = [0.42, 0.78, 1.0, 1.0];
+/// Tidal current arrows.
+///
+/// Green-blue, distinct from the tide stations' blue rings they sit beside
+/// and from the boat's orange. A current is a different kind of statement
+/// from a height and should not be mistaken for one.
+const CURRENT_COLOUR: [f32; 4] = [0.35, 0.92, 0.78, 0.95];
 const WIND_COLOUR: [f32; 4] = [0.78, 0.90, 0.94, 0.85];
 /// Grey, for a forecast old enough to distrust.
 const WIND_STALE_COLOUR: [f32; 4] = [0.54, 0.54, 0.54, 0.75];
@@ -162,6 +168,14 @@ const FOLLOW_STALE_SECS: i64 = 30;
 /// Above this the boat is making way and its course over ground means
 /// something. Below it, GPS course is noise.
 const UNDERWAY_KN: f64 = 0.5;
+
+/// How far either side of now the time slider reaches when there is no
+/// forecast to bound it.
+///
+/// The tide and the currents are astronomical and work for any time at
+/// all, so this is a judgement about what is useful rather than a limit:
+/// one tide either way covers planning a passage and getting back.
+const TIME_SPAN_SECS: i64 = 12 * 3600;
 
 /// The data files a platform found, however it found them.
 #[derive(Debug, Default)]
@@ -220,6 +234,16 @@ pub struct App {
     last: Option<Box<Collected>>,
 
     tides: Option<TideStations>,
+    /// Harmonic tidal current stations, loaded once like the tide ones.
+    currents: Vec<CurrentStation>,
+    currents_visible: bool,
+    /// Seconds from now that the chart is being shown for.
+    ///
+    /// Zero is now, and nearly always is. Everything astronomical or
+    /// forecast follows it — tide, currents, the under-keel check, wind,
+    /// temperature. The boat's own position deliberately does not: a GPS
+    /// says where the boat is, and no slider can change that.
+    shown_offset_secs: i64,
     /// Every station, loaded once.
     ///
     /// Held in memory rather than queried per frame. `nearest` and `in_box`
@@ -320,6 +344,7 @@ impl App {
             // stations is to see them.
             imagery_visible: true,
             tide_visible: true,
+            currents_visible: true,
             draft: Draft {
                 draft_m: draft_m.unwrap_or(Draft::default().draft_m),
                 ..Draft::default()
@@ -341,6 +366,28 @@ impl App {
             .as_ref()
             .and_then(|db| db.all().ok())
             .unwrap_or_default();
+        app.currents = app
+            .tides
+            .as_ref()
+            .and_then(|db| db.currents().ok())
+            .unwrap_or_default();
+        if app.currents.is_empty() && app.tides.is_some() {
+            log::info!(
+                "no harmonic current stations — NOAA publishes most as offsets \
+                 against a reference station, which is a method this does not \
+                 have yet"
+            );
+        } else if !app.currents.is_empty() {
+            log::info!(
+                "currents: {} harmonic stations, {}",
+                app.currents.len(),
+                app.currents
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
         app.rebuild_layer_entries();
         app
     }
@@ -492,6 +539,11 @@ impl App {
             }
         }
 
+        // Currents over the barbs and under the boat: an arrow at a
+        // station is a statement about that place, so it should not be
+        // buried by the synoptic wind drawn across the whole view.
+        marks.extend(self.current_marks());
+
         // The boat last, so it is drawn over the notation rather than
         // under it. Of everything on this chart it is the one mark that
         // must never be hidden by another.
@@ -537,7 +589,12 @@ impl App {
         let Some(forecast) = &self.weather else {
             return (Vec::new(), false);
         };
-        let Some((step, drift)) = forecast.nearest(unix_now()) else {
+        let shown = self.shown_time();
+        // `nearest` only for the node spacing and the staleness of the run
+        // — the values themselves are interpolated to the shown instant by
+        // `wind_at`, so dragging the slider moves the barbs continuously
+        // instead of snapping them every ninety minutes.
+        let Some((step, drift)) = forecast.nearest(shown) else {
             return (Vec::new(), false);
         };
         // A stale forecast is still drawn, because it beats nothing, but it
@@ -552,7 +609,7 @@ impl App {
         let kept: Vec<Overlay> = lattice
             .iter()
             .filter_map(|&at| {
-                let wind = step.wind.sample(at)?;
+                let wind = forecast.wind_at(shown, at)?;
                 Some(Overlay::Barb {
                     at: chart::project(at),
                     speed_kn: wind.speed_kn() as f32,
@@ -573,6 +630,137 @@ impl App {
         (kept, kept_count < lattice.len())
     }
 
+    /// Current arrows, one per station in view.
+    ///
+    /// One per station and nothing between them. A current follows its
+    /// channel: two stations a mile apart can have the flood setting in
+    /// quite different directions, and halfway between them the water may
+    /// be going sideways or there may be no water at all. Interpolating
+    /// would produce a smooth field that was confidently wrong everywhere
+    /// except at the stations — which is why a tidal current chart has
+    /// always been arrows at measured places.
+    fn current_marks(&self) -> Vec<Overlay> {
+        if !self.currents_visible {
+            return Vec::new();
+        }
+        let shown = self.shown_time();
+        let (nw, se) = self.view.bounds();
+        self.currents
+            .iter()
+            .filter(|s| s.lat >= se.lat && s.lat <= nw.lat && s.lon >= nw.lon && s.lon <= se.lon)
+            .map(|station| {
+                let current = station.current_at(shown);
+                Overlay::Current {
+                    at: chart::project(LatLon::new(station.lat, station.lon)),
+                    speed_kn: current.speed_kn as f32,
+                    toward_deg: current.toward_deg as f32,
+                    colour: CURRENT_COLOUR,
+                }
+            })
+            .collect()
+    }
+
+    /// The current station to report on: the nearest to the boat if there
+    /// is a fresh fix, otherwise the nearest to the middle of the screen.
+    fn current_station(&self) -> Option<&CurrentStation> {
+        let from = self.fresh_fix().unwrap_or(self.view.centre);
+        self.currents.iter().min_by(|a, b| {
+            let da = from.distance_to(LatLon::new(a.lat, a.lon));
+            let db = from.distance_to(LatLon::new(b.lat, b.lon));
+            da.partial_cmp(&db).unwrap_or(core::cmp::Ordering::Equal)
+        })
+    }
+
+    /// What the panel shows about the currents.
+    pub fn current_state(&self) -> CurrentState {
+        if self.currents.is_empty() {
+            return CurrentState::default();
+        }
+        let shown = self.shown_time();
+        let station = self.current_station();
+
+        CurrentState {
+            available: true,
+            visible: self.currents_visible,
+            stations: self.currents.len(),
+            station: station.map(|s| s.name.clone()),
+            now: station.map(|s| {
+                let current = s.current_at(shown);
+                if current.speed_kn < 0.1 {
+                    // Naming a direction for water that has stopped would
+                    // be inventing one.
+                    format!(
+                        "slack — turning {}",
+                        if current.flooding {
+                            "to flood"
+                        } else {
+                            "to ebb"
+                        }
+                    )
+                } else {
+                    format!(
+                        "{:.1} kn {}, setting {:03.0}°",
+                        current.speed_kn,
+                        if current.flooding { "flood" } else { "ebb" },
+                        current.toward_deg
+                    )
+                }
+            }),
+            next: station
+                .map(|s| {
+                    s.events(shown, shown + 12 * 3600)
+                        .into_iter()
+                        .take(4)
+                        .map(|e| {
+                            let what = match e.kind {
+                                CurrentKind::Slack => "slack".to_owned(),
+                                CurrentKind::MaxFlood => {
+                                    format!("{:.1} kn flood", e.speed_kn)
+                                }
+                                CurrentKind::MaxEbb => format!("{:.1} kn ebb", e.speed_kn),
+                            };
+                            format!(
+                                "{} {}  {}",
+                                format_utc_hhmm(e.unix),
+                                what,
+                                format_away(e.unix - shown)
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // Not known from the database, which only stores what it could
+            // predict. Reported as zero rather than guessed at.
+            subordinate_nearby: 0,
+        }
+    }
+
+    /// What the panel shows about the time being viewed.
+    pub fn time_state(&self) -> TimeState {
+        let (min, max) = self.time_span();
+        let shown = self.shown_time();
+        TimeState {
+            offset_secs: self.shown_offset_secs,
+            min_secs: min,
+            max_secs: max,
+            shown: format_utc_hhmm(shown),
+            away: if self.shown_offset_secs == 0 {
+                String::new()
+            } else {
+                format_away(self.shown_offset_secs)
+            },
+            at_now: self.shown_offset_secs == 0,
+            // True when there is no forecast at all: there is then nothing
+            // to be outside of, and saying "no forecast this far out"
+            // beside a chart with no wind layer would be noise.
+            wind_covers_this: self
+                .weather
+                .as_ref()
+                .and_then(|f| f.span())
+                .is_none_or(|(first, last)| (first..=last).contains(&shown)),
+        }
+    }
+
     /// Gather what the panel needs. See [`PanelState`].
     pub fn panel_state(&self, renderer: &Renderer, pixels_per_point: f32) -> PanelState {
         PanelState {
@@ -589,6 +777,8 @@ impl App {
                     .and_then(|i| i.metadata().attribution.clone()),
             },
             tides: self.tide_state(pixels_per_point),
+            currents: self.current_state(),
+            time: self.time_state(),
             draft: self.draft_state(renderer),
             wind: self.wind_state(),
             status: status_line(&self.view),
@@ -648,33 +838,26 @@ impl App {
     /// re-decoding gzip and protobuf for geometry already on the GPU is the
     /// kind of waste that shows up as a warm phone.
     fn refresh_charts(&mut self, renderer: &mut Renderer) {
-        // Settled before any geometry is uploaded, because the verdict is
-        // baked into vertex colours rather than applied at draw time.
+        // Handed over unrounded and unconditionally. Both of those used to
+        // matter a great deal: the verdict was baked into vertex colours,
+        // so any change re-uploaded every vertex in view — 413,000 of them
+        // in a harbour — and the tide was rounded to centimetres purely to
+        // stop that happening every second.
         //
-        // The tide is rounded to centimetres first, and that rounding is
-        // what stops this being expensive. The verdict is baked into vertex
-        // colours, so any change to it re-uploads every vertex in view —
-        // 400,000 of them on a busy chart. Comparing raw `f64` heights made
-        // that happen every second, because a second of tide is always a
-        // fraction of a millimetre of change. Chart datum and NOAA's own
-        // predictions are published to the centimetre, so rounding there
-        // loses nothing and the re-upload now happens only when a sounding
-        // could actually change verdict.
-        let centimetres = |m: f64| (m * 100.0).round() / 100.0;
-        let check = (self.draft_check)
-            .then(|| self.tide_window())
-            .flatten()
-            .map(|tide| rutter_render::DraftCheck {
-                draft: self.draft,
-                tide: TideWindow {
-                    now_m: centimetres(tide.now_m),
-                    lowest_m: centimetres(tide.lowest_m),
-                },
-            });
-        let recolour = renderer.draft_check() != check;
-        if recolour {
-            renderer.set_draft_check(check);
-        }
+        // The shader computes the verdict now (see `chart.wgsl`), so this
+        // is a 32-byte uniform write per frame. The rounding went with the
+        // cost it existed to avoid, which is what makes a time slider
+        // possible: the tide can move continuously without the chart being
+        // rebuilt behind it.
+        renderer.set_draft_check(
+            (self.draft_check)
+                .then(|| self.tide_window())
+                .flatten()
+                .map(|tide| rutter_render::DraftCheck {
+                    draft: self.draft,
+                    tide,
+                }),
+        );
 
         let Some(worker) = self.charts.as_mut() else {
             return;
@@ -703,14 +886,6 @@ impl App {
         if let Some(got) = worker.take_answer() {
             self.apply_collected(renderer, &got);
             self.last = Some(got);
-        } else if recolour {
-            // The draft changed but the chart did not. Re-upload what is
-            // already here rather than making the worker decode it again —
-            // only the colours differ.
-            if let Some(last) = self.last.take() {
-                self.apply_collected(renderer, &last);
-                self.last = Some(last);
-            }
         }
     }
 
@@ -920,17 +1095,37 @@ impl App {
                     self.tide_visible = *on;
                     touched = true;
                 }
+                Action::SetCurrents(on) => {
+                    self.currents_visible = *on;
+                    touched = true;
+                }
+                // The time. Clamped to the span the panel offered, so a
+                // stale action from a frame where the forecast was wider
+                // cannot put the chart somewhere the slider cannot reach.
+                Action::SetTimeOffset(seconds) => {
+                    let (min, max) = self.time_span();
+                    let clamped = (*seconds).clamp(min, max);
+                    if clamped != self.shown_offset_secs {
+                        self.shown_offset_secs = clamped;
+                        touched = true;
+                    }
+                }
+                Action::NowTime => {
+                    if self.shown_offset_secs != 0 {
+                        self.shown_offset_secs = 0;
+                        touched = true;
+                    }
+                }
+                // Neither of these touches the geometry any more: the
+                // charted depth is in the vertex and the boat is in a
+                // uniform, so switching the check on or changing the draft
+                // is a uniform write on the next frame.
                 Action::SetDraftCheck(on) => {
                     self.draft_check = *on;
-                    // The verdict is baked into vertex colours, so the
-                    // chart geometry has to be rebuilt rather than merely
-                    // redrawn.
-                    self.loaded.clear();
                     touched = true;
                 }
                 Action::SetDraft(draft) => {
                     self.draft = *draft;
-                    self.loaded.clear();
                     touched = true;
                 }
                 Action::SelectTideStation(id) => {
@@ -996,7 +1191,10 @@ impl App {
                 | Action::GoToBoat
                 | Action::ConnectNmea(_)
                 | Action::DisconnectNmea
-                | Action::UseDeviceGps => {}
+                | Action::UseDeviceGps
+                | Action::SetCurrents(_)
+                | Action::SetTimeOffset(_)
+                | Action::NowTime => {}
             }
         }
 
@@ -1028,6 +1226,54 @@ impl App {
         self.nmea_trouble = None;
         self.vessel_visible = true;
         self.nmea.is_some()
+    }
+
+    /// Look at a time this many seconds from now. Zero is now.
+    ///
+    /// Clamped to the range the slider offers, so a caller cannot put the
+    /// chart somewhere the control cannot reach. True if anything moved.
+    pub fn set_time_offset(&mut self, seconds: i64) -> bool {
+        let (min, max) = self.time_span();
+        let clamped = seconds.clamp(min, max);
+        if clamped == self.shown_offset_secs {
+            return false;
+        }
+        self.shown_offset_secs = clamped;
+        true
+    }
+
+    /// Step the shown time, for a platform's own key binding.
+    pub fn nudge_time(&mut self, seconds: i64) -> bool {
+        self.set_time_offset(self.shown_offset_secs.saturating_add(seconds))
+    }
+
+    /// The instant the chart is being shown for.
+    ///
+    /// Everything astronomical or forecast reads the time from here rather
+    /// than from the clock, which is the whole mechanism of the time
+    /// slider: one offset, applied in one place, and every layer that
+    /// depends on time follows. The boat's own position does not use this
+    /// and must not — see [`Self::boat_mark`].
+    fn shown_time(&self) -> i64 {
+        unix_now() + self.shown_offset_secs
+    }
+
+    /// How far the slider may be dragged, in seconds from now.
+    ///
+    /// The forecast is the binding constraint when there is one. The tide
+    /// and the currents are analytic — they answer for any instant, past
+    /// or future — so without a forecast the range is a judgement about
+    /// what is useful rather than a limit.
+    fn time_span(&self) -> (i64, i64) {
+        let now = unix_now();
+        let (mut min, mut max) = (-TIME_SPAN_SECS, TIME_SPAN_SECS);
+        if let Some((first, last)) = self.weather.as_ref().and_then(|f| f.span()) {
+            // Widened to the forecast, never narrowed below the default:
+            // a six-hour forecast should not shorten the tide slider.
+            min = min.min(first - now);
+            max = max.max(last - now);
+        }
+        (min, max)
     }
 
     /// Centre on the boat, for a platform's own key binding.
@@ -1064,7 +1310,7 @@ impl App {
     }
 
     /// What the panel shows about the boat. See [`VesselState`].
-    fn vessel_state(&self) -> VesselState {
+    pub fn vessel_state(&self) -> VesselState {
         let Some(nmea) = &self.nmea else {
             return VesselState {
                 link: self.nmea_trouble.clone().unwrap_or_default(),
@@ -1150,8 +1396,11 @@ impl App {
     /// Everything the panel shows about the tide — the curve, the next few
     /// turning points, the window the under-keel check uses — comes from
     /// here, computed once a second rather than once a frame.
-    fn refresh_tide_cache(&mut self) {
-        let now = unix_now();
+    pub fn refresh_tide_cache(&mut self) {
+        // The shown time, not the clock. Keying the cache on it means
+        // dragging the slider recomputes the curve exactly as the passing
+        // of a second does, with no extra machinery.
+        let now = self.shown_time();
         let Some(station) = self.tide_station() else {
             self.tide_cache = None;
             return;
@@ -1230,7 +1479,12 @@ impl App {
     /// The minimum is taken over a sampled curve rather than from
     /// `extremes`, because the window's lowest water may be its far end on
     /// a still-falling tide rather than a turning point inside it.
-    fn tide_window(&self) -> Option<TideWindow> {
+    /// The tide the under-keel check is answering against: the height at
+    /// the shown time, and the lowest water in the window after it.
+    ///
+    /// `None` until [`Self::refresh`] has run at least once, since it
+    /// comes out of the once-a-second cache.
+    pub fn tide_window(&self) -> Option<TideWindow> {
         self.tide_cache.as_ref().map(|c| c.window)
     }
 
@@ -1295,7 +1549,7 @@ impl App {
     }
 
     /// Everything the panel needs to show about tides.
-    fn tide_state(&self, pixels_per_point: f32) -> TideState {
+    pub fn tide_state(&self, pixels_per_point: f32) -> TideState {
         let Some(db) = self.tides.as_ref() else {
             return TideState::default();
         };
