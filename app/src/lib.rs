@@ -29,6 +29,7 @@ mod charts;
 pub mod download;
 pub mod nmea;
 mod serial;
+pub mod store;
 pub use charts::ChartWorker;
 
 use rutter_charts::{ChartSource, Collected, ImagerySource};
@@ -334,6 +335,12 @@ pub struct Sources {
     /// way. `None` means the download tool can cost an area but not get
     /// it, and the panel says so.
     pub fetcher: Option<std::sync::Arc<dyn download::TileFetcher>>,
+    /// Where to keep settings and routes.
+    ///
+    /// A platform's business: a desktop has XDG directories and a
+    /// sandboxed app has exactly one place it may write. `None` means the
+    /// app remembers nothing, which still charts.
+    pub data_dir: Option<std::path::PathBuf>,
     /// Where a download should write its MBTiles file.
     ///
     /// A platform's business, because it is the one thing here that is a
@@ -409,6 +416,14 @@ pub struct App {
     /// The area marked for download, and what to fetch for it.
     download: Download,
 
+    /// Where settings and routes are kept, if anywhere.
+    store: Option<store::Store>,
+    /// The settings as last written, so an unchanged frame does not
+    /// rewrite the file sixty times a second.
+    saved_settings: store::Settings,
+    /// The route as last written, for the same reason.
+    saved_route: Route,
+
     /// The passage being planned or followed.
     route: Route,
     route_visible: bool,
@@ -467,6 +482,9 @@ pub struct App {
     /// Where a finished download left its file, so the panel can say what
     /// to do next.
     downloaded: Option<String>,
+    /// Layers the settings said to hide, held until the chart's own layer
+    /// names are known — which is only after the worker's first answer.
+    hidden_on_load: Vec<String>,
     /// Why there is no feed, when the reason was a bad address typed into
     /// the panel. Worth keeping: an address that will not parse is the
     /// most likely failure and the least self-explanatory.
@@ -566,6 +584,44 @@ impl App {
             app.use_device_gps();
         }
 
+        // Settings before anything else that reads them, and before the
+        // first frame: a draft loaded after the chart was coloured would
+        // mean a frame of the wrong shading.
+        app.store = sources.data_dir.and_then(store::Store::open);
+        // Read out before anything is applied, so the store's borrow ends
+        // before the app is written to.
+        let kept = app
+            .store
+            .as_ref()
+            .map(|store| (store.settings(), store.route()));
+        if let Some((settings, route)) = kept {
+            app.apply_settings(&settings);
+            app.saved_settings = settings;
+
+            if let Some(route) = route {
+                log::info!(
+                    "route: {} with {} waypoints",
+                    route.name,
+                    route.waypoints.len()
+                );
+                app.saved_route = route.clone();
+                app.route = route;
+            }
+        }
+
+        // The command line last, so it wins. An explicit `--draft` is a
+        // decision made this minute and must beat a file written last
+        // week — the first version of this applied the settings after the
+        // flag and silently discarded it, so `--draft 2.6` did nothing at
+        // all and the saved value quietly stood.
+        //
+        // The same precedence `--nmea` already has: flag, then the saved
+        // value, then the default.
+        if let Some(metres) = draft_m {
+            app.draft.draft_m = metres;
+            app.draft_check = true;
+        }
+
         app.stations = app
             .tides
             .as_ref()
@@ -661,6 +717,8 @@ impl App {
         self.refresh_imagery(renderer);
         self.refresh_temperature(renderer);
         self.refresh_overlay(renderer);
+        // Last, so what is written is what was just drawn.
+        self.save_if_changed(renderer);
     }
 
     /// Take whatever the NMEA reader has produced, and follow the boat if
@@ -1006,6 +1064,158 @@ impl App {
             }),
             cells: self.temperature_patches.len(),
         }
+    }
+
+    /// Everything worth remembering, as it stands.
+    fn settings_now(&self) -> store::Settings {
+        store::Settings {
+            draft_m: self.draft.draft_m,
+            safety_m: self.draft.safety_m,
+            draft_check: self.draft_check,
+            imagery_visible: self.imagery_visible,
+            // Opacity lives on the renderer, which this does not have
+            // here. Carried through from what was loaded and updated by
+            // the action, so the file keeps whatever was last set.
+            imagery_opacity: self.saved_settings.imagery_opacity,
+            tide_visible: self.tide_visible,
+            currents_visible: self.currents_visible,
+            wind_visible: self.wind_visible,
+            temperature_visible: self.temperature_visible,
+            temperature_opacity: self.temperature_opacity,
+            vessel_visible: self.vessel_visible,
+            route_visible: self.route_visible,
+            nmea: self
+                .nmea
+                .as_ref()
+                .map(|n| match n.endpoint() {
+                    // The built-in GPS is not an address, so there is
+                    // nothing to write — and writing one would make the
+                    // next launch try to open a socket to it.
+                    nmea::Endpoint::Device => String::new(),
+                    other => format!(
+                        "{}://{}",
+                        other.protocol_name().to_lowercase(),
+                        other.address()
+                    ),
+                })
+                .unwrap_or_default(),
+            // `layers` holds what to *show*, empty meaning all. The file
+            // stores the complement, so a chart that gains a layer shows
+            // it rather than hiding it silently.
+            hidden_layers: self.hidden_layer_names(),
+            ..self.saved_settings.clone()
+        }
+    }
+
+    /// Which chart layers are being kept hidden, by name.
+    fn hidden_layer_names(&self) -> Vec<String> {
+        if self.layers.is_empty() {
+            return Vec::new();
+        }
+        self.chart_layer_names()
+            .into_iter()
+            .filter(|name| !self.layers.contains(name))
+            .collect()
+    }
+
+    /// Take settings read from the store.
+    fn apply_settings(&mut self, settings: &store::Settings) {
+        self.draft = Draft {
+            draft_m: settings.draft_m,
+            safety_m: settings.safety_m,
+        };
+        self.draft_check = settings.draft_check;
+        self.imagery_visible = settings.imagery_visible;
+        self.tide_visible = settings.tide_visible;
+        self.currents_visible = settings.currents_visible;
+        self.wind_visible = settings.wind_visible;
+        self.temperature_visible = settings.temperature_visible;
+        self.temperature_opacity = settings.temperature_opacity;
+        self.vessel_visible = settings.vessel_visible;
+        self.route_visible = settings.route_visible;
+
+        // A saved address wins over the built-in GPS, the same way a
+        // command-line one does: naming a feed is a decision.
+        if !settings.nmea.is_empty() && self.nmea.is_none() {
+            match nmea::Endpoint::parse(&settings.nmea) {
+                Ok(endpoint) => self.nmea = nmea::Receiver::spawn(endpoint),
+                Err(e) => {
+                    log::error!("settings: nmea = {}: {e}", settings.nmea);
+                    self.nmea_trouble = Some(format!("{}: {e}", settings.nmea));
+                }
+            }
+        }
+
+        // The hidden list is applied once the chart's own layer names are
+        // known, which is after the first answer from the worker. Held
+        // until then.
+        self.hidden_on_load = settings.hidden_layers.clone();
+    }
+
+    /// Write anything that has changed since it was last written.
+    ///
+    /// Compared rather than written every frame: the files are small but a
+    /// write per frame is sixty fsyncs a second on a phone, and the point
+    /// of keeping them is that they survive, not that they are fresh to
+    /// the millisecond.
+    fn save_if_changed(&mut self, renderer: &Renderer) {
+        let Some(store) = &self.store else {
+            return;
+        };
+
+        let mut settings = self.settings_now();
+        settings.imagery_opacity = renderer.imagery_opacity();
+        if settings != self.saved_settings {
+            store.save_settings(&settings);
+            self.saved_settings = settings;
+        }
+
+        if self.route != self.saved_route {
+            store.save_route(&self.route);
+            self.saved_route = self.route.clone();
+        }
+    }
+
+    /// Write anything changed, without a renderer.
+    ///
+    /// `refresh` does this every frame and needs a renderer for the
+    /// imagery opacity; the saving itself does not. Exposed so the
+    /// round trip can be tested without a GPU.
+    pub fn save_for_tests(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let settings = self.settings_now();
+        if settings != self.saved_settings {
+            store.save_settings(&settings);
+            self.saved_settings = settings;
+        }
+        if self.route != self.saved_route {
+            store.save_route(&self.route);
+            self.saved_route = self.route.clone();
+        }
+    }
+
+    /// Set the boat's draft, as the panel's control does.
+    pub fn set_draft(&mut self, draft: Draft) {
+        self.draft = draft;
+    }
+
+    /// Switch the under-keel check on or off.
+    pub fn set_draft_check(&mut self, on: bool) {
+        self.draft_check = on;
+    }
+
+    pub fn draft_for_tests(&self) -> Draft {
+        self.draft
+    }
+
+    pub fn draft_check_for_tests(&self) -> bool {
+        self.draft_check
+    }
+
+    pub fn imagery_visible_for_tests(&self) -> bool {
+        self.imagery_visible
     }
 
     /// Put a waypoint at a position, at the end of the route.
@@ -1784,6 +1994,27 @@ impl App {
 
         self.unfilled = got.unfilled;
         self.loaded = got.tiles.clone();
+
+        // The chart's own layer names are only known now, so a hidden
+        // list read from the settings can finally be turned into a
+        // selection. Done once: after this the list is empty and the
+        // user's own toggling takes over.
+        if !self.hidden_on_load.is_empty() {
+            let hidden = std::mem::take(&mut self.hidden_on_load);
+            let keep: Vec<String> = self
+                .chart_layer_names()
+                .into_iter()
+                .filter(|name| !hidden.contains(name))
+                .collect();
+            // Only if something was actually hidden. A settings file
+            // naming layers this chart does not have must not blank it.
+            if keep.len() < self.chart_layer_names().len() {
+                log::info!("settings: hiding {} chart layers", hidden.len());
+                self.set_layers(&keep);
+                self.requested.clear();
+                self.rebuild_layer_entries();
+            }
+        }
     }
 
     /// Change the layer selection. Returns true if it actually changed.
@@ -2014,11 +2245,11 @@ impl App {
                 // uniform, so switching the check on or changing the draft
                 // is a uniform write on the next frame.
                 Action::SetDraftCheck(on) => {
-                    self.draft_check = *on;
+                    self.set_draft_check(*on);
                     touched = true;
                 }
                 Action::SetDraft(draft) => {
-                    self.draft = *draft;
+                    self.set_draft(*draft);
                     touched = true;
                 }
                 Action::SelectTideStation(id) => {
@@ -3304,6 +3535,7 @@ mod tests {
                 gps: None,
                 fetcher: None,
                 imagery_out: None,
+                data_dir: None,
             },
             None,
         );
@@ -3360,6 +3592,7 @@ mod tests {
                 gps: None,
                 fetcher: None,
                 imagery_out: None,
+                data_dir: None,
             },
             None,
         );

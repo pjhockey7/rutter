@@ -16,7 +16,7 @@ time slider driving all of the above · NMEA 0183 over TCP, UDP and serial ·
 phone GPS through JNI · own-ship marker with course and heading · follow mode
 · Linux and Android builds · a portable glibc 2.17 binary.
 
-401 tests, clippy and fmt clean on host and `aarch64-linux-android`.
+426 tests, clippy and fmt clean on host and `aarch64-linux-android`.
 
 ## Tier 1 — not a plotter without these
 
@@ -60,9 +60,34 @@ behind it.
       dangerous rather than merely missing. Needs a timezone source, which is
       why it was deferred.
 
-- [ ] **Settings that persist.** Draft, units, layer choices and the NMEA
-      address all reset every launch. On Android the address has to arrive
-      bundled in the APK because there is nowhere to keep it.
+- [x] **Settings that persist.** Done. Two files in a platform-chosen
+      directory — `$XDG_DATA_HOME/rutter` on Linux, the app's own data
+      directory on Android:
+
+      * `settings.conf`, `key = value`, hand-rolled rather than TOML or
+        JSON. A settings file that will not load is a thing someone has to
+        repair on a boat with no internet, and a text editor is the only
+        tool they are guaranteed to have. Unknown keys are kept and written
+        back, so running an older build does not reset what a newer one
+        was keeping.
+      * `route.gpx`, which is **GPX** rather than a format of our own, so a
+        passage can be handed to someone with a Garmin and one off their
+        Garmin can be sailed here. Read with a tolerant scanner that
+        handles namespace prefixes, self-closing tags and files holding
+        only a recorded track; its limits are documented rather than
+        hoped for.
+
+      Written only when something changed — saving runs every frame, and
+      writing unconditionally would be sixty writes a second on a phone —
+      and written via a temporary file and a rename, so a power cut cannot
+      leave half a settings file.
+
+      Precedence is flag, then saved, then default. Worth stating because
+      the first version applied the settings *after* the command line and
+      silently discarded `--draft`.
+
+      Still to come: the NMEA address is saved but **units** are not, since
+      there are none yet.
 
 - [x] **Split the layers panel into tabs.** Done: fixed tabs — Boat, Chart,
       Water, Weather, Tools. Every screen has all of them and switches

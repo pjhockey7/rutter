@@ -34,6 +34,7 @@ fn bare_app() -> App {
             gps: None,
             fetcher: None,
             imagery_out: None,
+            data_dir: None,
         },
         None,
     )
@@ -58,6 +59,7 @@ fn app_with_gps() -> (App, std::net::SocketAddr) {
             gps: None,
             fetcher: None,
             imagery_out: None,
+            data_dir: None,
         },
         None,
     );

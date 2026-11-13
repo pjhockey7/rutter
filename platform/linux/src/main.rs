@@ -325,6 +325,12 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                     None
                 }
             },
+            // XDG, so settings land where a desktop user expects them
+            // and not in whatever directory the app was started from.
+            // `build/` is where this project's *generated data* goes;
+            // a draft and a planned passage are the user's, not the
+            // build's.
+            data_dir: data_directory(),
             // Default: beside the other data files. The download
             // replaces whatever is there, which on a desktop is what you
             // want — `rutter imagery` does the same.
@@ -339,6 +345,25 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
         draft_m,
         Opening { at, zoom },
     ))
+}
+
+/// Where settings and routes are kept.
+///
+/// `$XDG_DATA_HOME/rutter`, or `~/.local/share/rutter`. Not `build/`,
+/// which is for things this project generates and is reasonable to delete;
+/// a draft and a planned passage belong to the person, and `rutter clean`
+/// should not take them.
+fn data_directory() -> Option<std::path::PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Some(std::path::PathBuf::from(xdg).join("rutter"));
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("rutter"),
+    )
 }
 
 /// The window, the GPU, egui's winit glue — and the app they drive.

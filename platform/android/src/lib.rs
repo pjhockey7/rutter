@@ -276,6 +276,10 @@ fn open_bundled_sources(app: &AndroidApp) -> Sources {
         // fetching a harbour tops up the coverage the package shipped
         // with instead of competing with it.
         imagery_out: app.internal_data_path().map(|dir| dir.join(IMAGERY_ASSET)),
+        // The same directory as everything else here. A sandboxed app has
+        // exactly one place it may write, and it is wiped with the app —
+        // which is the right lifetime for a draft and a planned passage.
+        data_dir: app.internal_data_path(),
     }
 }
 

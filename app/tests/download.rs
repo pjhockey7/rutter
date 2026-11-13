@@ -426,6 +426,7 @@ fn app_with(fetcher: Arc<dyn TileFetcher>, out: &std::path::Path) -> rutter_app:
             gps: None,
             fetcher: Some(fetcher),
             imagery_out: Some(out.to_path_buf()),
+            data_dir: None,
         },
         None,
     );
@@ -464,6 +465,7 @@ fn a_platform_with_no_fetcher_says_so_rather_than_offering_a_button() {
             gps: None,
             fetcher: None,
             imagery_out: Some(out),
+            data_dir: None,
         },
         None,
     );
