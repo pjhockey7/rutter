@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rutter_core::route::{Route, Waypoint};
+use rutter_core::track::{self, Track};
 use rutter_core::LatLon;
 
 /// Where things are kept.
@@ -132,6 +133,10 @@ impl Store {
 
     fn route_path(&self) -> PathBuf {
         self.directory.join("route.gpx")
+    }
+
+    fn track_path(&self) -> PathBuf {
+        self.directory.join("track.gpx")
     }
 
     /// Read the settings, falling back to the defaults for anything
@@ -328,6 +333,208 @@ impl Settings {
         }
         out
     }
+}
+
+impl Store {
+    /// The recorded track, if there is one.
+    pub fn track(&self) -> Track {
+        std::fs::read_to_string(self.track_path())
+            .ok()
+            .map(|text| read_track_gpx(&text))
+            .unwrap_or_default()
+    }
+
+    /// Save a track. An empty one removes the file.
+    pub fn save_track(&self, track: &Track) {
+        let path = self.track_path();
+        if track.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        write_atomically(&path, &write_track_gpx(track));
+    }
+}
+
+/// Render a track as GPX 1.1.
+///
+/// `<trkseg>` per run, which is what the element is for: a reader that
+/// honours it will draw the breaks rather than joining across water
+/// nobody crossed.
+pub fn write_track_gpx(track: &Track) -> String {
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str(
+        "<gpx version=\"1.1\" creator=\"rutter\" \
+         xmlns=\"http://www.topografix.com/GPX/1/1\">\n",
+    );
+    out.push_str("  <trk>\n    <name>rutter track</name>\n");
+    for segment in &track.segments {
+        out.push_str("    <trkseg>\n");
+        for fix in segment {
+            // Time as well as position: a track without times is a shape,
+            // and what makes it a log is when you were where.
+            out.push_str(&format!(
+                "      <trkpt lat=\"{:.6}\" lon=\"{:.6}\"><time>{}</time></trkpt>\n",
+                fix.at.lat,
+                fix.at.lon,
+                iso8601(fix.unix)
+            ));
+        }
+        out.push_str("    </trkseg>\n");
+    }
+    out.push_str("  </trk>\n</gpx>\n");
+    out
+}
+
+/// Read a track back, segments and all.
+///
+/// Uses the same tolerant scanner as the route reader, and the same
+/// limits apply. A point with no usable time gets the one before it plus
+/// a second rather than the epoch: a 1970 timestamp in the middle of a
+/// track would make the span nonsense and every gap test fail.
+pub fn read_track_gpx(text: &str) -> Track {
+    let mut track = Track::default();
+    let mut previous = 0i64;
+
+    for segment_text in segments_of(text) {
+        let mut segment = Vec::new();
+        for (at, time) in points_with_time(&segment_text, "trkpt") {
+            let unix = time.unwrap_or(previous.saturating_add(1));
+            previous = unix;
+            segment.push(track::Fix { at, unix });
+        }
+        if !segment.is_empty() {
+            track.segments.push(segment);
+        }
+    }
+    track
+}
+
+/// Each `<trkseg>`'s inner text. One pseudo-segment for a file with none,
+/// so a track written without them still loads as a single run.
+fn segments_of(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = find_element(rest, "trkseg") {
+        let after = &rest[start..];
+        let Some(open_end) = after.find('>') else {
+            break;
+        };
+        let end = find_close(&after[open_end..], "trkseg").map_or(after.len(), |i| open_end + i);
+        out.push(after[open_end..end].to_owned());
+        rest = &after[end.min(after.len())..];
+    }
+    if out.is_empty() {
+        out.push(text.to_owned());
+    }
+    out
+}
+
+/// Positions and times of one element name.
+fn points_with_time(text: &str, tag: &str) -> Vec<(LatLon, Option<i64>)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = find_element(rest, tag) {
+        let after = &rest[start..];
+        let Some(tag_end) = after.find('>') else {
+            break;
+        };
+        let attributes = &after[..tag_end];
+        let self_closing = attributes.trim_end().ends_with('/');
+        let body = if self_closing {
+            ""
+        } else {
+            let from = tag_end + 1;
+            let end = find_close(&after[from..], tag).map_or(after.len(), |i| from + i);
+            &after[from..end]
+        };
+
+        if let (Some(lat), Some(lon)) = (attribute(attributes, "lat"), attribute(attributes, "lon"))
+        {
+            let time = element_text(body, "time").and_then(|t| parse_iso8601(&t));
+            out.push((LatLon::new(lat, lon), time));
+        }
+        rest = &after[tag_end..];
+    }
+    out
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ`, which is what GPX wants.
+///
+/// Written by hand because the alternative is a date-time dependency for
+/// one format in one direction, and because the arithmetic is the civil
+/// calendar's and not hard: days since the epoch, converted with the
+/// standard algorithm.
+fn iso8601(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let seconds = unix.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+fn parse_iso8601(text: &str) -> Option<i64> {
+    // Tolerant of the forms writers actually emit: a trailing Z or not, a
+    // fractional second or not. Anything else is declined rather than
+    // guessed at.
+    let text = text.trim();
+    let (date, rest) = text.split_once('T')?;
+    let time = rest.trim_end_matches('Z');
+    let time = time.split('.').next().unwrap_or(time);
+    // An offset other than Z is not handled; saying so beats being an
+    // hour out without saying anything.
+    if time.contains('+') {
+        return None;
+    }
+
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
+
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Howard Hinnant's `days_from_civil`, which is the standard way to do
+/// this without a calendar library and is exact for every year.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year =
+        (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Its inverse.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// Render a route as GPX 1.1.
@@ -826,6 +1033,150 @@ mod tests {
         assert!(empty.hidden_layers.is_empty());
     }
 
+    // ── Tracks ─────────────────────────────────────────────────────────
+
+    fn a_track() -> Track {
+        let mut track = Track::default();
+        let rules = track::Thinning::default();
+        // Two runs with a gap between them, so the segments are tested
+        // and not just the points.
+        for second in 0..40 {
+            track.record(
+                track::Fix {
+                    at: LatLon::new(32.70 + 0.0005 * f64::from(second), -117.23),
+                    unix: 1_772_323_200 + i64::from(second),
+                },
+                &rules,
+            );
+        }
+        for second in 600..640 {
+            track.record(
+                track::Fix {
+                    at: LatLon::new(32.60, -117.30 + 0.0005 * f64::from(second - 600)),
+                    unix: 1_772_323_200 + i64::from(second),
+                },
+                &rules,
+            );
+        }
+        track.finish();
+        track
+    }
+
+    #[test]
+    fn a_track_survives_the_round_trip_with_its_breaks() {
+        let before = a_track();
+        assert_eq!(before.segments.len(), 2, "the fixture needs two runs");
+
+        let after = read_track_gpx(&write_track_gpx(&before));
+        assert_eq!(
+            after.segments.len(),
+            before.segments.len(),
+            "the break between runs was lost, which would draw the boat \
+             crossing water it never crossed"
+        );
+        assert_eq!(after.len(), before.len());
+
+        for (a, b) in after
+            .segments
+            .iter()
+            .flatten()
+            .zip(before.segments.iter().flatten())
+        {
+            assert!((a.at.lat - b.at.lat).abs() < 1e-6);
+            assert!((a.at.lon - b.at.lon).abs() < 1e-6);
+            // The times are what make it a log rather than a shape.
+            assert_eq!(a.unix, b.unix, "a timestamp changed");
+        }
+    }
+
+    #[test]
+    fn the_track_output_uses_trkseg_so_other_readers_see_the_breaks() {
+        let text = write_track_gpx(&a_track());
+        assert_eq!(text.matches("<trkseg>").count(), 2, "{text}");
+        assert!(text.contains("<trkpt"), "{text}");
+        assert!(text.contains("<time>"), "no times, so it is not a log");
+        assert!(text.contains("http://www.topografix.com/GPX/1/1"));
+    }
+
+    #[test]
+    fn a_time_round_trips_through_iso8601() {
+        // Hand-written calendar arithmetic, so it is worth checking
+        // against dates a leap-year mistake would get wrong.
+        for (unix, expected) in [
+            (0_i64, "1970-01-01T00:00:00Z"),
+            (1_772_323_200, "2026-03-01T00:00:00Z"),
+            // 29 February 2024, which a naive implementation misses.
+            (1_709_164_800, "2024-02-29T00:00:00Z"),
+            // 1 March 1900, which was *not* a leap year — the case a
+            // naive "every fourth year" rule gets wrong, and the one my
+            // own expected value here was a week out on before being
+            // checked against an independent calculation.
+            (-2_203_891_200, "1900-03-01T00:00:00Z"),
+            (1_767_225_599, "2025-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(iso8601(unix), expected, "formatting {unix}");
+            assert_eq!(parse_iso8601(expected), Some(unix), "parsing {expected}");
+        }
+    }
+
+    #[test]
+    fn the_time_forms_other_writers_emit_are_accepted() {
+        let wanted = 1_772_323_200;
+        for text in [
+            "2026-03-01T00:00:00Z",
+            "2026-03-01T00:00:00",
+            "2026-03-01T00:00:00.000Z",
+            " 2026-03-01T00:00:00Z ",
+        ] {
+            assert_eq!(parse_iso8601(text), Some(wanted), "{text:?}");
+        }
+        // And what is not handled is declined rather than guessed at —
+        // being an hour out without saying so is worse than refusing.
+        for text in ["2026-03-01T00:00:00+01:00", "not a time", "", "2026-03-01"] {
+            assert_eq!(parse_iso8601(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_track_with_no_times_still_loads_in_order() {
+        // Some writers omit them. The points are still a shape worth
+        // having, and the times must at least not go backwards — a 1970
+        // stamp in the middle would make every gap test fire.
+        let text = r#"<gpx version="1.1"><trk><trkseg>
+            <trkpt lat="32.70" lon="-117.23"/>
+            <trkpt lat="32.71" lon="-117.23"/>
+            <trkpt lat="32.72" lon="-117.23"/>
+        </trkseg></trk></gpx>"#;
+        let track = read_track_gpx(text);
+        assert_eq!(track.len(), 3);
+        let times: Vec<i64> = track.segments.iter().flatten().map(|f| f.unix).collect();
+        for pair in times.windows(2) {
+            assert!(pair[0] < pair[1], "times went backwards: {times:?}");
+        }
+    }
+
+    #[test]
+    fn a_track_without_segments_loads_as_one_run() {
+        let text = r#"<gpx version="1.1"><trk>
+            <trkpt lat="32.70" lon="-117.23"/><trkpt lat="32.71" lon="-117.23"/>
+        </trk></gpx>"#;
+        let track = read_track_gpx(text);
+        assert_eq!(track.segments.len(), 1);
+        assert_eq!(track.len(), 2);
+    }
+
+    #[test]
+    fn nothing_in_the_file_is_an_empty_track_not_a_panic() {
+        for text in [
+            "",
+            "not xml",
+            "<gpx/>",
+            "<gpx><trk><trkseg></trkseg></trk></gpx>",
+        ] {
+            assert!(read_track_gpx(text).is_empty(), "{text:?}");
+        }
+    }
+
     #[test]
     fn a_store_writes_and_reads_what_it_was_given() {
         let directory = std::env::temp_dir().join(format!("rutter-store-{}", std::process::id()));
@@ -852,6 +1203,14 @@ mod tests {
         // one to be loaded as a route with nothing in it.
         store.save_route(&Route::default());
         assert!(store.route().is_none());
+
+        // And the track, which is a separate file so a route and a
+        // track cannot clobber one another.
+        store.save_track(&a_track());
+        let track = store.track();
+        assert_eq!(track.segments.len(), 2);
+        store.save_track(&Track::default());
+        assert!(store.track().is_empty());
 
         // No partial files left behind.
         let strays: Vec<_> = std::fs::read_dir(&directory)

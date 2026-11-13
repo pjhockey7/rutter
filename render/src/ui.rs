@@ -72,6 +72,20 @@ pub enum Action {
     SetCurrents(bool),
     /// Show or hide the route.
     SetRoute(bool),
+    /// Show or hide the track.
+    SetTrack(bool),
+    /// Start or stop recording the track.
+    SetRecording(bool),
+    /// Throw the recorded track away.
+    ClearTrack,
+    /// Set the anchor watch here, with this much swinging room, metres.
+    SetAnchor(f64),
+    /// Stop the anchor watch.
+    WeighAnchor,
+    /// Alarm below this depth, or stop watching it.
+    SetShallowAlarm(Option<f64>),
+    /// Silence the noise. The warning stays while the condition does.
+    AcknowledgeAlarms,
     /// Put a waypoint at the middle of the view.
     AddWaypointAtCentre,
     /// Remove the waypoint at this index.
@@ -119,6 +133,49 @@ pub struct WaypointRow {
     pub leg: String,
     /// Whether this is the one being steered for.
     pub active: bool,
+}
+
+/// What the panel knows about the alarms.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AlarmState {
+    /// Whether there is a GPS and a sounder to watch with.
+    pub available: bool,
+    pub anchored: bool,
+    pub anchor_radius_m: f64,
+    pub shallow_m: Option<f64>,
+    /// Whether something is making a noise right now.
+    pub sounding: bool,
+    /// Whether a noise can be made at all. Shown plainly when it cannot:
+    /// an alarm that silently fails is worse than no alarm, because the
+    /// absence of one is at least obvious.
+    pub audible: bool,
+    pub siren: String,
+    /// Whether the system has been asked to keep this process running —
+    /// true only while something is armed.
+    pub held: bool,
+    /// What does the keeping, for the panel: "foreground service", or
+    /// "nothing" where the platform has no way to ask.
+    pub keepalive: String,
+    /// What is wrong, in words.
+    pub active: Vec<String>,
+}
+
+/// What the panel knows about where the boat has been.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackState {
+    pub visible: bool,
+    pub recording: bool,
+    /// Whether there is a GPS to record from at all.
+    pub available: bool,
+    pub points: usize,
+    /// How far has been run, as "12.40 nm run".
+    pub distance: Option<String>,
+    /// When recording began and when it last had a fix.
+    pub since: Option<String>,
+    /// How many times the line is broken, which is how many times the
+    /// feed dropped out. Worth saying: a break looks like a bug rather
+    /// than a gap in the record.
+    pub breaks: usize,
 }
 
 /// What the panel knows about the passage.
@@ -469,6 +526,8 @@ pub struct PanelState {
     pub tides: TideState,
     pub currents: CurrentState,
     pub route: RouteState,
+    pub track: TrackState,
+    pub alarms: AlarmState,
     pub temperature: TemperatureState,
     pub download: DownloadState,
     pub time: TimeState,
@@ -631,6 +690,8 @@ impl Ui {
             tides,
             currents,
             route,
+            track,
+            alarms,
             temperature,
             download,
             time,
@@ -694,6 +755,14 @@ impl Ui {
             });
         });
 
+        // The alarm banner, before any panel and across the whole width.
+        // Nothing else here is allowed to cover it, and it is drawn even
+        // with every panel closed — an alarm that only appears when a
+        // panel happens to be open is not an alarm.
+        if !alarms.active.is_empty() {
+            actions.extend(Self::alarm_banner(root, alarms));
+        }
+
         // Tools in a panel of its own, on the other side. It is not a
         // layer and does not belong behind a button called Layers —
         // downloading a chart is something you do *to* the app rather than
@@ -740,10 +809,14 @@ impl Ui {
                     Tab::Boat => {
                         actions.extend(self.vessel_section(ui, vessel));
                         ui.separator();
+                        actions.extend(Self::alarm_section(ui, alarms));
+                        ui.separator();
                         actions.extend(Self::draft_section(ui, draft));
                     }
                     Tab::Route => {
                         actions.extend(Self::route_section(ui, route));
+                        ui.separator();
+                        actions.extend(Self::track_section(ui, track));
                     }
                     Tab::Chart => {
                         actions.extend(Self::imagery_section(ui, imagery));
@@ -889,6 +962,261 @@ impl Ui {
                 actions.push(Action::RemoveWaypoint(index));
             }
         });
+
+        actions
+    }
+
+    /// The alarm banner: what is wrong, and the way to silence it.
+    fn alarm_banner(root: &mut egui::Ui, alarms: &AlarmState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        egui::Panel::top("alarm").show(root, |ui| {
+            // Red ground rather than red text: a coloured word can be
+            // missed at a glance on a bright chart, and this is the one
+            // thing on screen that must not be.
+            let rect = ui.available_rect_before_wrap();
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_rgb(0x9c, 0x16, 0x12));
+
+            ui.horizontal_wrapped(|ui| {
+                for line in &alarms.active {
+                    ui.label(
+                        egui::RichText::new(line)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if alarms.sounding && ui.button("Silence").clicked() {
+                        actions.push(Action::AcknowledgeAlarms);
+                    }
+                    if !alarms.audible {
+                        ui.label(
+                            egui::RichText::new("no sound available")
+                                .small()
+                                .color(egui::Color32::from_rgb(0xff, 0xd0, 0xc0)),
+                        );
+                    }
+                });
+            });
+        });
+
+        actions
+    }
+
+    /// The anchor watch and the depth watch.
+    fn alarm_section(ui: &mut egui::Ui, alarms: &AlarmState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.label(egui::RichText::new("Alarms").strong());
+
+        if !alarms.audible {
+            // Said here as well as on the banner, because this is where
+            // someone sets an alarm up and so where they can still do
+            // something about it.
+            ui.label(
+                egui::RichText::new("No sound available — alarms will be silent.")
+                    .color(egui::Color32::from_rgb(0xff, 0xb8, 0x26)),
+            )
+            .on_hover_text(format!(
+                "Tried to sound through: {}. On a desktop, install \
+                 pipewire, pulseaudio or alsa-utils.",
+                alarms.siren
+            ));
+        }
+
+        // ── Anchor ─────────────────────────────────────────────────────
+        ui.add_space(4.0);
+        let mut radius = alarms.anchor_radius_m;
+        ui.horizontal(|ui| {
+            if alarms.anchored {
+                if ui
+                    .button("Weigh anchor")
+                    .on_hover_text("Stop the anchor watch")
+                    .clicked()
+                {
+                    actions.push(Action::WeighAnchor);
+                }
+            } else {
+                let set = ui.add_enabled(alarms.available, egui::Button::new("Drop anchor here"));
+                if set.clicked() {
+                    actions.push(Action::SetAnchor(radius));
+                }
+                if !alarms.available {
+                    set.on_hover_text("No GPS, so there is nothing to watch with.");
+                }
+            }
+            ui.label(egui::RichText::new("swing").weak().small());
+        });
+
+        if ui
+            .add(
+                egui::Slider::new(&mut radius, 10.0..=200.0)
+                    .suffix(" m")
+                    .show_value(true),
+            )
+            .on_hover_text(
+                "Scope plus a boat length plus slack — not the scope \
+                 alone. A boat on 30 m of chain swings on nearly a 30 m \
+                 circle, and its stern is further out again.",
+            )
+            .changed()
+        {
+            // Re-setting with a new radius keeps the anchor where it is.
+            if alarms.anchored {
+                actions.push(Action::SetAnchor(radius));
+            }
+        }
+
+        // ── Depth ──────────────────────────────────────────────────────
+        ui.add_space(6.0);
+        let mut watching_depth = alarms.shallow_m.is_some();
+        let mut limit = alarms.shallow_m.unwrap_or(3.0);
+        ui.horizontal(|ui| {
+            let toggle = ui.add_enabled(
+                alarms.available,
+                egui::Checkbox::new(&mut watching_depth, "Shallow"),
+            );
+            if toggle.clicked() {
+                actions.push(Action::SetShallowAlarm(watching_depth.then_some(limit)));
+            }
+            if !alarms.available {
+                toggle.on_hover_text("No sounder reading to watch.");
+            }
+        });
+        if watching_depth
+            && ui
+                .add(
+                    egui::Slider::new(&mut limit, 0.5..=20.0)
+                        .suffix(" m")
+                        .show_value(true),
+                )
+                .on_hover_text(
+                    "Under the transducer, not under the keel — the \
+                     sounder measures from where it is mounted.",
+                )
+                .changed()
+        {
+            actions.push(Action::SetShallowAlarm(Some(limit)));
+        }
+
+        // ── What happens when the screen goes off ──────────────────────
+        //
+        // The question anyone setting an anchor watch is actually asking.
+        // Said here, under the controls, rather than as a warning: on a
+        // desktop the answer is "it keeps running" and that needs no
+        // alarm bells, and on a phone without the hold it is a real
+        // limitation someone should know before they go to sleep.
+        ui.add_space(6.0);
+        if alarms.held {
+            ui.label(
+                egui::RichText::new(format!("Standing watch — {} holding.", alarms.keepalive))
+                    .weak()
+                    .small(),
+            )
+            .on_hover_text(
+                "The system has been asked to keep this running with the \
+                 screen off. The watch is on the feed, not on the \
+                 drawing, so it keeps looking whether or not anything is \
+                 shown.",
+            );
+        } else if alarms.keepalive == "nothing" {
+            ui.label(
+                egui::RichText::new("Nothing will hold this open in the background.")
+                    .weak()
+                    .small(),
+            )
+            .on_hover_text(
+                "The watch runs for as long as this app does. On a \
+                 desktop that is until you close it. On a phone the \
+                 system may stop it once the screen is off.",
+            );
+        }
+
+        actions
+    }
+
+    /// Where the boat has been.
+    ///
+    /// On the Route tab beside the passage, because the two are read
+    /// together: the gap between where you meant to go and where you went
+    /// is what the tide did to you.
+    fn track_section(ui: &mut egui::Ui, track: &TrackState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.horizontal(|ui| {
+            let mut on = track.visible;
+            if ui.checkbox(&mut on, "Show track").clicked() {
+                actions.push(Action::SetTrack(on));
+            }
+            let mut recording = track.recording;
+            let control = ui.add_enabled(
+                track.available,
+                egui::Checkbox::new(&mut recording, "Record"),
+            );
+            if control.clicked() {
+                actions.push(Action::SetRecording(recording));
+            }
+            if !track.available {
+                control.on_hover_text("Nothing to record from — no GPS feed.");
+            }
+        });
+
+        if track.points == 0 {
+            ui.label(
+                egui::RichText::new(if track.available {
+                    "Nothing recorded yet."
+                } else {
+                    "A track records where you have been, which is the safest \
+                     water back out of somewhere you felt your way into."
+                })
+                .weak()
+                .small(),
+            );
+            return actions;
+        }
+
+        if let Some(distance) = &track.distance {
+            ui.label(egui::RichText::new(distance).strong());
+        }
+        if let Some(since) = &track.since {
+            ui.label(egui::RichText::new(since).weak().small());
+        }
+        ui.label(
+            egui::RichText::new(format!("{} points", track.points))
+                .weak()
+                .small(),
+        )
+        .on_hover_text(
+            "Thinned as it records: a straight run keeps its two ends and \
+             every turn is kept exactly, so a day's sailing is a few \
+             hundred points rather than forty thousand.",
+        );
+
+        if track.breaks > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} break{} where the feed dropped",
+                    track.breaks,
+                    if track.breaks == 1 { "" } else { "s" }
+                ))
+                .weak()
+                .small(),
+            )
+            .on_hover_text(
+                "The line is broken rather than joined across the gap. \
+                 Joining it would draw you crossing water you never \
+                 crossed.",
+            );
+        }
+
+        if ui
+            .button("Clear track")
+            .on_hover_text("Throws away what has been recorded")
+            .clicked()
+        {
+            actions.push(Action::ClearTrack);
+        }
 
         actions
     }
@@ -2343,6 +2671,8 @@ mod font_tests {
                     vessel: populated_vessel(),
                     currents: populated_currents(),
                     route: populated_route(),
+                    track: populated_track(),
+                    alarms: populated_alarms(),
                     temperature: populated_temperature(),
                     download: populated_download(),
                     time: populated_time(),
@@ -2556,6 +2886,39 @@ mod font_tests {
         }
     }
 
+    /// A track recorded with a break in it, for the drawing tests.
+    fn populated_track() -> TrackState {
+        TrackState {
+            visible: true,
+            recording: true,
+            available: true,
+            points: 284,
+            distance: Some("41.80 nm run".to_owned()),
+            since: Some("06:12Z to 14:48Z".to_owned()),
+            breaks: 1,
+        }
+    }
+
+    /// An alarm actually firing, which is the state worth drawing: the
+    /// banner only exists in it.
+    fn populated_alarms() -> AlarmState {
+        AlarmState {
+            available: true,
+            anchored: true,
+            anchor_radius_m: 40.0,
+            shallow_m: Some(3.0),
+            sounding: true,
+            audible: true,
+            siren: "pw-play".to_owned(),
+            held: true,
+            keepalive: "foreground service".to_owned(),
+            active: vec![
+                "Anchor dragging — 63 m from the anchor".to_owned(),
+                "Shallow water — 2.4 m under the transducer".to_owned(),
+            ],
+        }
+    }
+
     fn populated_wind() -> WindState {
         WindState {
             available: true,
@@ -2611,6 +2974,8 @@ mod font_tests {
                     vessel: populated_vessel(),
                     currents: populated_currents(),
                     route: populated_route(),
+                    track: populated_track(),
+                    alarms: populated_alarms(),
                     temperature: populated_temperature(),
                     download: populated_download(),
                     time: populated_time(),

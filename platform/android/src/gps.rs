@@ -7,12 +7,22 @@
 //! ## The constraint that shapes all of this
 //!
 //! `requestLocationUpdates` wants a `LocationListener`: an *object*
-//! implementing a Java interface. You cannot create one of those without
-//! Java bytecode, and this APK has none — `android:hasCode="false"` and
-//! zero dex entries, which is the whole reason it builds at all where the
-//! OpenCPN attempt did not. `java.lang.reflect.Proxy` does not help: it
-//! needs an `InvocationHandler`, which is another interface with the same
-//! problem.
+//! implementing a Java interface, which you cannot create without Java
+//! bytecode. `java.lang.reflect.Proxy` does not help: it needs an
+//! `InvocationHandler`, which is another interface with the same problem.
+//!
+//! When this was written the APK had no bytecode at all —
+//! `android:hasCode="false"`, zero dex entries — so a listener was simply
+//! impossible. That is no longer true: the anchor watch needs a
+//! foreground service, `android.app.Service` is abstract, and so there is
+//! now a `classes.dex` with one class in it. A `LocationListener` could
+//! be added to it.
+//!
+//! It has not been, because the pull below is working as far as anything
+//! here can tell, and nothing here has been run on hardware yet — which
+//! makes this the wrong moment to replace a mechanism with an untested
+//! one. If polling proves to be stale or expensive on a real phone, the
+//! listener is the fix and the door is now open to it.
 //!
 //! So position is **pulled**, not pushed:
 //!
@@ -30,11 +40,6 @@
 //! visibly old position is acceptable; degrading into a confidently wrong
 //! one is not.
 //!
-//! The alternative, if this proves not good enough on real hardware, is
-//! about forty lines of Java in a `classes.dex` built with `d8`. That is a
-//! known, boring fix — but it costs the no-bytecode property, so it is
-//! worth finding out whether this suffices first.
-//!
 //! ## Untested on hardware
 //!
 //! Every JNI descriptor here is checked at compile time by `jni_sig!`,
@@ -48,10 +53,12 @@
 // where the workspace's rule says unsafe belongs.
 #![allow(unsafe_code)]
 
-use jni::objects::{JObject, JObjectArray, JString, JValue};
+use jni::objects::{JObject, JValue};
 use jni::refs::Reference;
 use jni::{jni_sig, jni_str, Env, JavaVM};
 use rutter_app::{Fix, FixSource};
+
+use crate::jvm::{at, Trouble};
 use rutter_core::LatLon;
 
 /// Metres per second to knots.
@@ -89,9 +96,6 @@ const PERMISSIONS: [&str; 2] = [
     "android.permission.ACCESS_COARSE_LOCATION",
 ];
 
-/// `PackageManager.PERMISSION_GRANTED`.
-const PERMISSION_GRANTED: i32 = 0;
-
 /// Providers to ask, best first.
 ///
 /// `gps` is the real thing. `fused` is Android's blend of GPS, WiFi and
@@ -100,32 +104,6 @@ const PERMISSION_GRANTED: i32 = 0;
 /// few hundred metres is useless for pilotage but still tells you which
 /// harbour you are in while the GPS gets a fix.
 const PROVIDERS: [&str; 3] = ["gps", "fused", "network"];
-
-/// An error with the Java call that produced it.
-///
-/// Exists so `?` works inside the attach closure — `jni` requires the
-/// error type to be `From<jni::errors::Error>`, and a bare `String` is
-/// not.
-#[derive(Debug)]
-struct Trouble(String);
-
-impl From<jni::errors::Error> for Trouble {
-    fn from(e: jni::errors::Error) -> Self {
-        Self(e.to_string())
-    }
-}
-
-impl std::fmt::Display for Trouble {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Name the call that failed, so a wrong descriptor is one logcat away
-/// from being identified rather than a mystery.
-fn at<T>(what: &str, got: jni::errors::Result<T>) -> Result<T, Trouble> {
-    got.map_err(|e| Trouble(format!("{what}: {e}")))
-}
 
 /// Open the device's GPS.
 ///
@@ -153,7 +131,14 @@ pub fn open() -> Result<Box<dyn FixSource>, String> {
             // lives as long as the process.
             let activity = unsafe { JObject::from_raw(env, activity_raw) };
 
-            ask_for_permission(env, &activity)?;
+            // Does not wait for an answer: there is no
+            // `onRequestPermissionsResult` to receive without a Java
+            // class to receive it, so the dialogue is raised and the next
+            // poll finds out. A refusal shows on the panel as a provider
+            // that never produces a fix, and granting it later from the
+            // system settings is picked up by the reader's own retry loop
+            // with no restart.
+            crate::jvm::ask_for(env, &activity, &PERMISSIONS)?;
 
             let manager = at(
                 "getSystemService(location)",
@@ -202,68 +187,6 @@ fn location_manager<'local>(
         &[JValue::Object(&name)],
     )?
     .l()
-}
-
-/// Ask for the location permission if it is not already held.
-///
-/// Does not wait for an answer: there is no `onRequestPermissionsResult`
-/// to receive without Java, so the dialogue is raised and the next poll
-/// finds out. A refusal shows on the panel as a provider that never
-/// produces a fix, and granting it later from the system settings is
-/// picked up by the reader's own retry loop with no restart.
-fn ask_for_permission(env: &mut Env<'_>, activity: &JObject<'_>) -> Result<(), Trouble> {
-    let mut missing = Vec::new();
-    for permission in PERMISSIONS {
-        let name = at("new_string(permission)", env.new_string(permission))?;
-        let state = at(
-            "checkSelfPermission",
-            env.call_method(
-                activity,
-                jni_str!("checkSelfPermission"),
-                jni_sig!((name: java.lang.String) -> jint),
-                &[JValue::Object(&name)],
-            )
-            .and_then(jni::JValueOwned::i),
-        )?;
-        if state != PERMISSION_GRANTED {
-            missing.push(permission);
-        }
-    }
-
-    if missing.is_empty() {
-        return Ok(());
-    }
-    log::info!("GPS: asking for {missing:?}");
-
-    // Both are always requested, even if only one is missing: the pair has
-    // to go in together or API 31 and later ignore the request.
-    let blank = at("new_string(blank)", env.new_string(""))?;
-    let array = at(
-        "new_object_array(String)",
-        JObjectArray::<JString<'_>>::new(
-            env,
-            PERMISSIONS.len(),
-            AsRef::<JString<'_>>::as_ref(&blank),
-        ),
-    )?;
-    for (index, permission) in PERMISSIONS.iter().enumerate() {
-        let name = at("new_string(permission)", env.new_string(permission))?;
-        at(
-            "set_element(permissions)",
-            array.set_element(env, index, &name),
-        )?;
-    }
-
-    at(
-        "requestPermissions",
-        env.call_method(
-            activity,
-            jni_str!("requestPermissions"),
-            jni_sig!((permissions: java.lang.String[], code: jint) -> void),
-            &[JValue::Object(&array), JValue::Int(1)],
-        ),
-    )?;
-    Ok(())
 }
 
 /// `requestLocationUpdates(provider, interval, distance, PendingIntent)`.
@@ -371,7 +294,7 @@ impl FixSource for Gps {
                 // first so the panel says "permission" rather than
                 // "SecurityException".
                 let activity = activity.as_ref();
-                ask_for_permission(env, activity)?;
+                crate::jvm::ask_for(env, activity, &PERMISSIONS)?;
 
                 // Every provider, keeping whichever has the newest fix.
                 // Not first-wins: a phone that has just started has an

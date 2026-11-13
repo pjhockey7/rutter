@@ -42,6 +42,8 @@ fn with_stations() -> Option<App> {
             gps: None,
             fetcher: None,
             imagery_out: None,
+            siren: None,
+            keepalive: None,
             data_dir: None,
         },
         Some(2.0),

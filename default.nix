@@ -274,12 +274,21 @@ let
         relative = lib.removePrefix (toString ./. + "/") (toString path);
         top = builtins.head (lib.splitString "/" relative);
       in
+      # Every workspace member, or cargo cannot read the workspace at
+      # all: a missing member is not a smaller build, it is
+      # "failed to load manifest for workspace member". This list fell
+      # behind when `app`, `tides` and `fetch` were added and the
+      # derivation stopped building — the shell's own `rutter apk` kept
+      # working, so nothing noticed.
       builtins.elem top [
         "Cargo.toml"
         "Cargo.lock"
         "core"
+        "app"
         "charts"
+        "tides"
         "render"
+        "fetch"
         "platform"
         "android"
       ];
@@ -452,7 +461,9 @@ let
   #     result/rutter-${defaultAbi}-unsigned.apk
   rutterApk = pkgs.runCommand "rutter-${defaultAbi}-unsigned.apk"
     {
-      nativeBuildInputs = [ pkgs.zip ];
+      # javac for the one Java class, which `d8` then turns into the
+      # classes.dex the foreground service needs. See android/java.
+      nativeBuildInputs = [ pkgs.zip pkgs.jdk_headless ];
       passthru = { inherit rutterAndroidLib; };
     }
     ''
@@ -464,8 +475,30 @@ let
         staging/lib/${defaultAbi}/librutter.so
       chmod +w staging/lib/${defaultAbi}/librutter.so
 
-      # No res/ and no classes.dex: the manifest declares hasCode="false" and
-      # the activity is the framework's android.app.NativeActivity.
+      # ── The one Java class ──────────────────────────────────────────
+      #
+      # `WatchService`, and nothing else. Android has no NativeService to
+      # match NativeActivity, so a foreground service — the only
+      # sanctioned way to keep the anchor watch alive with the screen off
+      # — cannot be had without bytecode. The app ran with zero dex
+      # entries until it needed one.
+      #
+      # --release so d8 does not emit debug line tables for eighty lines,
+      # and a min-api matching the manifest so it does not desugar for
+      # versions this never runs on.
+      mkdir -p classes
+      javac --release 17 -nowarn \
+        -classpath "$jar" \
+        -d classes \
+        ${./android/java}/com/pjhockey7/rutter/*.java
+
+      "$bt/d8" --release --min-api ${minSdk} --lib "$jar" \
+        --output . \
+        $(find classes -name '*.class')
+
+      # aapt2 link takes the manifest and assets; classes.dex is added to
+      # the archive afterwards, the same way the .so is. Deflated rather
+      # than stored: unlike the native library, nothing maps it in place.
       "$bt/aapt2" link \
         --manifest ${./android/AndroidManifest.xml} \
         -I "$jar" \
@@ -478,6 +511,7 @@ let
       # -0 stores rather than deflates, which extractNativeLibs="false"
       # requires: the loader maps the .so out of the APK in place.
       ( cd staging && zip -q -0 -X ../unaligned.apk "lib/${defaultAbi}/librutter.so" )
+      zip -q -X ../unaligned.apk classes.dex 2>/dev/null || zip -q -X unaligned.apk classes.dex
 
       # -P 16 aligns the stored .so to 16 KB pages, which Android 15+ needs.
       # The ELF's own segment alignment is a separate thing, set by the
@@ -772,9 +806,31 @@ let
         # version dance — all of which cost a day in ../../opencpn. aapt2,
         # zipalign and apksigner are three commands and do the whole job.
         #
-        # There is no res/ directory and no classes.dex: the manifest sets
-        # android:hasCode="false" and the activity is the framework's
-        # android.app.NativeActivity, so the APK carries no bytecode at all.
+        # There is no res/ directory. There is exactly one class in the
+        # dex: `WatchService`, which exists because Android has no
+        # NativeService to match NativeActivity and a foreground service
+        # cannot be had without bytecode. Everything else is native.
+        echo "compiling WatchService"
+        rm -rf "$out/classes" "$out/classes.dex"
+        mkdir -p "$out/classes"
+        # `--release 17` rather than -source/-target, and android.jar on
+        # the classpath rather than the boot class path: modern javac
+        # refuses -bootclasspath for targets past 8, and the Android
+        # framework classes are ordinary classpath entries as far as it
+        # is concerned.
+        ${pkgs.jdk_headless}/bin/javac --release 17 -nowarn \
+          -classpath "$jar" \
+          -d "$out/classes" \
+          android/java/com/pjhockey7/rutter/*.java
+
+        # --release: no debug line tables for eighty lines. --min-api
+        # matching the manifest so nothing is desugared for versions this
+        # never runs on.
+        "$bt/d8" --release --min-api ${minSdk} --lib "$jar" \
+          --output "$out" \
+          $(find "$out/classes" -name '*.class')
+        rm -rf "$out/classes"
+
         echo "linking resources"
         "$bt/aapt2" link \
           --manifest android/AndroidManifest.xml \
@@ -793,6 +849,11 @@ let
         # page-aligned.
         echo "adding librutter.so"
         ( cd "$out" && zip -q -0 -X unaligned.apk "lib/$abi/librutter.so" )
+
+        # Deflated, unlike the .so: nothing maps the dex in place, so
+        # there is no reason to pay the size.
+        echo "adding classes.dex"
+        ( cd "$out" && zip -q -X unaligned.apk classes.dex )
 
         # ── Alignment ───────────────────────────────────────────────────────
         #

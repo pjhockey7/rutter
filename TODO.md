@@ -16,7 +16,7 @@ time slider driving all of the above · NMEA 0183 over TCP, UDP and serial ·
 phone GPS through JNI · own-ship marker with course and heading · follow mode
 · Linux and Android builds · a portable glibc 2.17 binary.
 
-426 tests, clippy and fmt clean on host and `aarch64-linux-android`.
+472 tests, clippy and fmt clean on host and `aarch64-linux-android`.
 
 ## Tier 1 — not a plotter without these
 
@@ -43,13 +43,103 @@ behind it.
       the `w` key, **saving** routes (GPX, so they interchange with other
       plotters), and **arrival and off-track alarms** — which are small now.
 
-- [ ] **Tracks.** Where you have been — a safety feature in its own right,
-      retracing your own line out of shallow water in fog, and the basis of a
-      log. The fix stream already exists, so this is cheap.
+- [x] **Tracks.** Done. Recorded from the fix stream, drawn under the
+      route so the gap between where you meant to go and where you went is
+      visible, and saved as GPX with `<trkseg>` per run.
 
-- [ ] **Anchor drag and shallow-water alarms.** `DBT` and `DPT` already
-      arrive from the sounder and the position stream is running. The highest
-      value-to-effort item on this list.
+      Thinned as it records, with an **opening window**: hold every fix
+      since the last committed point, and when one strays further than the
+      tolerance from the line between that point and the newest, commit the
+      worst of them as a corner. That is Douglas–Peucker run forwards, and
+      the window is the part that matters — a single point of lookahead
+      cannot see a corner, because the fix immediately after a right-angle
+      turn is only nine metres off the line it left, so the turn is
+      discarded as redundant before its deviation can grow. A test caught
+      exactly that.
+
+      Tolerance is 10 m: above a consumer GPS's three-to-five-metre
+      scatter, so a moored boat does not record a mile of jitter overnight,
+      and well inside a boat length of the truth. A gap of more than a
+      minute **breaks** the line rather than joining it, because joining
+      would draw the boat crossing water it never crossed. The point cap
+      coarsens the whole track rather than dropping its beginning — losing
+      where you started is worse than describing it roughly — and the
+      coarsening escalates, which the first version got wrong.
+
+      Still to come: **retrace** — following a track backwards out of
+      somewhere, which is the commonest reason to keep one and is a small
+      addition now that routes exist.
+
+- [x] **Anchor drag and shallow-water alarms.** Done, with sound. The
+      conditions are the easy half; what took the work is everything round
+      them:
+
+      * **Three consecutive breaches** before firing. A GPS throws an
+        outlier now and then, and an alarm that cries wolf once a night
+        gets switched off — and then is not there on the night it matters.
+      * **Hysteresis**: clears at nine tenths of the radius, or half a
+        metre deeper. A boat swinging to a tide on the line would
+        otherwise alarm every few minutes all night.
+      * **No reading is not a reading of zero.** A sounder that loses
+        bottom reports nothing or reports zero, and treating that as no
+        water fires the shallow alarm in mid-ocean. A stale reading is
+        likewise no reading.
+      * **Losing the feed does not clear a firing alarm.** The boat may be
+        dragging right now; going quiet when the GPS is unplugged is the
+        worst moment to go quiet.
+      * **Silence silences, it does not cancel.** The warning stays while
+        the condition does, and an alarm that clears and returns sounds
+        again.
+
+      The noise is a generated two-tone WAV — alternating, because a
+      steady tone is what every appliance in a galley makes and gets
+      ignored — played through whatever the system has (`pw-play`,
+      `paplay`, `aplay`), so no audio dependency and no build-environment
+      change. A `Siren` trait means a platform can supply something
+      better.
+
+      **A siren that cannot sound says so**, on the banner and in the
+      panel, because an alarm that fails silently is worse than no alarm.
+
+- [x] **The overnight case: a foreground service, not a wakelock.** An
+      anchor watch exists for the hours nobody is looking, so the two
+      halves of "will it still be watching at 3 a.m." both had to be
+      answered.
+
+      *Ours:* the alarms used to be evaluated from the frame loop, which
+      meant a dark screen was no watch at all. The `Watch` now lives
+      behind an `Arc<Mutex<_>>` on the **NMEA reader thread**, driven by a
+      `nmea::Observer` — so it keeps looking whether or not anything is
+      drawn. Two tests arm a watch and then never poll again.
+
+      *Android's:* a backgrounded process is killable whenever the system
+      wants memory, and only a foreground service says otherwise. That
+      needed bytecode — `android.app.Service` is abstract, there is no
+      `NativeService` — so the APK now carries exactly one class,
+      `WatchService`, and `android:hasCode="true"`. The zero-dex property
+      is gone, deliberately; eighty lines of Java sitting next to
+      everything else is not the thing that sank the OpenCPN attempt.
+
+      Behind a `Keepalive` trait, like `Siren` and `TileFetcher`: held
+      only while something is armed, re-announced when the reason
+      changes, released when nothing is. A desktop passes `None` and the
+      panel says plainly that nothing will hold it open.
+
+      `startForeground` is wrapped in a catch — a service typed
+      `location` throws on API 34+ without the permission, and crashing
+      the app at the moment someone sets an anchor watch would be worse
+      than having no service. `START_NOT_STICKY` on purpose: a restarted
+      service does not restart the activity, so a sticky restart would
+      show "Anchor watch standing" over a process watching nothing.
+
+- [x] **Android siren.** `ToneGenerator` on `STREAM_ALARM`, which is the
+      stream that still sounds when the phone is on silent — an anchor
+      alarm that respects the ringer switch is one that does not go off,
+      because the phone was silenced at dinner. The tone constants are
+      read from the framework by name rather than written down as
+      numbers, since this app never compiles against `android.jar`.
+
+      Untested on hardware, like everything else Android here.
 
 - [ ] **Feet and fathoms.** Everything is metres. US charts print feet and
       the draft is in feet in your head. Depth, height and clearance all need

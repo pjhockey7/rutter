@@ -27,22 +27,27 @@
 
 mod charts;
 pub mod download;
+pub mod keepalive;
 pub mod nmea;
 mod serial;
+pub mod siren;
 pub mod store;
 pub use charts::ChartWorker;
 
 use rutter_charts::{ChartSource, Collected, ImagerySource};
+use rutter_core::alarm::{self, Watch};
 use rutter_core::chart::TileId;
 use rutter_core::depth::{Draft, TideWindow};
 use rutter_core::nmea::Vessel;
 use rutter_core::route::{Leg, Route, Waypoint};
 use rutter_core::tide::{CurrentKind, CurrentStation, Kind, Station};
+use rutter_core::track::{self, Track};
 use rutter_core::{chart, LatLon, View};
+pub use rutter_render::AlarmState;
 use rutter_render::{
     Action, CurrentState, DownloadProgress, DownloadState, DraftState, FieldPatch, ImageryState,
     LayerEntry, Overlay, PanelState, Renderer, RouteState, TemperatureState, TideMarker,
-    TideReading, TideState, TimeState, Ui, VesselState, WaypointRow, WindState,
+    TideReading, TideState, TimeState, TrackState, Ui, VesselState, WaypointRow, WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -175,6 +180,20 @@ const CURRENT_COLOUR: [f32; 4] = [0.35, 0.92, 0.78, 0.95];
 const ROUTE_COLOUR: [f32; 4] = [0.95, 0.35, 0.85, 0.9];
 /// The leg being steered, and its waypoint.
 const ROUTE_ACTIVE_COLOUR: [f32; 4] = [1.0, 0.55, 0.95, 1.0];
+/// Where the boat has been.
+///
+/// Dimmer than the route and a different hue: the track is history and
+/// should recede, while the route is the thing being followed. Seeing them
+/// together is the point — the gap between them is what the tide did to
+/// you — so they must not be the same colour.
+const TRACK_COLOUR: [f32; 4] = [0.60, 0.70, 0.80, 0.70];
+
+/// How much swinging room an anchor watch allows by default, metres.
+///
+/// Scope plus a boat length plus slack. Forty metres suits a small boat
+/// lying to thirty of chain in five of water; anything bigger wants
+/// setting by hand, which is why the panel offers it.
+const ANCHOR_RADIUS_M: f64 = 40.0;
 const WIND_COLOUR: [f32; 4] = [0.78, 0.90, 0.94, 0.85];
 /// Grey, for a forecast old enough to distrust.
 const WIND_STALE_COLOUR: [f32; 4] = [0.54, 0.54, 0.54, 0.75];
@@ -340,6 +359,19 @@ pub struct Sources {
     /// A platform's business: a desktop has XDG directories and a
     /// sandboxed app has exactly one place it may write. `None` means the
     /// app remembers nothing, which still charts.
+    /// How to make a noise, where the platform can.
+    ///
+    /// `None` means the alarms still watch and still draw, and the panel
+    /// says plainly that they cannot be heard — which is the one thing a
+    /// silent alarm must never do quietly.
+    pub siren: Option<std::sync::Arc<dyn siren::Siren>>,
+    /// How to ask the system not to kill this process while a watch is
+    /// standing, where that is a thing the platform has.
+    ///
+    /// `None` means the watch still runs for as long as the process does
+    /// — which on a desktop is until someone closes it, and on a phone is
+    /// whenever the system feels like it. The panel says which.
+    pub keepalive: Option<std::sync::Arc<dyn keepalive::Keepalive>>,
     pub data_dir: Option<std::path::PathBuf>,
     /// Where a download should write its MBTiles file.
     ///
@@ -423,6 +455,34 @@ pub struct App {
     saved_settings: store::Settings,
     /// The route as last written, for the same reason.
     saved_route: Route,
+
+    /// The anchor watch and the depth watch.
+    ///
+    /// Behind a lock because it is evaluated on the *reader* thread, not
+    /// here. That is the whole reason it works: an alarm driven from the
+    /// frame loop stops being evaluated the moment the screen goes off,
+    /// which is the only state an anchor watch exists for. The reader
+    /// thread keeps running whether or not anything is drawn.
+    ///
+    /// This side only reads it, to put it on the panel.
+    watch: std::sync::Arc<std::sync::Mutex<Watch>>,
+    siren: Option<std::sync::Arc<dyn siren::Siren>>,
+    /// Keeping the process running while a watch stands.
+    keepalive: Option<std::sync::Arc<dyn keepalive::Keepalive>>,
+    /// The reason last passed to [`keepalive::Keepalive::hold`], or
+    /// `None` while nothing is held. Kept so the hold is taken, changed
+    /// and dropped on transitions rather than re-announced every frame.
+    held: Option<String>,
+    /// When the siren last sounded, so it repeats rather than screams.
+    /// Shared, because the sounding happens on the reader thread.
+    last_sounded: std::sync::Arc<std::sync::atomic::AtomicI64>,
+
+    /// Where the boat has been, and whether it is being recorded.
+    track: Track,
+    track_visible: bool,
+    recording: bool,
+    /// The track as last written.
+    saved_track: Track,
 
     /// The passage being planned or followed.
     route: Route,
@@ -530,6 +590,14 @@ impl App {
     const DRAFT_WINDOW_HOURS: i64 = 12;
 
     pub fn new(sources: Sources, draft_m: Option<f64>) -> Self {
+        // Built before the receiver, because the receiver needs the
+        // watchkeeper and the watchkeeper needs these. A feed named on
+        // the command line would otherwise start without an anchor
+        // watch, and nothing would say so.
+        let watch = std::sync::Arc::new(std::sync::Mutex::new(Watch::default()));
+        let last_sounded = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let watchkeeper = watchkeeper(&watch, &sources.siren, &last_sounded);
+
         let mut app = Self {
             charts: sources.charts.and_then(ChartWorker::spawn),
             imagery: sources.imagery,
@@ -539,12 +607,17 @@ impl App {
             // feed from the boat's instruments carries depth and wind as
             // well as position, so someone who named one meant it.
             nmea: match (sources.nmea, &sources.gps) {
-                (Some(endpoint), _) => nmea::Receiver::spawn(endpoint),
+                (Some(endpoint), _) => nmea::Receiver::spawn(endpoint, Some(watchkeeper.clone())),
                 (None, Some(_)) => None,
                 (None, None) => None,
             },
             gps: sources.gps,
             fetcher: sources.fetcher,
+            siren: sources.siren,
+            keepalive: sources.keepalive,
+            held: None,
+            watch,
+            last_sounded,
             download: Download {
                 out: sources
                     .imagery_out
@@ -557,6 +630,12 @@ impl App {
             // On when a forecast is present, same as the other layers.
             wind_visible: true,
             route_visible: true,
+            track_visible: true,
+            // On whenever there is a feed. A track you forgot to start is
+            // a track you do not have, and the commonest reason to want
+            // one is to get back out the way you came in — which you
+            // decide after you are already in.
+            recording: true,
             // On when a forecast is present, like every other layer here:
             // the reason to fetch one is to see it. Kept light — 30% — so
             // that a wash over the whole chart is context rather than the
@@ -606,6 +685,18 @@ impl App {
                 );
                 app.saved_route = route.clone();
                 app.route = route;
+            }
+        }
+        if let Some(store) = &app.store {
+            let track = store.track();
+            if !track.is_empty() {
+                log::info!(
+                    "track: {} points in {} runs",
+                    track.len(),
+                    track.segments.len()
+                );
+                app.saved_track = track.clone();
+                app.track = track;
             }
         }
 
@@ -718,7 +809,7 @@ impl App {
         self.refresh_temperature(renderer);
         self.refresh_overlay(renderer);
         // Last, so what is written is what was just drawn.
-        self.save_if_changed(renderer);
+        self.save_if_changed(Some(renderer.imagery_opacity()));
     }
 
     /// Take whatever the NMEA reader has produced, and follow the boat if
@@ -735,12 +826,32 @@ impl App {
             return;
         };
         nmea.poll();
+        // Copied out, so the borrow on the receiver ends here and the
+        // rest of this can take `&mut self`. A `Vessel` is a handful of
+        // `Option`s and is `Copy`.
+        let vessel = *nmea.vessel();
+
+        // The track, stamped with the fix's own time rather than the
+        // clock: a cached position from a phone is minutes old, and a log
+        // that said otherwise would be wrong about the one thing a log is
+        // for.
+        if self.recording {
+            if let Some(fix) = vessel.position {
+                self.track.record(
+                    track::Fix {
+                        at: fix.value,
+                        unix: fix.at,
+                    },
+                    &track::Thinning::default(),
+                );
+            }
+        }
 
         if !self.follow {
             return;
         }
         let now = unix_now();
-        let Some(fix) = nmea.vessel().position else {
+        let Some(fix) = vessel.position else {
             return;
         };
         if now - fix.at > FOLLOW_STALE_SECS {
@@ -807,6 +918,11 @@ impl App {
                 });
             }
         }
+
+        // The track under the route: it is history, and the route is the
+        // thing being followed. Seeing the two apart is the point — the
+        // gap between them is the set of the tide.
+        marks.extend(self.track_marks());
 
         // The route over the data layers: it is the thing being followed,
         // so nothing that merely describes the water should sit on top of
@@ -1138,7 +1254,9 @@ impl App {
         // command-line one does: naming a feed is a decision.
         if !settings.nmea.is_empty() && self.nmea.is_none() {
             match nmea::Endpoint::parse(&settings.nmea) {
-                Ok(endpoint) => self.nmea = nmea::Receiver::spawn(endpoint),
+                Ok(endpoint) => {
+                    self.nmea = nmea::Receiver::spawn(endpoint, Some(self.watchkeeper()));
+                }
                 Err(e) => {
                     log::error!("settings: nmea = {}: {e}", settings.nmea);
                     self.nmea_trouble = Some(format!("{}: {e}", settings.nmea));
@@ -1158,13 +1276,17 @@ impl App {
     /// write per frame is sixty fsyncs a second on a phone, and the point
     /// of keeping them is that they survive, not that they are fresh to
     /// the millisecond.
-    fn save_if_changed(&mut self, renderer: &Renderer) {
+    fn save_if_changed(&mut self, imagery_opacity: Option<f32>) {
         let Some(store) = &self.store else {
             return;
         };
 
         let mut settings = self.settings_now();
-        settings.imagery_opacity = renderer.imagery_opacity();
+        // The opacity lives on the renderer, which a caller without a GPU
+        // does not have. Absent, whatever was last written stands.
+        if let Some(opacity) = imagery_opacity {
+            settings.imagery_opacity = opacity;
+        }
         if settings != self.saved_settings {
             store.save_settings(&settings);
             self.saved_settings = settings;
@@ -1173,27 +1295,25 @@ impl App {
         if self.route != self.saved_route {
             store.save_route(&self.route);
             self.saved_route = self.route.clone();
+        }
+
+        // Compared on the *committed* points only. The open window
+        // changes on every fix and resolves to one point, so comparing
+        // the whole track would rewrite the file a few times a second
+        // for a shape that has not been decided yet.
+        if self.track.segments != self.saved_track.segments {
+            store.save_track(&self.track);
+            self.saved_track = self.track.clone();
         }
     }
 
     /// Write anything changed, without a renderer.
     ///
-    /// `refresh` does this every frame and needs a renderer for the
-    /// imagery opacity; the saving itself does not. Exposed so the
-    /// round trip can be tested without a GPU.
+    /// `refresh` does this every frame and passes the imagery opacity;
+    /// the saving itself needs no GPU. Exposed so the round trip can be
+    /// tested without one.
     pub fn save_for_tests(&mut self) {
-        let Some(store) = &self.store else {
-            return;
-        };
-        let settings = self.settings_now();
-        if settings != self.saved_settings {
-            store.save_settings(&settings);
-            self.saved_settings = settings;
-        }
-        if self.route != self.saved_route {
-            store.save_route(&self.route);
-            self.saved_route = self.route.clone();
-        }
+        self.save_if_changed(None);
     }
 
     /// Set the boat's draft, as the panel's control does.
@@ -1262,6 +1382,31 @@ impl App {
     /// Go back to following whichever leg the boat is beside.
     pub fn follow_nearest_leg(&mut self) {
         self.chosen_leg = None;
+    }
+
+    /// Open a feed at this address, as the panel's control does.
+    ///
+    /// The watchkeeper goes with it, so changing feeds — the boat's
+    /// instruments coming on, say — does not silently disarm the anchor
+    /// alarm. The watch itself is shared and outlives any receiver.
+    pub fn apply_connect_nmea(&mut self, address: &str) {
+        match nmea::Endpoint::parse(address) {
+            // Replacing the receiver drops the old one, which is what
+            // stops its thread — see the Drop test in `nmea`. Nothing
+            // here has to join it.
+            Ok(endpoint) => {
+                self.nmea = nmea::Receiver::spawn(endpoint, Some(self.watchkeeper()));
+                self.nmea_trouble = None;
+                self.vessel_visible = true;
+            }
+            Err(e) => {
+                // Kept rather than dropped: the panel shows the reason
+                // where the link status goes, so a typo explains itself.
+                log::error!("NMEA: {address}: {e}");
+                self.nmea = None;
+                self.nmea_trouble = Some(format!("{address}: {e}"));
+            }
+        }
     }
 
     /// Close the GPS feed, as the panel's control does.
@@ -1378,6 +1523,189 @@ impl App {
         state.arrived = progress.arrived;
 
         state
+    }
+
+    /// The closure the reader thread runs on every fix.
+    fn watchkeeper(&self) -> nmea::Observer {
+        watchkeeper(&self.watch, &self.siren, &self.last_sounded)
+    }
+
+    /// Read the watch, for the panel.
+    fn watch(&self) -> Watch {
+        self.watch.lock().map(|w| w.clone()).unwrap_or_default()
+    }
+
+    /// Drop the anchor where the boat is, with this much swinging room.
+    ///
+    /// At the boat rather than at the view centre: the anchor is where
+    /// the boat is when you say so, and a watch centred on wherever the
+    /// chart happened to be scrolled would be watching the wrong circle.
+    pub fn set_anchor(&mut self, radius_m: f64) -> bool {
+        let Some(at) = self.nmea.as_ref().and_then(|n| n.vessel().position) else {
+            return false;
+        };
+        if let Ok(mut watch) = self.watch.lock() {
+            watch.set_anchor(at.value, radius_m);
+        }
+        log::info!("anchor watch set at {:?}, {radius_m:.0} m", at.value);
+        self.review_keepalive();
+        true
+    }
+
+    /// Whether an anchor watch is set.
+    pub fn anchored(&self) -> bool {
+        self.watch().watching.anchor.is_some()
+    }
+
+    pub fn weigh_anchor(&mut self) {
+        if let Ok(mut watch) = self.watch.lock() {
+            watch.weigh_anchor();
+        }
+        self.review_keepalive();
+    }
+
+    pub fn set_shallow_alarm(&mut self, metres: Option<f64>) {
+        if let Ok(mut watch) = self.watch.lock() {
+            watch.set_shallow(metres);
+        }
+        self.review_keepalive();
+    }
+
+    /// Take, change or drop the hold that keeps this process running.
+    ///
+    /// Called after every change to what is armed, and not otherwise: the
+    /// state is held here rather than asked of the platform because the
+    /// platform's answer would be a round trip into Java to learn
+    /// something this side already knows.
+    ///
+    /// Nothing here can fail in a way that matters. A hold that cannot be
+    /// taken costs the promise that the system won't kill the process; it
+    /// does not stop the watch, which runs on the reader thread either
+    /// way.
+    fn review_keepalive(&mut self) {
+        // Nothing to ask, so nothing is held — and `held` must stay false
+        // so the panel says "nothing will hold this open" rather than
+        // "standing watch", which on a platform with no keepalive would
+        // be a promise nobody made.
+        let Some(keepalive) = self.keepalive.clone() else {
+            return;
+        };
+        let watch = self.watch();
+        let armed = watch.watching.anchor.is_some() || watch.watching.shallow_m.is_some();
+        let wanted = armed
+            .then(|| keepalive::reason(watch.watching.anchor.is_some(), watch.watching.shallow_m));
+        if wanted == self.held {
+            return;
+        }
+        match &wanted {
+            Some(reason) => keepalive.hold(reason),
+            None => keepalive.release(),
+        }
+        self.held = wanted;
+    }
+
+    pub fn acknowledge_alarms(&mut self) {
+        if let Ok(mut watch) = self.watch.lock() {
+            watch.acknowledge();
+        }
+    }
+
+    /// What the panel shows about the alarms.
+    pub fn alarm_state(&self) -> AlarmState {
+        let watch = self.watch();
+        AlarmState {
+            // Watching needs something to watch with.
+            available: self.nmea.is_some(),
+            anchored: watch.watching.anchor.is_some(),
+            anchor_radius_m: watch
+                .watching
+                .anchor
+                .map_or(ANCHOR_RADIUS_M, |a| a.radius_m),
+            shallow_m: watch.watching.shallow_m,
+            sounding: watch.sounding(),
+            // The one thing a silent alarm must never do quietly.
+            audible: self.siren.as_ref().is_some_and(|s| s.available()),
+            siren: self
+                .siren
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |s| s.describe()),
+            held: self.held.is_some(),
+            keepalive: self
+                .keepalive
+                .as_ref()
+                .map_or_else(|| "nothing".to_owned(), |k| k.describe()),
+            active: watch
+                .active()
+                .iter()
+                .map(|a| match a.kind {
+                    alarm::Kind::AnchorDrag => {
+                        format!("{} — {:.0} m from the anchor", a.kind.label(), a.value_m)
+                    }
+                    alarm::Kind::Shallow => {
+                        format!(
+                            "{} — {:.1} m under the transducer",
+                            a.kind.label(),
+                            a.value_m
+                        )
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// The track, as lines on the chart.
+    ///
+    /// One mark per segment of each run, which is why the thinning
+    /// matters: an unthinned day of fixes would be forty thousand of
+    /// these.
+    fn track_marks(&self) -> Vec<Overlay> {
+        if !self.track_visible {
+            return Vec::new();
+        }
+        let mut marks = Vec::new();
+        for line in self.track.lines() {
+            for pair in line.windows(2) {
+                marks.push(Overlay::Leg {
+                    from: chart::project(pair[0]),
+                    to: chart::project(pair[1]),
+                    colour: TRACK_COLOUR,
+                });
+            }
+        }
+        marks
+    }
+
+    /// What the panel shows about the track.
+    fn track_state(&self) -> TrackState {
+        let span = self.track.span();
+        let distance = self.track.distance_nm();
+        TrackState {
+            visible: self.track_visible,
+            recording: self.recording,
+            available: self.nmea.is_some(),
+            points: self.track.len(),
+            distance: (distance > 0.005).then(|| format!("{distance:.2} nm run")),
+            since: span
+                .map(|(from, to)| format!("{} to {}", format_utc_hhmm(from), format_utc_hhmm(to))),
+            // More than one run means the feed dropped out and the line is
+            // broken. Said out loud, because a break in a track looks like
+            // a bug rather than a gap in the record.
+            breaks: self.track.segments.len().saturating_sub(1),
+        }
+    }
+
+    /// Start or stop recording. Stopping closes the line cleanly.
+    pub fn set_recording(&mut self, on: bool) {
+        if self.recording && !on {
+            // Otherwise the last leg of a passage sits in the window and
+            // is lost.
+            self.track.finish();
+        }
+        self.recording = on;
+    }
+
+    pub fn clear_track(&mut self) {
+        self.track.clear();
     }
 
     /// The route's legs and waypoints, as marks on the chart.
@@ -1814,6 +2142,8 @@ impl App {
             tides: self.tide_state(pixels_per_point),
             currents: self.current_state(),
             route: self.route_state(),
+            track: self.track_state(),
+            alarms: self.alarm_state(),
             temperature: self.temperature_state(),
             download: self.download_state(),
             time: self.time_state(),
@@ -2115,23 +2445,7 @@ impl App {
                     touched = true;
                 }
                 Action::ConnectNmea(address) => {
-                    match nmea::Endpoint::parse(address) {
-                        // Replacing the receiver drops the old one, which
-                        // is what stops its thread — see the Drop test in
-                        // `nmea`. Nothing here has to join it.
-                        Ok(endpoint) => {
-                            self.nmea = nmea::Receiver::spawn(endpoint);
-                            self.vessel_visible = true;
-                        }
-                        Err(e) => {
-                            // Kept rather than dropped: the panel shows
-                            // the reason where the link status goes, so a
-                            // typo explains itself.
-                            log::error!("NMEA: {address}: {e}");
-                            self.nmea = None;
-                            self.nmea_trouble = Some(format!("{address}: {e}"));
-                        }
-                    }
+                    self.apply_connect_nmea(address);
                     touched = true;
                 }
                 Action::UseDeviceGps => {
@@ -2172,6 +2486,33 @@ impl App {
                 }
                 Action::SetRoute(on) => {
                     self.route_visible = *on;
+                    touched = true;
+                }
+                Action::SetTrack(on) => {
+                    self.track_visible = *on;
+                    touched = true;
+                }
+                Action::SetRecording(on) => {
+                    self.set_recording(*on);
+                    touched = true;
+                }
+                Action::ClearTrack => {
+                    self.clear_track();
+                    touched = true;
+                }
+                Action::SetAnchor(radius) => {
+                    touched |= self.set_anchor(*radius);
+                }
+                Action::WeighAnchor => {
+                    self.weigh_anchor();
+                    touched = true;
+                }
+                Action::SetShallowAlarm(metres) => {
+                    self.set_shallow_alarm(*metres);
+                    touched = true;
+                }
+                Action::AcknowledgeAlarms => {
+                    self.acknowledge_alarms();
                     touched = true;
                 }
                 Action::AddWaypointAtCentre => {
@@ -2320,6 +2661,13 @@ impl App {
                 | Action::SetTemperature(_)
                 | Action::SetTemperatureOpacity(_)
                 | Action::SetRoute(_)
+                | Action::SetTrack(_)
+                | Action::SetRecording(_)
+                | Action::ClearTrack
+                | Action::SetAnchor(_)
+                | Action::WeighAnchor
+                | Action::SetShallowAlarm(_)
+                | Action::AcknowledgeAlarms
                 | Action::AddWaypointAtCentre
                 | Action::RemoveWaypoint(_)
                 | Action::ClearRoute
@@ -2360,7 +2708,7 @@ impl App {
         };
         // Replacing the receiver drops any network feed, which is what
         // stops its thread and releases its socket.
-        self.nmea = nmea::Receiver::spawn_device(gps);
+        self.nmea = nmea::Receiver::spawn_device(gps, Some(self.watchkeeper()));
         self.nmea_trouble = None;
         self.vessel_visible = true;
         self.nmea.is_some()
@@ -2883,6 +3231,60 @@ fn part_file(target: &std::path::Path) -> std::path::PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
     target.with_file_name(name)
+}
+
+/// Build the closure the reader thread runs on every fix.
+///
+/// A free function rather than a method because it is wanted before the
+/// `App` exists: the receiver is constructed in the initialiser and needs
+/// this, and a feed that started without a watch would be an anchor alarm
+/// that silently never fired.
+///
+/// Everything it touches is shared rather than borrowed, so it outlives
+/// any particular receiver — reconnecting to a different feed does not
+/// lose the watch.
+fn watchkeeper(
+    watch: &std::sync::Arc<std::sync::Mutex<Watch>>,
+    siren: &Option<std::sync::Arc<dyn siren::Siren>>,
+    last_sounded: &std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> nmea::Observer {
+    let watch = watch.clone();
+    let siren = siren.clone();
+    let last_sounded = last_sounded.clone();
+
+    std::sync::Arc::new(move |vessel: &Vessel, now: i64| {
+        let reading = alarm::Reading {
+            position: vessel.position.map(|p| (p.value, p.at)),
+            depth_m: vessel.depth_m.map(|d| (d.value, d.at)),
+        };
+
+        // A poisoned lock means something already panicked on this path.
+        // Carrying on from slightly stale state beats an alarm that stops.
+        let Ok(mut watch) = watch.lock() else {
+            return;
+        };
+
+        if watch.update(&reading, now) {
+            for active in watch.active() {
+                log::warn!("ALARM: {} ({:.1} m)", active.kind.label(), active.value_m);
+            }
+        }
+        if !watch.sounding() {
+            return;
+        }
+
+        // Repeated rather than continuous: insistent, and spaced enough
+        // that someone can think and reach the Silence button between
+        // noises.
+        let since = last_sounded.load(std::sync::atomic::Ordering::Relaxed);
+        if now - since < siren::REPEAT_SECS {
+            return;
+        }
+        last_sounded.store(now, std::sync::atomic::Ordering::Relaxed);
+        if let Some(siren) = &siren {
+            siren.sound(siren::Urgency::Alarm);
+        }
+    })
 }
 
 /// How many tiles cover a box across a range of zooms.
@@ -3535,6 +3937,8 @@ mod tests {
                 gps: None,
                 fetcher: None,
                 imagery_out: None,
+                siren: None,
+                keepalive: None,
                 data_dir: None,
             },
             None,
@@ -3592,6 +3996,8 @@ mod tests {
                 gps: None,
                 fetcher: None,
                 imagery_out: None,
+                siren: None,
+                keepalive: None,
                 data_dir: None,
             },
             None,

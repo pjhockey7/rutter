@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+mod siren;
+
 use rutter_app::{App, NmeaEndpoint, Position, Sources, Viewport};
 use rutter_charts::{ChartSource, ImagerySource};
 use rutter_render::{Frame, GuiFrame, Renderer};
@@ -206,6 +208,7 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
                 println!("  n               back to now");
                 println!("  i               show or hide the aerial imagery");
                 println!("  w               add a waypoint under the cursor");
+                println!("  a               set or clear the anchor watch");
                 println!("  m               mark this view for download (Tools tab)");
                 println!("  Escape          quit");
                 std::process::exit(0);
@@ -330,6 +333,15 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
             // `build/` is where this project's *generated data* goes;
             // a draft and a planned passage are the user's, not the
             // build's.
+            // Through whatever player the system has. See siren.rs for
+            // why that rather than an audio crate.
+            siren: Some(std::sync::Arc::new(siren::Audio::new())),
+            // Nothing to hold open. A desktop runs what it is told to
+            // run until it is told to stop, and an inhibitor would only
+            // stop the machine suspending — which is a laptop-lid
+            // question, not an anchor-watch one, and one the user is in a
+            // better position to answer than this app is.
+            keepalive: None,
             data_dir: data_directory(),
             // Default: beside the other data files. The download
             // replaces whatever is there, which on a desktop is what you
@@ -708,6 +720,20 @@ impl ApplicationHandler for Platform {
                         let at = self.app.view.position_at(x, y);
                         self.app.add_waypoint(at);
                         log::info!("waypoint at {at:?}");
+                        changed = true;
+                    }
+                    // The anchor watch. Worth a key of its own: it is set
+                    // at the moment the anchor goes down, which is a
+                    // moment with both hands busy.
+                    Key::Character("a" | "A") => {
+                        if self.app.anchored() {
+                            self.app.weigh_anchor();
+                            log::info!("anchor watch off");
+                        } else if self.app.set_anchor(40.0) {
+                            log::info!("anchor watch set, 40 m");
+                        } else {
+                            log::warn!("no fix, so there is nothing to anchor to");
+                        }
                         changed = true;
                     }
                     Key::Character("m" | "M") => {

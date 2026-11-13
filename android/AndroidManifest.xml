@@ -2,11 +2,18 @@
 <!--
   rutter's Android manifest.
 
-  There is no Java in this app and no classes.dex in the APK. That is the
-  point of `android:hasCode="false"` below: `android.app.NativeActivity` is a
-  framework class, so the system can launch a purely native app with no
-  application bytecode at all. The `android-activity` crate reimplements the
-  NDK's native_app_glue in Rust and `winit` drives it from there.
+  There is exactly one Java class in this app — `WatchService` — and it is
+  here because Android gives no alternative. `android.app.Service` is
+  abstract, with no `NativeService` counterpart to `NativeActivity`, so a
+  foreground service cannot exist without bytecode. Everything else is
+  native: `android.app.NativeActivity` is a framework class, the
+  `android-activity` crate reimplements the NDK's native_app_glue in Rust,
+  and `winit` drives it from there.
+
+  The app ran with `hasCode="false"` and zero dex entries until an anchor
+  watch needed to survive the screen going off. That property was worth
+  keeping and worth giving up for this: a watch that only runs while you
+  are looking at it is not a watch.
 
   This is also what ../../opencpn could not do. Qt's Android port needs a Java
   activity to call into, which is exactly the tree OpenCPN never published —
@@ -60,6 +67,24 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
+    <!--
+      The foreground service, and the location type it declares.
+
+      A service of type `location` is what lets the GPS keep reporting
+      with the app in the background — a foreground service counts as
+      foreground for the purposes of the location restrictions, which is
+      why ACCESS_BACKGROUND_LOCATION is *not* needed here and deliberately
+      not asked for. It is the most scrutinised permission Android has and
+      this does not need it.
+
+      POST_NOTIFICATIONS is a runtime permission from API 33. Without it
+      the service still runs, but its notification is not shown — so the
+      only visible sign that the watch is keeping is missing.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <uses-feature
         android:name="android.hardware.location.gps"
         android:required="false" />
@@ -76,7 +101,7 @@
 
     <application
         android:label="rutter"
-        android:hasCode="false"
+        android:hasCode="true"
         android:extractNativeLibs="false"
         android:debuggable="true">
 
@@ -104,5 +129,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          Started when an alarm is armed and stopped when it is not. Not
+          exported: nothing outside this app has any business starting it.
+
+          Same process as the activity, which is the whole point — the
+          anchor watch, the NMEA reader and the siren are Rust threads in
+          that process, and this exists so Android does not kill them
+          when the screen goes off.
+        -->
+        <service
+            android:name=".WatchService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
     </application>
 </manifest>

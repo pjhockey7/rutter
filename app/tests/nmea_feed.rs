@@ -81,9 +81,11 @@ fn the_simulator_and_the_parser_agree_about_where_the_boat_is() {
         probe.local_addr().expect("addr").port()
     };
 
-    let mut nmea =
-        Receiver::spawn(Endpoint::parse(&format!("udp://127.0.0.1:{port}")).expect("endpoint"))
-            .expect("reader thread");
+    let mut nmea = Receiver::spawn(
+        Endpoint::parse(&format!("udp://127.0.0.1:{port}")).expect("endpoint"),
+        None,
+    )
+    .expect("reader thread");
     wait_for(&mut nmea, "the socket to bind", |n| {
         matches!(n.report().link, Link::Open(_))
     });
@@ -189,9 +191,11 @@ fn a_feed_with_corrupt_sentences_still_produces_a_boat() {
         probe.local_addr().expect("addr").port()
     };
 
-    let mut nmea =
-        Receiver::spawn(Endpoint::parse(&format!("udp://127.0.0.1:{port}")).expect("endpoint"))
-            .expect("reader thread");
+    let mut nmea = Receiver::spawn(
+        Endpoint::parse(&format!("udp://127.0.0.1:{port}")).expect("endpoint"),
+        None,
+    )
+    .expect("reader thread");
     wait_for(&mut nmea, "the socket to bind", |n| {
         matches!(n.report().link, Link::Open(_))
     });

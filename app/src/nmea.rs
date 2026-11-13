@@ -357,6 +357,20 @@ impl Link {
     }
 }
 
+/// Something told about every fix, on the reader's own thread.
+///
+/// The alarms use this, and the reason is the whole point of them: they
+/// were first evaluated from the frame loop, which means that with the
+/// screen off — the only state an anchor watch exists for — nothing was
+/// drawing, nothing was polling, and nothing was watching. An alarm that
+/// only works while you are looking at it is not an alarm.
+///
+/// So the watch runs here, where the fixes arrive, on a thread that keeps
+/// running whether or not anything is drawn. A closure rather than a
+/// concrete type because this module has no business knowing what an
+/// alarm is.
+pub type Observer = std::sync::Arc<dyn Fn(&Vessel, i64) + Send + Sync>;
+
 /// A snapshot of the feed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Report {
@@ -387,13 +401,13 @@ pub struct Receiver {
 impl Receiver {
     /// Start reading. `None` if the thread could not be started — the same
     /// rule as the chart worker: an app with no GPS is still a chart.
-    pub fn spawn(endpoint: Endpoint) -> Option<Self> {
+    pub fn spawn(endpoint: Endpoint, observer: Option<Observer>) -> Option<Self> {
         let (to_app, from_reader) = mpsc::channel::<Report>();
         let moved = endpoint.clone();
 
         if let Err(e) = thread::Builder::new()
             .name("rutter-nmea".to_owned())
-            .spawn(move || reader(&moved, &to_app))
+            .spawn(move || reader(&moved, &to_app, observer.as_ref()))
         {
             log::error!("could not start the NMEA reader: {e}");
             return None;
@@ -432,12 +446,12 @@ impl Receiver {
     /// same thread pattern, the same [`Report`] over the same channel, so
     /// the panel, the boat marker and the follow mode cannot tell the
     /// difference and did not need changing.
-    pub fn spawn_device(gps: DeviceGps) -> Option<Self> {
+    pub fn spawn_device(gps: DeviceGps, observer: Option<Observer>) -> Option<Self> {
         let (to_app, from_reader) = mpsc::channel::<Report>();
 
         if let Err(e) = thread::Builder::new()
             .name("rutter-gps".to_owned())
-            .spawn(move || device_reader(&gps, &to_app))
+            .spawn(move || device_reader(&gps, &to_app, observer.as_ref()))
         {
             log::error!("could not start the GPS reader: {e}");
             return None;
@@ -501,6 +515,8 @@ struct Feed<'a> {
     partial: Vec<u8>,
     /// Whether the current line is being skipped because it overran.
     resyncing: bool,
+    /// Told about every published state, on this thread. See [`Observer`].
+    observer: Option<Observer>,
 }
 
 impl<'a> Feed<'a> {
@@ -510,12 +526,20 @@ impl<'a> Feed<'a> {
             to_app,
             partial: Vec::new(),
             resyncing: false,
+            observer: None,
         }
     }
 
     /// Publish the current state. False if the app has gone away, which is
     /// the thread's signal to stop.
+    ///
+    /// The observer is told first and unconditionally. It is the alarm
+    /// watch, and it has to keep working when the app is no longer
+    /// drawing — which is precisely when nobody is reading the channel.
     fn publish(&self) -> bool {
+        if let Some(observer) = &self.observer {
+            observer(&self.report.vessel, unix_now());
+        }
         self.to_app.send(self.report.clone()).is_ok()
     }
 
@@ -618,8 +642,9 @@ impl<'a> Feed<'a> {
 /// permission can be refused and then granted from the system settings
 /// while the app is running, and a provider can be switched off and on,
 /// both of which this recovers from without a restart.
-fn device_reader(gps: &DeviceGps, to_app: &mpsc::Sender<Report>) {
+fn device_reader(gps: &DeviceGps, to_app: &mpsc::Sender<Report>, observer: Option<&Observer>) {
     let mut feed = Feed::new(to_app);
+    feed.observer = observer.cloned();
 
     loop {
         if !feed.set_link(Link::Connecting) {
@@ -680,8 +705,9 @@ fn device_reader(gps: &DeviceGps, to_app: &mpsc::Sender<Report>) {
 }
 
 /// The reader's loop: open, read until it fails, wait, open again.
-fn reader(endpoint: &Endpoint, to_app: &mpsc::Sender<Report>) {
+fn reader(endpoint: &Endpoint, to_app: &mpsc::Sender<Report>, observer: Option<&Observer>) {
     let mut feed = Feed::new(to_app);
+    feed.observer = observer.cloned();
 
     loop {
         if !feed.set_link(Link::Connecting) {
@@ -1051,8 +1077,8 @@ mod tests {
         // Port 0 so the test never collides with a real feed or with
         // another test; the bound port comes back in the report, which is
         // why `Link::Open` carries an address at all.
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec")).expect("thread");
+        let mut nmea = Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec"), None)
+            .expect("thread");
         let to = opened(&mut nmea);
 
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
@@ -1073,8 +1099,8 @@ mod tests {
     fn several_sentences_in_one_datagram_all_arrive() {
         // A multiplexer sends a whole cycle in one packet, and some send it
         // without a trailing newline.
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec")).expect("thread");
+        let mut nmea = Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec"), None)
+            .expect("thread");
         let to = opened(&mut nmea);
 
         let burst = format!(
@@ -1117,9 +1143,11 @@ mod tests {
             thread::sleep(Duration::from_millis(500));
         });
 
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("spec"))
-                .expect("thread");
+        let mut nmea = Receiver::spawn(
+            Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("spec"),
+            None,
+        )
+        .expect("thread");
         wait_for(&mut nmea, "a fix", |n| n.vessel().position.is_some());
         assert_eq!(nmea.report().accepted, 1);
 
@@ -1134,9 +1162,11 @@ mod tests {
             probe.local_addr().expect("addr").port()
         };
 
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("spec"))
-                .expect("thread");
+        let mut nmea = Receiver::spawn(
+            Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("spec"),
+            None,
+        )
+        .expect("thread");
 
         wait_for(&mut nmea, "a failure", |n| n.troubled());
         assert!(
@@ -1151,8 +1181,8 @@ mod tests {
         // The failure this guards: a binary gateway or the wrong baud rate
         // produces megabytes with no newline. The reader has to throw it
         // away and still find the sentence afterwards.
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec")).expect("thread");
+        let mut nmea = Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec"), None)
+            .expect("thread");
         let to = opened(&mut nmea);
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
 
@@ -1171,8 +1201,8 @@ mod tests {
 
     #[test]
     fn a_bad_checksum_is_counted_and_not_believed() {
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec")).expect("thread");
+        let mut nmea = Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec"), None)
+            .expect("thread");
         let to = opened(&mut nmea);
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
 
@@ -1198,8 +1228,8 @@ mod tests {
         // and the panel showed "0 refused" while refusing every line. "No
         // data" and "data, all bad" are different problems with different
         // fixes, and the counts are the only thing that tells them apart.
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec")).expect("thread");
+        let mut nmea = Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec"), None)
+            .expect("thread");
         let to = opened(&mut nmea);
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
 
@@ -1227,8 +1257,8 @@ mod tests {
         // A feed of nothing but satellite status and AIS is working
         // perfectly and giving no position, which is a different problem
         // from a feed of noise. The counts have to tell them apart.
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec")).expect("thread");
+        let mut nmea = Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec"), None)
+            .expect("thread");
         let to = opened(&mut nmea);
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
 
@@ -1262,7 +1292,8 @@ mod tests {
             return;
         };
 
-        let mut nmea = Receiver::spawn(Endpoint::parse(&path).expect("spec")).expect("thread");
+        let mut nmea =
+            Receiver::spawn(Endpoint::parse(&path).expect("spec"), None).expect("thread");
         wait_for(&mut nmea, "the port to open", |n| n.report().link.is_open());
 
         // Written in two pieces across the sentence boundary, because a
@@ -1306,7 +1337,8 @@ mod tests {
             return;
         };
 
-        let mut nmea = Receiver::spawn(Endpoint::parse(&path).expect("spec")).expect("thread");
+        let mut nmea =
+            Receiver::spawn(Endpoint::parse(&path).expect("spec"), None).expect("thread");
         wait_for(&mut nmea, "the port to open", |n| n.report().link.is_open());
 
         // Well past one read window with nothing written, and well short
@@ -1342,9 +1374,11 @@ mod tests {
             socket.read(&mut sink)
         });
 
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("spec"))
-                .expect("thread");
+        let mut nmea = Receiver::spawn(
+            Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).expect("spec"),
+            None,
+        )
+        .expect("thread");
         opened(&mut nmea);
         drop(nmea);
 
@@ -1354,8 +1388,8 @@ mod tests {
 
     #[test]
     fn polling_an_idle_feed_is_cheap_and_says_nothing_changed() {
-        let mut nmea =
-            Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec")).expect("thread");
+        let mut nmea = Receiver::spawn(Endpoint::parse("udp://127.0.0.1:0").expect("spec"), None)
+            .expect("thread");
         opened(&mut nmea);
         // Drain whatever the open produced.
         while nmea.poll() {

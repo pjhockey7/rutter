@@ -52,6 +52,17 @@ const NMEA_ASSET: &str = "nmea.txt";
 #[cfg(target_os = "android")]
 mod gps;
 
+// Keeping the process alive while an alarm is armed. The only reason
+// there is any Java in this app at all.
+#[cfg(target_os = "android")]
+mod jvm;
+#[cfg(target_os = "android")]
+mod keepalive;
+#[cfg(target_os = "android")]
+mod siren;
+#[cfg(target_os = "android")]
+mod watch;
+
 // The only unsafe thing in the project, and unavoidable: the NDK's glue
 // finds this entry point by symbol name, so it cannot be mangled. Spelled
 // with the explicit `unsafe(…)` form and an `allow` rather than relaxing the
@@ -279,6 +290,21 @@ fn open_bundled_sources(app: &AndroidApp) -> Sources {
         // The same directory as everything else here. A sandboxed app has
         // exactly one place it may write, and it is wiped with the app —
         // which is the right lifetime for a draft and a planned passage.
+        // On the alarm stream, so a silenced phone still sounds it —
+        // see `siren.rs`. If it will not open, the alarms still watch and
+        // still draw and the panel says plainly that they cannot be
+        // heard, which is the one thing a silent alarm must never do
+        // quietly.
+        siren: match siren::Tones::open() {
+            Ok(tones) => Some(std::sync::Arc::new(tones)),
+            Err(e) => {
+                log::error!("no siren: {e}");
+                None
+            }
+        },
+        // The foreground service, so an anchor watch survives the screen
+        // going off.
+        keepalive: Some(std::sync::Arc::new(keepalive::Service)),
         data_dir: app.internal_data_path(),
     }
 }
