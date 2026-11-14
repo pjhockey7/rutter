@@ -144,14 +144,42 @@ behind it.
       correctly rather than guessed. Whether it is *audible* is still
       untested: nothing has yet made it sound.
 
-- [ ] **Feet and fathoms.** Everything is metres. US charts print feet and
-      the draft is in feet in your head. Depth, height and clearance all need
-      a unit setting.
+- [x] **Feet and fathoms.** Done, in a Settings tab of its own, saved
+      with everything else. Metres stay metres everywhere inside —
+      `rutter_core::units` is the last step before a number reaches a
+      person, and nothing upstream ever holds a converted value, because
+      a figure that *might* be feet is one that will eventually be
+      compared against one that is metres.
 
-- [ ] **Local time.** Every time is UTC with a `Z`. Planning an 0600
-      departure off UTC tide tables is the one gap here that is actively
-      dangerous rather than merely missing. Needs a timezone source, which is
-      why it was deferred.
+      Soundings, draft, clearance, tide heights and the sounder reading
+      follow the setting. Horizontal distances — swing radius, GPS
+      accuracy — fall back to feet when fathoms are chosen, since
+      "within 27 fathoms" reads as a bug even when the arithmetic is
+      right. Distances run and speeds stay nautical miles and knots.
+
+      The decimal places are set by an absolute limit on how coarsely a
+      number may read and still be acted on, not by matching metres: a
+      foot is 0.305 m, so **whole feet would be coarser than metres to
+      one place** and a 1.80 m draft and a 1.95 m draft would print the
+      same. A test asserts the limit for every unit.
+
+- [x] **Local time.** Done, and not as an offset read at startup, which
+      is wrong twice a year: San Diego is −8 in winter and −7 in summer,
+      and a tide curve drawn across the changeover would put one side of
+      it out by an hour — silently, on exactly the weekend the clocks
+      moved.
+
+      So `zone::Zone` is asked **per timestamp**. Android uses
+      `java.util.TimeZone.getOffset(millis)`; a desktop uses
+      `localtime_r` and `tm_gmtoff`. A platform with nothing to offer
+      leaves every time in UTC, which is honest rather than a zero offset
+      labelled "local". The clock resolves once a frame, so every time on
+      a panel is in one scale — and because on Android each resolution is
+      two JNI calls.
+
+      One trap worth remembering: glibc's `localtime_r`, unlike
+      `localtime`, does **not** call `tzset`, and the `libc` crate does
+      not export it. It is declared and called once behind a `Once`.
 
 - [x] **Settings that persist.** Done. Two files in a platform-chosen
       directory — `$XDG_DATA_HOME/rutter` on Linux, the app's own data
@@ -179,11 +207,12 @@ behind it.
       the first version applied the settings *after* the command line and
       silently discarded `--draft`.
 
-      Still to come: the NMEA address is saved but **units** are not, since
-      there are none yet.
+      Units and the clock are saved here too, as `units` and
+      `local_time`.
 
-- [x] **Split the layers panel into tabs.** Done: fixed tabs — Boat, Chart,
-      Water, Weather, Tools. Every screen has all of them and switches
+- [x] **Split the layers panel into tabs.** Done: fixed tabs — Boat,
+      Route, Chart, Water, Weather, Settings, with Tools in a panel of its
+      own. Every screen has all of them and switches
       freely; only the Chart tab scrolls, which is the one place scrolling
       is the point. Saved presets still to come, and they are a selection of
       layers rather than of tabs.
