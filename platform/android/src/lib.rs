@@ -400,9 +400,22 @@ struct Platform {
     fingers: Vec<(u64, (f64, f64))>,
     /// The pinch in progress, if two fingers are down.
     pinch: Option<Pinch>,
-    /// Whether the panel has had the current gesture. egui gets the first
-    /// refusal on a touch, the same as it gets on a Linux click.
-    gesture_consumed: bool,
+    /// Whether the panel has claimed the gesture in progress, or `None`
+    /// while that is not yet known.
+    ///
+    /// It cannot be known when the finger lands. egui answers
+    /// `wants_pointer_input` out of its *last completed pass*, and at the
+    /// moment of a press that pass ran before the finger existed — so
+    /// asking then gets the answer for a screen nobody was touching.
+    ///
+    /// Taking that answer at face value is what made every control need
+    /// two taps: the first was judged not-for-the-panel, so the release
+    /// was never delivered to egui and the widget sat there looking
+    /// pressed; the second then found `wants_pointer_input` already true
+    /// and worked. The press is now always delivered, and the question is
+    /// asked after the pass that answers it — see
+    /// [`Platform::settle_gesture`].
+    gesture: Option<bool>,
 
     /// The surface, in pixels, as winit last reported it.
     ///
@@ -421,6 +434,53 @@ struct Platform {
     /// is a real answer, and asking forever would be a handful of JNI
     /// calls every frame to learn zero again.
     inset_tries: u8,
+}
+
+/// How much bigger the text is than egui's desktop default.
+const FONT_SCALE: f32 = 1.25;
+
+/// How much bigger the controls are.
+///
+/// More than the text, and deliberately: a pointer is exact and a
+/// fingertip is about nine millimetres across, so what has to grow is the
+/// area you can hit rather than the words inside it. Scaling both equally
+/// — which is all `pixels_per_point` can do — would make a phone read
+/// like a desktop held close, with the same fiddly targets.
+const CONTROL_SCALE: f32 = 1.5;
+
+/// Make the interface a finger can hit.
+///
+/// Applied only here. A desktop keeps egui's defaults, because a mouse
+/// does not need any of this and the panel is already tall enough to want
+/// a scroll bar.
+fn size_for_fingers(ctx: &egui::Context) {
+    // Both themes, since egui keeps a style per theme and the app does
+    // not pin one.
+    ctx.all_styles_mut(|style| {
+        for font in style.text_styles.values_mut() {
+            font.size *= FONT_SCALE;
+        }
+
+        let spacing = &mut style.spacing;
+        // Button height is `max(interact_size.y, text + padding)`, so the
+        // minimum is what actually sets it at these sizes — the padding
+        // is scaled too so a button grows in both directions rather than
+        // becoming a letterbox.
+        spacing.interact_size *= CONTROL_SCALE;
+        spacing.button_padding *= CONTROL_SCALE;
+        // Checkbox and radio ticks, which are sized independently of the
+        // text beside them and would otherwise stay desktop-small.
+        spacing.icon_width *= CONTROL_SCALE;
+        spacing.icon_width_inner *= CONTROL_SCALE;
+        spacing.icon_spacing *= FONT_SCALE;
+        // A slider's grab handle comes from `interact_size`, but its rail
+        // does not, and a thick handle on a hairline rail looks broken.
+        spacing.slider_rail_height *= CONTROL_SCALE;
+        // Room to drag, and room between rows so a fingertip landing
+        // slightly off still lands on the right one.
+        spacing.slider_width *= CONTROL_SCALE;
+        spacing.item_spacing *= FONT_SCALE;
+    });
 }
 
 /// egui's context, without winit's translator.
@@ -467,6 +527,23 @@ impl Platform {
         if let Some(r) = self.renderer.as_mut() {
             r.set_letterbox(self.insets.any().then_some((x, y, w, h)));
         }
+    }
+
+    /// Decide whether the gesture in progress belongs to the panel.
+    ///
+    /// Called once a pass has run with the press in it, which is the
+    /// first moment egui can answer. `is_using_pointer` covers a drag
+    /// already under way — a slider being moved — and
+    /// `wants_pointer_input` covers the pass a widget is first touched.
+    fn settle_gesture(&mut self) {
+        if self.gesture.is_some() || self.fingers.is_empty() {
+            return;
+        }
+        let Some(egui) = self.egui.as_ref() else {
+            return;
+        };
+        let wanted = egui.ctx.egui_wants_pointer_input() || egui.ctx.egui_is_using_pointer();
+        self.gesture = Some(wanted);
     }
 
     fn redraw_soon(&self) {
@@ -536,7 +613,14 @@ impl Platform {
                     // Only the first finger of a gesture is offered to the
                     // panel. A second finger means a pinch, which the panel
                     // has no use for.
-                    self.gesture_consumed = self.offer_to_panel(touch);
+                    //
+                    // Always offered, and the answer taken later: see the
+                    // note on `gesture`.
+                    self.offer_to_panel(touch);
+                    self.gesture = None;
+                } else {
+                    // A pinch is never the panel's.
+                    self.gesture = Some(false);
                 }
                 self.pinch = self.start_pinch();
                 // The press needs a frame of its own.
@@ -562,18 +646,33 @@ impl Platform {
                     slot.1 = now;
                 }
 
-                if self.fingers.len() >= 2 {
-                    self.pinch_moved();
-                } else if self.gesture_consumed {
-                    self.offer_to_panel(touch);
-                } else if let Some(last) = previous {
-                    self.app.pan_pixels(now.0 - last.0, now.1 - last.1);
+                match (self.fingers.len() >= 2, self.gesture) {
+                    (true, _) => self.pinch_moved(),
+                    (false, Some(true)) => {
+                        self.offer_to_panel(touch);
+                    }
+                    (false, Some(false)) => {
+                        if let Some(last) = previous {
+                            self.app.pan_pixels(now.0 - last.0, now.1 - last.1);
+                        }
+                    }
+                    // Still undecided, which lasts one frame at most.
+                    // Doing nothing is right: panning now would drag the
+                    // chart out from under a slider the finger had in
+                    // fact landed on.
+                    (false, None) => {}
                 }
                 self.redraw_soon();
             }
 
             TouchPhase::Ended | TouchPhase::Cancelled => {
-                if self.gesture_consumed && self.fingers.len() == 1 {
+                // Unconditionally, where the press went. egui needs the
+                // release to turn a press into a click, and withholding
+                // it leaves the widget stuck looking pressed — which is
+                // precisely the bug this replaced. A release egui had no
+                // use for costs nothing; one it needed and never got
+                // costs the click.
+                if self.fingers.len() == 1 {
                     self.offer_to_panel(touch);
                 }
                 self.fingers.retain(|(f, _)| *f != id);
@@ -582,7 +681,7 @@ impl Platform {
                 // the remaining finger moves.
                 self.pinch = self.start_pinch();
                 if self.fingers.is_empty() {
-                    self.gesture_consumed = false;
+                    self.gesture = None;
                 }
                 self.redraw_soon();
             }
@@ -700,6 +799,8 @@ impl Platform {
             )
         });
 
+        self.settle_gesture();
+
         let (gui, wants_repaint) = match tessellated {
             Some((ppp, ref primitives, textures, viewports)) => (
                 Some(GuiFrame {
@@ -780,6 +881,7 @@ impl ApplicationHandler for Platform {
         );
 
         let ctx = egui::Context::default();
+        size_for_fingers(&ctx);
         self.egui = Some(EguiState {
             ctx,
             events: Vec::new(),
@@ -799,7 +901,7 @@ impl ApplicationHandler for Platform {
         self.window = None;
         self.fingers.clear();
         self.pinch = None;
-        self.gesture_consumed = false;
+        self.gesture = None;
         // The uploaded geometry went with the renderer. The sources and
         // their decoded-tile caches survive, so coming back costs an upload
         // but not a re-decode.
