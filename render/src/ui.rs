@@ -535,6 +535,15 @@ pub struct PanelState {
     pub wind: WindState,
     /// The top strip's text: position, zoom, scale.
     pub status: String,
+    /// The part of the window the system has not claimed, in points, or
+    /// `None` for all of it.
+    ///
+    /// A desktop window is all usable. A phone is not: from Android 15 an
+    /// app is forced edge-to-edge, and the top row of buttons ends up
+    /// under a camera cutout with the leftmost one clipped by the corner
+    /// radius. Everything is laid out inside this, and what is left over
+    /// is painted black — see [`Panel::show`].
+    pub safe: Option<egui::Rect>,
 }
 
 /// Which group of controls the panel is showing.
@@ -698,8 +707,41 @@ impl Ui {
             draft,
             wind,
             status,
+            safe,
         } = state;
         let mut actions = Vec::new();
+
+        // Everything below is laid out inside the safe area, and the
+        // margins are painted over.
+        //
+        // Painted rather than left showing the chart: the chart is
+        // letterboxed to the same rectangle, so what is outside it is
+        // whatever the clear colour happened to be. Black, so that a
+        // cutout and a gesture bar sit on something deliberate instead of
+        // on a band of sea.
+        let whole = root.max_rect();
+        let area = safe.map_or(whole, |safe| safe.intersect(whole));
+        if area != whole {
+            let painter = root.painter();
+            for margin in [
+                egui::Rect::from_min_max(whole.min, egui::pos2(whole.max.x, area.min.y)),
+                egui::Rect::from_min_max(egui::pos2(whole.min.x, area.max.y), whole.max),
+                egui::Rect::from_min_max(
+                    egui::pos2(whole.min.x, area.min.y),
+                    egui::pos2(area.min.x, area.max.y),
+                ),
+                egui::Rect::from_min_max(
+                    egui::pos2(area.max.x, area.min.y),
+                    egui::pos2(whole.max.x, area.max.y),
+                ),
+            ] {
+                if margin.is_positive() {
+                    painter.rect_filled(margin, 0.0, egui::Color32::BLACK);
+                }
+            }
+        }
+        let mut inside = root.new_child(egui::UiBuilder::new().max_rect(area));
+        let root = &mut inside;
 
         // Station rings and wind barbs are drawn by the chart renderer, not
         // here — see `Overlay` in this crate's root. What remains in egui is
@@ -2667,6 +2709,7 @@ mod font_tests {
             ui_state.show(
                 ui,
                 &PanelState {
+                    safe: None,
                     layers: entries.clone(),
                     vessel: populated_vessel(),
                     currents: populated_currents(),
@@ -2970,6 +3013,7 @@ mod font_tests {
             ui_state.show(
                 ui,
                 &PanelState {
+                    safe: None,
                     layers: entries.clone(),
                     vessel: populated_vessel(),
                     currents: populated_currents(),
@@ -3174,6 +3218,7 @@ mod font_tests {
                 ui_state.show(
                     ui,
                     &PanelState {
+                        safe: None,
                         draft: state,
                         wind: populated_wind(),
                         status: "status".to_owned(),
@@ -3225,6 +3270,7 @@ mod font_tests {
                 ui_state.show(
                     ui,
                     &PanelState {
+                        safe: None,
                         wind: wind.clone(),
                         status: "status".to_owned(),
                         ..PanelState::default()

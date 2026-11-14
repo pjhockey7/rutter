@@ -643,6 +643,9 @@ pub struct Renderer {
     overlay_fill_count: u32,
     /// Reference point the overlay anchors are measured from.
     overlay_origin: chart::WorldXY,
+    /// The part of the surface the chart may use, in surface pixels, or
+    /// `None` for all of it. See [`Renderer::set_letterbox`].
+    letterbox: Option<(u32, u32, u32, u32)>,
     bind_layout: wgpu::BindGroupLayout,
     /// egui's wgpu backend, which owns its own pipelines and font atlas and
     /// draws into the chart's render pass.
@@ -1281,6 +1284,8 @@ impl Renderer {
         );
 
         Ok(Self {
+            // A window fills itself; only a phone has anything to avoid.
+            letterbox: None,
             surface,
             device,
             queue,
@@ -1333,6 +1338,21 @@ impl Renderer {
     /// A zero in either dimension means the window is minimised, or — on
     /// Android — that the activity is going away. Reconfiguring to zero is a
     /// validation error, so it is ignored.
+    /// Confine the chart to part of the surface.
+    ///
+    /// `None` fills it, which is what a desktop window wants. A phone
+    /// passes the area the system has *not* claimed — see
+    /// `platform/android/src/insets.rs` — so the chart stops short of a
+    /// camera cutout and a gesture bar rather than being drawn under
+    /// them.
+    ///
+    /// Only the chart is confined. The interface is drawn afterwards with
+    /// the viewport restored, because it works in surface pixels and
+    /// paints the margins itself.
+    pub fn set_letterbox(&mut self, area: Option<(u32, u32, u32, u32)>) {
+        self.letterbox = area.filter(|&(_, _, w, h)| w > 0 && h > 0);
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -1470,6 +1490,14 @@ impl Renderer {
                 multiview_mask: None,
             });
 
+            // Everything from here to the interface is drawn into the
+            // part of the surface the system has left us. The clear
+            // above still covers the whole attachment, so the margins
+            // come out sea-coloured; the panel paints them over.
+            if let Some((x, y, w, h)) = self.letterbox {
+                pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+            }
+
             // Imagery first of all: a photograph is the ground everything
             // else is drawn on.
             if !self.imagery_tiles.is_empty() {
@@ -1536,7 +1564,20 @@ impl Renderer {
                 pass.draw(0..self.overlay_count, 0..1);
             }
 
-            // Interface last, over everything.
+            // Interface last, over everything — and over the whole
+            // surface, not the letterbox. egui's vertices and scissor
+            // rects are in surface pixels, so a viewport still set to the
+            // safe area would shift and squash the entire panel.
+            if self.letterbox.is_some() {
+                pass.set_viewport(
+                    0.0,
+                    0.0,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                    0.0,
+                    1.0,
+                );
+            }
             if let (Some(gui), Some(descriptor)) = (&gui, &egui_prepared) {
                 self.egui
                     .render(&mut pass.forget_lifetime(), gui.primitives, descriptor);

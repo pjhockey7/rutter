@@ -2127,6 +2127,10 @@ impl App {
     /// Gather what the panel needs. See [`PanelState`].
     pub fn panel_state(&self, renderer: &Renderer, pixels_per_point: f32) -> PanelState {
         PanelState {
+            // A platform fact, like `Sources`: the app has no idea
+            // whether it is behind a camera cutout. The shim that does
+            // fills this in after the call.
+            safe: None,
             layers: self.layer_entries.clone(),
             vessel: self.vessel_state(),
             imagery: ImageryState {

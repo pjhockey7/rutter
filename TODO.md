@@ -290,7 +290,7 @@ trusted.
       settings persistence, 1 Hz GPS, the foreground service across its
       whole lifecycle, `ToneGenerator` opening on the alarm stream.
 
-      Six bugs, every one of them hardware-only:
+      Seven bugs, every one of them hardware-only:
 
       1. **`requestPermissions` → `NoSuchMethodError`.** `ndk_context`
          holds the **`Application`**, not the `Activity`. Nearly every
@@ -326,6 +326,21 @@ trusted.
          finger holds for 50–150 ms, and a redraw triggered by anything
          else (a GPS fix) would rescue it — but it made taps land about
          one time in five instead of every time.
+
+      7. **Edge to edge, whether we liked it or not.** Android 15 forces
+         it on anything targeting API 35+: the window is the whole
+         display, and the top row of buttons came out under the camera
+         cutout with the leftmost clipped by the corner radius. There is
+         an opt-out, `windowOptOutEdgeToEdgeEnforcement`, deliberately
+         not taken — it stops working at targetSdk 36, and it would hand
+         the top of the chart to a status bar on every device rather
+         than only where something is in the way. The insets are read
+         instead (`platform/android/src/insets.rs`), the chart is
+         letterboxed into what is left, and the panel paints the margins
+         black. On this phone that is 152 px of cutout above and 63 px
+         of gesture bar below; nothing is hard-coded, because those four
+         numbers differ per device, per navigation mode and per
+         rotation.
 
       Two findings that were not ours and are worth remembering: Android
       hands a backgrounded app *no* location at all, which is the whole

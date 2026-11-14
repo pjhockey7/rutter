@@ -45,6 +45,13 @@ pub fn remember_activity(activity: *mut std::ffi::c_void) {
     ACTIVITY.store(activity, Ordering::Release);
 }
 
+/// The `Activity`, if `android_main` has run. `None` is a real state
+/// off-device and during very early startup, not a fault.
+pub fn activity() -> Option<*mut std::ffi::c_void> {
+    let raw = ACTIVITY.load(Ordering::Acquire);
+    (!raw.is_null()).then_some(raw)
+}
+
 /// An error with the Java call that produced it.
 #[derive(Debug)]
 pub struct Trouble(pub String);

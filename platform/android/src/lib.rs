@@ -54,6 +54,33 @@ mod gps;
 
 // Keeping the process alive while an alarm is armed. The only reason
 // there is any Java in this app at all.
+// What the system has already taken of the screen — cutout, status
+// bar, gesture bar. See the note there on edge-to-edge enforcement.
+#[cfg(target_os = "android")]
+mod insets;
+
+/// Off-Android there is no window manager to ask, and `Platform` still
+/// has to compile — see the note at the top of this file.
+#[cfg(not(target_os = "android"))]
+mod insets {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Insets {
+        pub left: u32,
+        pub top: u32,
+        pub right: u32,
+        pub bottom: u32,
+    }
+
+    impl Insets {
+        pub fn any(self) -> bool {
+            false
+        }
+    }
+
+    pub fn current() -> Option<Insets> {
+        None
+    }
+}
 #[cfg(target_os = "android")]
 mod jvm;
 #[cfg(target_os = "android")]
@@ -105,6 +132,7 @@ fn android_main(app: AndroidApp) {
         // No draft: the under-keel check is switched on from the panel, the
         // same as on a desktop with no `--draft`.
         app: App::new(sources, None),
+        inset_tries: INSET_TRIES,
         ..Platform::default()
     };
     if let Err(e) = event_loop.run_app(&mut platform) {
@@ -354,6 +382,10 @@ struct Pinch {
     centre: (f64, f64),
 }
 
+/// Frames to keep asking for the insets before settling for none.
+/// Roughly two seconds at sixty frames a second.
+const INSET_TRIES: u8 = 120;
+
 #[derive(Default)]
 struct Platform {
     window: Option<Arc<Window>>,
@@ -371,6 +403,24 @@ struct Platform {
     /// Whether the panel has had the current gesture. egui gets the first
     /// refusal on a touch, the same as it gets on a Linux click.
     gesture_consumed: bool,
+
+    /// The surface, in pixels, as winit last reported it.
+    ///
+    /// Kept because the safe area is derived from it and from the system
+    /// insets, and the two arrive separately.
+    surface: (u32, u32),
+    /// What the system has claimed of the edges. See `insets.rs`.
+    insets: insets::Insets,
+    /// Frames still to be spent looking for the insets.
+    ///
+    /// `getRootWindowInsets` returns null until the decor view is
+    /// attached, which is routinely still true at the first `Resized` —
+    /// and nothing guarantees a second one. Without a retry the app would
+    /// settle on "no insets" and draw under the cutout for the rest of
+    /// the run. Bounded because a device with genuinely nothing claimed
+    /// is a real answer, and asking forever would be a handful of JNI
+    /// calls every frame to learn zero again.
+    inset_tries: u8,
 }
 
 /// egui's context, without winit's translator.
@@ -391,6 +441,34 @@ struct EguiState {
 }
 
 impl Platform {
+    /// The part of the surface the system has not claimed, in pixels.
+    ///
+    /// Clamped so that a bad or enormous inset cannot produce a zero or
+    /// negative viewport, which wgpu rejects outright.
+    fn safe_area(&self) -> (u32, u32, u32, u32) {
+        let (width, height) = self.surface;
+        let x = self.insets.left.min(width.saturating_sub(1));
+        let y = self.insets.top.min(height.saturating_sub(1));
+        let w = width.saturating_sub(x + self.insets.right).max(1);
+        let h = height.saturating_sub(y + self.insets.bottom).max(1);
+        (x, y, w, h)
+    }
+
+    /// Point the chart and the view at the safe area.
+    ///
+    /// The view is sized to the safe area rather than the surface, so
+    /// that centring on the boat puts it in the middle of what can
+    /// actually be seen rather than in the middle of the glass — where,
+    /// with a 152-pixel cutout above and a gesture bar below, it would
+    /// sit visibly low.
+    fn apply_safe_area(&mut self) {
+        let (x, y, w, h) = self.safe_area();
+        self.app.resize(w, h);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_letterbox(self.insets.any().then_some((x, y, w, h)));
+        }
+    }
+
     fn redraw_soon(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -536,34 +614,62 @@ impl Platform {
             return;
         }
 
+        // Into the chart's own pixels: a touch is reported against the
+        // surface, and the chart now starts below the cutout.
+        let (left, top, _, _) = self.safe_area();
         self.app.zoom_about(
             change / PINCH_PIXELS_PER_STEP,
-            previous.centre.0,
-            previous.centre.1,
+            previous.centre.0 - f64::from(left),
+            previous.centre.1 - f64::from(top),
         );
         self.pinch = Some(current);
     }
 
     fn redraw(&mut self) {
+        if self.inset_tries > 0 && !self.insets.any() {
+            self.inset_tries -= 1;
+            if let Some(got) = insets::current().filter(|got| got.any()) {
+                log::info!("insets: {got:?}");
+                self.insets = got;
+                self.apply_safe_area();
+            }
+        }
+
         if let Some(renderer) = self.renderer.as_mut() {
             self.app.refresh(renderer);
         }
 
         let pixels_per_point = self.egui.as_ref().map_or(1.0, |e| e.pixels_per_point);
-        let state = self
-            .renderer
-            .as_ref()
-            .map(|r| self.app.panel_state(r, pixels_per_point));
+        let state = self.renderer.as_ref().map(|r| {
+            let mut state = self.app.panel_state(r, pixels_per_point);
+            // Where the panel may lay itself out. The app cannot know
+            // this — it is a fact about the glass, not about charts.
+            state.safe = self.insets.any().then(|| {
+                let (x, y, w, h) = self.safe_area();
+                let scale = pixels_per_point.max(f32::EPSILON);
+                egui::Rect::from_min_size(
+                    egui::pos2(x as f32 / scale, y as f32 / scale),
+                    egui::vec2(w as f32 / scale, h as f32 / scale),
+                )
+            });
+            state
+        });
 
         let mut actions = Vec::new();
         let gui_output = match (self.egui.as_mut(), state.as_ref()) {
             (Some(egui), Some(state)) => {
                 let input = egui::RawInput {
+                    // The whole surface, not the safe area. egui's
+                    // vertices have to land in surface pixels so that it
+                    // can paint the margins black; where it may put
+                    // *controls* is `PanelState::safe`, which it applies
+                    // itself. Not `view.width_px` either — that is the
+                    // chart's size now, which is the safe area.
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
                         egui::vec2(
-                            self.app.view.width_px as f32 / egui.pixels_per_point,
-                            self.app.view.height_px as f32 / egui.pixels_per_point,
+                            self.surface.0 as f32 / egui.pixels_per_point,
+                            self.surface.1 as f32 / egui.pixels_per_point,
                         ),
                     )),
                     events: std::mem::take(&mut egui.events),
@@ -705,10 +811,28 @@ impl ApplicationHandler for Platform {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::Resized(size) => {
-                self.app.resize(size.width, size.height);
+                self.surface = (size.width, size.height);
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(size.width, size.height);
                 }
+                // Asked for again on every resize rather than cached at
+                // startup: a cutout is a different size on every phone,
+                // the gesture bar differs between navigation modes, and
+                // all four edges change on rotation. It is also null
+                // until the view is attached, so the first query during
+                // startup commonly fails and this is where it succeeds.
+                // A rotation changes all four, so a known-good answer
+                // is re-asked for here too — and the retry budget is
+                // reset, since a resize is exactly when the old answer
+                // stops being true.
+                self.inset_tries = INSET_TRIES;
+                if let Some(got) = insets::current() {
+                    if got != self.insets {
+                        log::info!("insets: {got:?}");
+                        self.insets = got;
+                    }
+                }
+                self.apply_safe_area();
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {

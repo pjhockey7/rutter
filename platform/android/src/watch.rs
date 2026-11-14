@@ -180,7 +180,7 @@ pub fn end() {
 }
 
 /// `Build.VERSION.SDK_INT`.
-fn android_api() -> i32 {
+pub fn android_api() -> i32 {
     let context = ndk_context::android_context();
     if context.vm().is_null() {
         return 0;
