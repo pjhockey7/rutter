@@ -154,19 +154,13 @@ public final class WatchService extends Service {
                 .build();
     }
 
-    /** Start the watch service from the native side. */
-    public static void begin(Context context, String text) {
-        Intent intent = new Intent(context, WatchService.class);
-        intent.putExtra(EXTRA_TEXT, text);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent);
-        } else {
-            context.startService(intent);
-        }
-    }
-
-    /** Stop it. */
-    public static void end(Context context) {
-        context.stopService(new Intent(context, WatchService.class));
-    }
+    // There are deliberately no static begin/end helpers here.
+    //
+    // They existed once and were called over JNI, which failed on
+    // hardware: `FindClass` from a natively-attached thread resolves
+    // against the system class loader and cannot see this APK's classes
+    // at all. The native side now builds the Intent itself from a
+    // `ComponentName`, so nothing has to resolve this class by name —
+    // the system finds it from the manifest, which is the supported
+    // route. See `platform/android/src/watch.rs`.
 }

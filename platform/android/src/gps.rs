@@ -78,12 +78,28 @@ const UPDATE_INTERVAL_MS: i64 = 1_000;
 /// the marker while the boat moved.
 const UPDATE_DISTANCE_M: f32 = 0.0;
 
-/// `PendingIntent.FLAG_IMMUTABLE | FLAG_UPDATE_CURRENT`.
+/// `PendingIntent.FLAG_MUTABLE | FLAG_UPDATE_CURRENT`.
 ///
-/// Immutable is required from API 31 for a `PendingIntent` that is not
-/// explicitly mutable, and update-current keeps one request rather than
-/// stacking a new one on every reconnect.
-const PENDING_INTENT_FLAGS: i32 = (1 << 26) | (1 << 27);
+/// **Mutable**, which looks like the wrong answer and is not. From API 31
+/// a `PendingIntent` must declare one or the other, and immutable is the
+/// right default nearly everywhere — but `LocationManager` writes the
+/// fix into this intent's extras before broadcasting it, so an immutable
+/// one is refused outright:
+///
+/// ```text
+/// IllegalArgumentException: pending intent must be mutable
+///   at android.location.LocationManager.requestLocationUpdates
+/// ```
+///
+/// which is what the first run on hardware produced. The usual objection
+/// to a mutable `PendingIntent` — that another app could fill in the
+/// blanks and have it sent as us — does not apply: the intent names an
+/// explicit action of ours, it is never handed to anything but the
+/// system, and nothing is registered to receive the broadcast anyway.
+///
+/// Update-current keeps one request rather than stacking a new one on
+/// every reconnect.
+const PENDING_INTENT_FLAGS: i32 = (1 << 25) | (1 << 27);
 
 /// The permissions a location needs.
 ///
@@ -104,6 +120,23 @@ const PERMISSIONS: [&str; 2] = [
 /// few hundred metres is useless for pilotage but still tells you which
 /// harbour you are in while the GPS gets a fix.
 const PROVIDERS: [&str; 3] = ["gps", "fused", "network"];
+
+/// The providers actually asked for updates.
+///
+/// Both, and the reason is the whole mechanism. Nothing receives these
+/// broadcasts — the request exists to switch a provider on so that
+/// `getLastKnownLocation` has something current to hand back. A provider
+/// nobody has asked for keeps a cache that is as old as whatever last
+/// used it, which on a quiet phone is hours.
+///
+/// So asking only for `gps`, as this did at first, meant that indoors —
+/// or under a marina roof, or anywhere the GNSS has not got a satellite
+/// yet — *nothing* refreshed and the boat never moved off its first fix.
+/// Observed on hardware: one fix on launch and then silence.
+///
+/// `fused` is the low-power provider, so this is not the battery cost it
+/// looks like; it is cheaper than `gps` and answers indoors.
+const REQUESTED: [&str; 2] = ["gps", "fused"];
 
 /// Open the device's GPS.
 ///
@@ -149,11 +182,23 @@ pub fn open() -> Result<Box<dyn FixSource>, String> {
             // or empty: Android does not keep a GPS powered for an app
             // that has not asked for updates. See the note at the top —
             // nothing receives these, the request itself is the point.
-            if let Err(e) = request_updates(env, &activity, &manager) {
-                // Not fatal. `getLastKnownLocation` may still answer from
-                // another app's request, and a position that works badly
-                // beats a chart with no boat on it.
-                log::warn!("GPS: could not request updates ({e}); falling back to the cache");
+            // Per provider, and a failure on one is not a failure on
+            // the others: `fused` does not exist below API 31, and a
+            // device may not have a GNSS at all.
+            let mut asked = 0;
+            for (code, provider) in REQUESTED.iter().enumerate() {
+                match request_updates(env, &activity, &manager, provider, code as i32) {
+                    Ok(()) => asked += 1,
+                    // Not fatal. `getLastKnownLocation` may still answer
+                    // from another app's request, and a position that
+                    // works badly beats a chart with no boat on it.
+                    Err(e) => log::warn!("GPS: no updates from {provider} ({e})"),
+                }
+            }
+            if asked == 0 {
+                log::warn!(
+                    "GPS: no provider accepted an update request; falling back to the cache"
+                );
             }
 
             let manager = at(
@@ -198,10 +243,17 @@ fn request_updates(
     env: &mut Env<'_>,
     activity: &JObject<'_>,
     manager: &JObject<'_>,
+    provider: &str,
+    code: i32,
 ) -> Result<(), Trouble> {
+    // A distinct action and request code per provider, so the two
+    // `PendingIntent`s are distinct. A `PendingIntent` is identified by
+    // its action and request code among other things, and reusing one
+    // would have the second request replace the first rather than sit
+    // beside it.
     let action = at(
         "new_string(action)",
-        env.new_string("com.pjhockey7.rutter.LOCATION"),
+        env.new_string(format!("com.pjhockey7.rutter.LOCATION.{provider}")),
     )?;
     let intent = at(
         "new Intent(String)",
@@ -211,6 +263,34 @@ fn request_updates(
             &[JValue::Object(&action)],
         ),
     )?;
+    // Explicit, by naming our own package. From API 34 a *mutable*
+    // `PendingIntent` wrapping an *implicit* intent — one with neither a
+    // component nor a package — is refused outright:
+    //
+    // ```text
+    // Targeting U+ (version 34 and above) disallows creating or
+    // retrieving a PendingIntent with FLAG_MUTABLE, an implicit Intent
+    // within [...] for security reasons.
+    // ```
+    //
+    // and `LocationManager` insists on mutable, so the intent is the end
+    // that has to give. Naming the package is enough to make it explicit
+    // and costs nothing: nothing is registered to receive the broadcast
+    // in the first place.
+    let package = at(
+        "new_string(package)",
+        env.new_string("com.pjhockey7.rutter"),
+    )?;
+    at(
+        "Intent.setPackage",
+        env.call_method(
+            &intent,
+            jni_str!("setPackage"),
+            jni_sig!((name: java.lang.String) -> android.content.Intent),
+            &[JValue::Object(&package)],
+        ),
+    )?;
+
     let pending = at(
         "PendingIntent.getBroadcast",
         env.call_static_method(
@@ -223,7 +303,7 @@ fn request_updates(
             ),
             &[
                 JValue::Object(activity),
-                JValue::Int(0),
+                JValue::Int(code),
                 JValue::Object(&intent),
                 JValue::Int(PENDING_INTENT_FLAGS),
             ],
@@ -231,10 +311,7 @@ fn request_updates(
         .and_then(jni::JValueOwned::l),
     )?;
 
-    // Only the real GPS is asked for updates. Asking `fused` as well would
-    // double the battery cost for a provider that is only wanted as a
-    // fallback while the GPS is still searching.
-    let provider = at("new_string(gps)", env.new_string("gps"))?;
+    let provider = at("new_string(provider)", env.new_string(provider))?;
     at(
         "requestLocationUpdates",
         env.call_method(
@@ -319,6 +396,22 @@ impl FixSource for Gps {
             // reporting it again would make a frozen fix look live.
             Some(fix) if fix.taken <= last_taken => Ok(None),
             Some(fix) => {
+                // The first one at info, the rest at debug. "Did it ever
+                // acquire?" is the question someone asks when the boat is
+                // not on the chart, and it deserves to be answerable from
+                // a log without turning debug on.
+                if self.last_taken == 0 {
+                    log::info!(
+                        "GPS: first fix {:.5}, {:.5}{}",
+                        fix.at.lat,
+                        fix.at.lon,
+                        fix.accuracy_m
+                            .map(|m| format!(", ±{m:.0} m"))
+                            .unwrap_or_default()
+                    );
+                } else {
+                    log::debug!("GPS: {:.5}, {:.5}", fix.at.lat, fix.at.lon);
+                }
                 self.last_taken = fix.taken;
                 Ok(Some(fix))
             }

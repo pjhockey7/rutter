@@ -82,6 +82,13 @@ fn android_main(app: AndroidApp) {
 
     log::info!("rutter starting");
 
+    // Before anything that might want it. `ndk_context` holds the
+    // `Application`, which is a `Context` and so answers nearly every
+    // call this app makes — but `requestPermissions` is declared on
+    // `Activity` alone, and without this it fails with
+    // `NoSuchMethodError`. See `jvm.rs`.
+    jvm::remember_activity(app.activity_as_ptr());
+
     // The assets must come off the store before the event loop takes the
     // AndroidApp.
     let sources = open_bundled_sources(&app);
@@ -454,6 +461,21 @@ impl Platform {
                     self.gesture_consumed = self.offer_to_panel(touch);
                 }
                 self.pinch = self.start_pinch();
+                // The press needs a frame of its own.
+                //
+                // egui decides a widget was clicked by matching the
+                // release against a *potential click* recorded when the
+                // press was last laid out — which is to say, in an
+                // earlier pass. Deliver press and release in the same
+                // pass and there is no potential click yet to match, so
+                // the widget takes focus and does nothing else.
+                //
+                // On hardware that read as a dead interface: every
+                // button needed a second, unrelated tap before the first
+                // one took effect, and a tap on its own looked ignored.
+                // A mouse never showed it because a desktop redraws on
+                // the button-down as well.
+                self.redraw_soon();
             }
 
             TouchPhase::Moved => {

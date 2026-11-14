@@ -7,9 +7,43 @@
 //! The permission dance ended up here for the same reason: the GPS wants
 //! location and the watch service wants notifications, and the shape of
 //! asking is identical.
+//!
+//! ## Application is not Activity
+//!
+//! `ndk_context` holds the **`Application`**, not the `Activity` —
+//! `android-activity` registers `get_application(..)` at startup. That is
+//! fine for nearly everything, because the methods wanted here
+//! (`getSystemService`, `checkSelfPermission`, `startForegroundService`,
+//! `stopService`) are all declared on `Context`, which `Application` is.
+//!
+//! `requestPermissions` is the exception: it is declared on `Activity`
+//! and nowhere else, so calling it on the `Application` fails with
+//! `NoSuchMethodError`, which is exactly what the first run on hardware
+//! produced. The `Activity` is reachable through
+//! `AndroidApp::activity_as_ptr`, so [`remember_activity`] stashes it at
+//! startup and [`ask_for`] uses it.
+
+// JNI is unsafe by nature, and this crate is the board support — which
+// is where the workspace's rule says unsafe belongs.
+#![allow(unsafe_code)]
+
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use jni::objects::{JObject, JObjectArray, JString, JValue};
 use jni::{jni_sig, jni_str, Env};
+
+/// The `Activity`, as a JNI global reference.
+///
+/// A raw pointer in a static because the one place it can be obtained —
+/// `android_main`'s `AndroidApp` — is nowhere near the code that needs
+/// it. `AndroidApp` keeps the global reference alive for as long as it
+/// exists, which is the life of the process.
+static ACTIVITY: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Stash the `Activity` for later. Called once from `android_main`.
+pub fn remember_activity(activity: *mut std::ffi::c_void) {
+    ACTIVITY.store(activity, Ordering::Release);
+}
 
 /// An error with the Java call that produced it.
 #[derive(Debug)]
@@ -50,18 +84,14 @@ const PERMISSION_GRANTED: i32 = 0;
 /// `ACCESS_FINE_LOCATION` that does not also ask for
 /// `ACCESS_COARSE_LOCATION` is *ignored* — no dialogue appears and
 /// nothing is granted, which looks exactly like a user who said no.
-pub fn ask_for(
-    env: &mut Env<'_>,
-    activity: &JObject<'_>,
-    wanted: &[&str],
-) -> Result<bool, Trouble> {
+pub fn ask_for(env: &mut Env<'_>, context: &JObject<'_>, wanted: &[&str]) -> Result<bool, Trouble> {
     let mut missing = Vec::new();
     for permission in wanted {
         let name = at("new_string(permission)", env.new_string(permission))?;
         let state = at(
             "checkSelfPermission",
             env.call_method(
-                activity,
+                context,
                 jni_str!("checkSelfPermission"),
                 jni_sig!((name: java.lang.String) -> jint),
                 &[JValue::Object(&name)],
@@ -76,7 +106,21 @@ pub fn ask_for(
     if missing.is_empty() {
         return Ok(true);
     }
+
+    // Only an `Activity` can raise the dialogue. Without one there is
+    // nothing to do but say so — and say it once per call rather than
+    // silently, because "the GPS never produced a fix" is a much harder
+    // thing to diagnose than this line.
+    let activity = ACTIVITY.load(Ordering::Acquire);
+    if activity.is_null() {
+        log::warn!("cannot ask for {missing:?}: no Activity");
+        return Ok(false);
+    }
     log::info!("asking for {missing:?}");
+
+    // SAFETY: a JNI global reference stored by `remember_activity` from
+    // `AndroidApp`, which keeps it alive for the life of the process.
+    let activity = unsafe { JObject::from_raw(env, activity.cast()) };
 
     let blank = at("new_string(blank)", env.new_string(""))?;
     let array = at(
@@ -94,7 +138,7 @@ pub fn ask_for(
     at(
         "requestPermissions",
         env.call_method(
-            activity,
+            &activity,
             jni_str!("requestPermissions"),
             jni_sig!((permissions: java.lang.String[], code: jint) -> void),
             &[JValue::Object(&array), JValue::Int(1)],

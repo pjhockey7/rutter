@@ -139,7 +139,10 @@ behind it.
       read from the framework by name rather than written down as
       numbers, since this app never compiles against `android.jar`.
 
-      Untested on hardware, like everything else Android here.
+      Opens on hardware — `siren: ToneGenerator open on stream 4`, which
+      also confirms the constants are being read from the framework
+      correctly rather than guessed. Whether it is *audible* is still
+      untested: nothing has yet made it sound.
 
 - [ ] **Feet and fathoms.** Everything is metres. US charts print feet and
       the draft is in feet in your head. Depth, height and clearance all need
@@ -277,10 +280,69 @@ boat cannot fetch its own charts.
 Nothing here changes what the app can do; all of it changes whether it can be
 trusted.
 
-- [ ] **Run it on the phone.** The APK has never been installed. There is a
-      lot of untested code aimed at a device nothing has ever run on — the
-      whole JNI location path above all — and every feature added before that
-      first run is one more thing to debug at once. **Do this first.**
+- [x] **Run it on the phone.** Done: Pixel 10a, Android 17 (API 37), 13
+      November 2026. It launched first try and drew San Diego on a Mali
+      GPU. Everything else found that day was in the JNI, and *none* of
+      it was reachable from a host test — which is the argument for
+      having done this before building more on top of it.
+
+      Confirmed working: charts, tides, weather, the staleness display,
+      settings persistence, 1 Hz GPS, the foreground service across its
+      whole lifecycle, `ToneGenerator` opening on the alarm stream.
+
+      Six bugs, every one of them hardware-only:
+
+      1. **`requestPermissions` → `NoSuchMethodError`.** `ndk_context`
+         holds the **`Application`**, not the `Activity`. Nearly every
+         call this app makes is declared on `Context`, so everything else
+         worked and this one method — declared on `Activity` alone —
+         did not. The `Activity` now comes from
+         `AndroidApp::activity_as_ptr` and is stashed in `jvm.rs`.
+      2. **`pending intent must be mutable`.** `LocationManager` writes
+         the fix into the intent's extras, so `FLAG_IMMUTABLE` is
+         refused.
+      3. **…and API 34+ refuses `FLAG_MUTABLE` on an *implicit* intent.**
+         A genuine catch-22; the way out is `setPackage`, which makes the
+         intent explicit.
+      4. **Only `gps` was asked for updates.** The code polled
+         `["gps", "fused", "network"]` for cached fixes but never *asked*
+         for `fused`, so nothing refreshed it — the "fallback while the
+         GPS is still searching" did not exist. Indoors that was one fix
+         on launch and then silence. Both are requested now, and `fused`
+         is the cheaper of the two, so the battery argument in the old
+         comment was backwards as well.
+      5. **`FindClass` cannot see this APK's own classes.** It resolves
+         against the class loader of the native method on the stack, and
+         a natively-attached thread has no Java frame, so it falls back
+         to the system loader. `WatchService` was "not found" while
+         sitting in `classes.dex`. Fixed by not needing it: the intent is
+         built from a `ComponentName`, which names the service by string
+         and lets the system resolve it from the manifest.
+      6. **A touch delivered press and release in one egui pass.** egui
+         matches a release against a *potential click* recorded in an
+         earlier pass, so a tap whose press and release share a pass sets
+         focus and nothing more. `TouchPhase::Started` now requests a
+         redraw. Not the dead interface it first looked like — a real
+         finger holds for 50–150 ms, and a redraw triggered by anything
+         else (a GPS fix) would rescue it — but it made taps land about
+         one time in five instead of every time.
+
+      Two findings that were not ours and are worth remembering: Android
+      hands a backgrounded app *no* location at all, which is the whole
+      case for the service; and with Location switched off device-wide
+      every provider reads `ProviderRequest[OFF]`, including Google's,
+      which looks exactly like a broken app.
+
+- [ ] **Anchor drag on hardware.** The service, the watch and the siren
+      are each verified separately; the chain from *a boat that actually
+      moved* through to a noise is not. Arm a 10 m swing and walk down
+      the street, or feed a mock location. Until then "the alarm sounds"
+      rests on the host tests plus `ToneGenerator` opening.
+
+- [ ] **A real overnight.** Screen genuinely off, several hours, battery
+      measured. What was shown instead was rutter backgrounded behind
+      another app and still taking fixes at 1 Hz — the same process-state
+      transition, but minutes rather than hours.
 
 - [ ] **Imagery decode off the main thread.** JPEG decoding still happens in
       the frame. The chart worker already shows the pattern to copy.
