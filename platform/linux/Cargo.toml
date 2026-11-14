@@ -12,6 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 rutter-app.workspace = true
+# The system's time-zone rules, for showing local time. `localtime_r` is
+# the only portable way to the host's zone database, and the unsafe that
+# needs belongs in a platform crate — see src/zone.rs.
+libc = "0.2"
+
 # The HTTPS tile fetcher. Linked here rather than in rutter-app so the TLS
 # stack stays a platform's choice — see rutter_app::download.
 rutter-fetch.workspace = true

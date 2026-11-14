@@ -35,6 +35,7 @@ pub mod route;
 pub mod tide;
 pub mod track;
 pub mod triangulate;
+pub mod units;
 pub mod weather;
 
 pub use geo::LatLon;

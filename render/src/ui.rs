@@ -70,6 +70,10 @@ pub enum Action {
     UseDeviceGps,
     /// Show or hide the tidal currents.
     SetCurrents(bool),
+    /// Show lengths in this unit.
+    SetUnits(rutter_core::units::Length),
+    /// Show times locally rather than in UTC.
+    SetLocalTime(bool),
     /// Show or hide the route.
     SetRoute(bool),
     /// Show or hide the track.
@@ -535,6 +539,8 @@ pub struct PanelState {
     pub wind: WindState,
     /// The top strip's text: position, zoom, scale.
     pub status: String,
+    /// How things are shown: units and the clock.
+    pub display: DisplayState,
     /// The part of the window the system has not claimed, in points, or
     /// `None` for all of it.
     ///
@@ -544,6 +550,22 @@ pub struct PanelState {
     /// radius. Everything is laid out inside this, and what is left over
     /// is painted black — see [`Panel::show`].
     pub safe: Option<egui::Rect>,
+}
+
+/// What the Settings tab shows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DisplayState {
+    /// What lengths are shown in.
+    pub units: rutter_core::units::Length,
+    /// Whether times are shown locally.
+    pub local_time: bool,
+    /// Whether the platform can answer what local time is at all. False
+    /// disables the choice and says why, rather than offering a switch
+    /// that silently does nothing.
+    pub zone_available: bool,
+    /// What the clock currently is — `"Z"`, `"PST"`. Shown so the choice
+    /// is legible before it is made.
+    pub clock: String,
 }
 
 /// Which group of controls the panel is showing.
@@ -566,17 +588,20 @@ pub enum Tab {
     Water,
     /// Wind and air temperature.
     Weather,
+    /// How things are shown: units, and which clock.
+    Settings,
 }
 
 impl Tab {
     /// In the order they appear, which is roughly how often they are
     /// wanted: the boat first, the tools last.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Boat,
         Self::Route,
         Self::Chart,
         Self::Water,
         Self::Weather,
+        Self::Settings,
     ];
 
     /// Plain words, not icon glyphs. egui's default font covers Latin text
@@ -589,6 +614,7 @@ impl Tab {
             Self::Chart => "Chart",
             Self::Water => "Water",
             Self::Weather => "Weather",
+            Self::Settings => "Settings",
         }
     }
 
@@ -599,6 +625,7 @@ impl Tab {
             Self::Chart => "Aerial imagery and the chart's own layers",
             Self::Water => "Tide heights and tidal currents",
             Self::Weather => "Wind and air temperature",
+            Self::Settings => "Units, and whether times are UTC or local",
         }
     }
 }
@@ -707,6 +734,7 @@ impl Ui {
             draft,
             wind,
             status,
+            display,
             safe,
         } = state;
         let mut actions = Vec::new();
@@ -851,9 +879,9 @@ impl Ui {
                     Tab::Boat => {
                         actions.extend(self.vessel_section(ui, vessel));
                         ui.separator();
-                        actions.extend(Self::alarm_section(ui, alarms));
+                        actions.extend(Self::alarm_section(ui, alarms, display.units));
                         ui.separator();
-                        actions.extend(Self::draft_section(ui, draft));
+                        actions.extend(Self::draft_section(ui, draft, display.units));
                     }
                     Tab::Route => {
                         actions.extend(Self::route_section(ui, route));
@@ -866,7 +894,7 @@ impl Ui {
                         actions.extend(self.layers_section(ui, layers));
                     }
                     Tab::Water => {
-                        actions.extend(Self::tide_section(ui, tides));
+                        actions.extend(Self::tide_section(ui, tides, display.units));
                         ui.separator();
                         actions.extend(Self::current_section(ui, currents));
                     }
@@ -874,6 +902,9 @@ impl Ui {
                         actions.extend(Self::wind_section(ui, wind));
                         ui.separator();
                         actions.extend(Self::temperature_section(ui, temperature));
+                    }
+                    Tab::Settings => {
+                        actions.extend(Self::display_section(ui, display));
                     }
                 }
             });
@@ -1047,7 +1078,11 @@ impl Ui {
     }
 
     /// The anchor watch and the depth watch.
-    fn alarm_section(ui: &mut egui::Ui, alarms: &AlarmState) -> Vec<Action> {
+    fn alarm_section(
+        ui: &mut egui::Ui,
+        alarms: &AlarmState,
+        units: rutter_core::units::Length,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
 
         ui.label(egui::RichText::new("Alarms").strong());
@@ -1069,7 +1104,9 @@ impl Ui {
 
         // ── Anchor ─────────────────────────────────────────────────────
         ui.add_space(4.0);
-        let mut radius = alarms.anchor_radius_m;
+        // Over the ground, so fathoms fall back to feet.
+        let across = units.horizontal();
+        let mut radius = across.from_metres(alarms.anchor_radius_m);
         ui.horizontal(|ui| {
             if alarms.anchored {
                 if ui
@@ -1082,7 +1119,7 @@ impl Ui {
             } else {
                 let set = ui.add_enabled(alarms.available, egui::Button::new("Drop anchor here"));
                 if set.clicked() {
-                    actions.push(Action::SetAnchor(radius));
+                    actions.push(Action::SetAnchor(across.to_metres(radius)));
                 }
                 if !alarms.available {
                     set.on_hover_text("No GPS, so there is nothing to watch with.");
@@ -1093,9 +1130,12 @@ impl Ui {
 
         if ui
             .add(
-                egui::Slider::new(&mut radius, 10.0..=200.0)
-                    .suffix(" m")
-                    .show_value(true),
+                egui::Slider::new(
+                    &mut radius,
+                    across.from_metres(10.0)..=across.from_metres(200.0),
+                )
+                .suffix(format!(" {}", across.suffix()))
+                .show_value(true),
             )
             .on_hover_text(
                 "Scope plus a boat length plus slack — not the scope \
@@ -1106,21 +1146,23 @@ impl Ui {
         {
             // Re-setting with a new radius keeps the anchor where it is.
             if alarms.anchored {
-                actions.push(Action::SetAnchor(radius));
+                actions.push(Action::SetAnchor(across.to_metres(radius)));
             }
         }
 
         // ── Depth ──────────────────────────────────────────────────────
         ui.add_space(6.0);
         let mut watching_depth = alarms.shallow_m.is_some();
-        let mut limit = alarms.shallow_m.unwrap_or(3.0);
+        let mut limit = units.from_metres(alarms.shallow_m.unwrap_or(3.0));
         ui.horizontal(|ui| {
             let toggle = ui.add_enabled(
                 alarms.available,
                 egui::Checkbox::new(&mut watching_depth, "Shallow"),
             );
             if toggle.clicked() {
-                actions.push(Action::SetShallowAlarm(watching_depth.then_some(limit)));
+                actions.push(Action::SetShallowAlarm(
+                    watching_depth.then(|| units.to_metres(limit)),
+                ));
             }
             if !alarms.available {
                 toggle.on_hover_text("No sounder reading to watch.");
@@ -1129,8 +1171,8 @@ impl Ui {
         if watching_depth
             && ui
                 .add(
-                    egui::Slider::new(&mut limit, 0.5..=20.0)
-                        .suffix(" m")
+                    egui::Slider::new(&mut limit, units.from_metres(0.5)..=units.from_metres(20.0))
+                        .suffix(format!(" {}", units.suffix()))
                         .show_value(true),
                 )
                 .on_hover_text(
@@ -1139,7 +1181,7 @@ impl Ui {
                 )
                 .changed()
         {
-            actions.push(Action::SetShallowAlarm(Some(limit)));
+            actions.push(Action::SetShallowAlarm(Some(units.to_metres(limit))));
         }
 
         // ── What happens when the screen goes off ──────────────────────
@@ -1174,6 +1216,82 @@ impl Ui {
                  system may stop it once the screen is off.",
             );
         }
+
+        actions
+    }
+
+    /// How things are shown: units, and which clock.
+    ///
+    /// Its own tab rather than a corner of another one. These are the two
+    /// settings that change the meaning of every number on every other
+    /// tab, so burying them under Boat or Chart would make them look like
+    /// properties of the boat or the chart — which is exactly the
+    /// misreading that matters: a depth is not "3.1" and it is certainly
+    /// not "3.1" in whichever unit you last assumed.
+    fn display_section(ui: &mut egui::Ui, display: &DisplayState) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        ui.label(egui::RichText::new("Units").strong());
+        ui.label(
+            egui::RichText::new("Depths, heights and clearance.")
+                .weak()
+                .small(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for unit in rutter_core::units::Length::ALL {
+                if ui
+                    .selectable_label(display.units == unit, unit.label())
+                    .clicked()
+                {
+                    actions.push(Action::SetUnits(unit));
+                }
+            }
+        });
+        // Said plainly, because it is the one thing about this setting
+        // that would otherwise look like a bug.
+        if display.units == rutter_core::units::Length::Fathoms {
+            ui.label(
+                egui::RichText::new("Distances over the ground stay in feet.")
+                    .weak()
+                    .small(),
+            )
+            .on_hover_text(
+                "A swing radius or a GPS accuracy in fathoms reads as a \
+                 mistake even when the arithmetic is right.",
+            );
+        }
+        ui.label(
+            egui::RichText::new("Distances run and speeds stay nautical miles and knots.")
+                .weak()
+                .small(),
+        );
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Time").strong());
+
+        let mut local = display.local_time;
+        let toggle = ui.add_enabled(
+            display.zone_available,
+            egui::Checkbox::new(&mut local, "Local time"),
+        );
+        if toggle.clicked() {
+            actions.push(Action::SetLocalTime(local));
+        }
+        if display.zone_available {
+            toggle.on_hover_text(
+                "Tides, forecasts and almanacs are all published in UTC. \
+                 Local is easier to plan a morning against; UTC is what \
+                 the source data says.",
+            );
+        } else {
+            toggle.on_hover_text("This platform cannot say what the local zone is.");
+        }
+        ui.label(
+            egui::RichText::new(format!("Times shown as {}", display.clock))
+                .weak()
+                .small(),
+        );
 
         actions
     }
@@ -2110,7 +2228,11 @@ impl Ui {
     /// This is the control that turns the tide from a number into an answer.
     /// Everything above it describes the water; this asks whether the boat
     /// fits in it.
-    fn draft_section(ui: &mut egui::Ui, state: &DraftState) -> Vec<Action> {
+    fn draft_section(
+        ui: &mut egui::Ui,
+        state: &DraftState,
+        units: rutter_core::units::Length,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
 
         ui.horizontal(|ui| {
@@ -2136,41 +2258,53 @@ impl Ui {
 
         // Both numbers are drag-values rather than text fields: on a phone
         // in a cockpit, dragging a number is possible and typing is not.
+        // Edited in the shown unit and stored in metres. The drag speed
+        // and the range are converted too, or a boat set to feet would
+        // find its draft moving in 5 cm steps and capped at 20 ft.
         let mut draft = state.draft;
+        let mut shown_draft = units.from_metres(draft.draft_m);
+        let mut shown_margin = units.from_metres(draft.safety_m);
+        let suffix = format!(" {}", units.suffix());
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("draft");
             changed |= ui
                 .add(
-                    egui::DragValue::new(&mut draft.draft_m)
-                        .speed(0.05)
-                        .range(0.0..=20.0)
-                        .suffix(" m"),
+                    egui::DragValue::new(&mut shown_draft)
+                        .speed(units.from_metres(0.05))
+                        .range(0.0..=units.from_metres(20.0))
+                        .suffix(&suffix),
                 )
                 .changed();
             ui.label("+ margin");
             changed |= ui
                 .add(
-                    egui::DragValue::new(&mut draft.safety_m)
-                        .speed(0.05)
-                        .range(0.0..=10.0)
-                        .suffix(" m"),
+                    egui::DragValue::new(&mut shown_margin)
+                        .speed(units.from_metres(0.05))
+                        .range(0.0..=units.from_metres(10.0))
+                        .suffix(&suffix),
                 )
-                .on_hover_text(
+                .on_hover_text(format!(
                     "Water you want left under the keel. Worth at least \
-                     0.3 m here: the tide prediction is astronomical only \
+                     {} here: the tide prediction is astronomical only \
                      and takes no account of pressure or wind.",
-                )
+                    units.show(0.3)
+                ))
                 .changed();
         });
         if changed {
+            draft.draft_m = units.to_metres(shown_draft);
+            draft.safety_m = units.to_metres(shown_margin);
             actions.push(Action::SetDraft(draft));
         }
 
         ui.label(
-            egui::RichText::new(format!("needs {:.2} m of water", draft.needed_m()))
-                .weak()
-                .small(),
+            egui::RichText::new(format!(
+                "needs {} of water",
+                units.show_precise(draft.needed_m())
+            ))
+            .weak()
+            .small(),
         );
 
         // The arithmetic, spelled out. The whole feature is one subtraction,
@@ -2179,9 +2313,9 @@ impl Ui {
         let needed = draft.needed_m();
         ui.label(
             egui::RichText::new(format!(
-                "clears soundings ≥ {:.2} m now, ≥ {:.2} m within {} h",
-                needed - state.tide_now_m,
-                needed - state.tide_low_m,
+                "clears soundings ≥ {} now, ≥ {} within {} h",
+                units.show_precise(needed - state.tide_now_m),
+                units.show_precise(needed - state.tide_low_m),
                 state.window_hours
             ))
             .weak()
@@ -2205,8 +2339,8 @@ impl Ui {
         } else {
             ui.label(
                 egui::RichText::new(format!(
-                    "tide falls {:.2} m before its low",
-                    state.tide_now_m - state.tide_low_m
+                    "tide falls {} before its low",
+                    units.show_precise(state.tide_now_m - state.tide_low_m)
                 ))
                 .weak()
                 .small(),
@@ -2296,7 +2430,11 @@ impl Ui {
 
     /// The tide block in the panel: station, water now, next turning points,
     /// and a plot of the window around now.
-    fn tide_section(ui: &mut egui::Ui, tides: &TideState) -> Vec<Action> {
+    fn tide_section(
+        ui: &mut egui::Ui,
+        tides: &TideState,
+        units: rutter_core::units::Length,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
 
         ui.horizontal(|ui| {
@@ -2349,7 +2487,7 @@ impl Ui {
         }
 
         if !tides.curve.is_empty() {
-            Self::plot_tide(ui, tides);
+            Self::plot_tide(ui, tides, units);
         }
 
         for reading in &tides.next {
@@ -2377,7 +2515,7 @@ impl Ui {
     /// It is a polyline, a baseline at chart datum and a cursor at now —
     /// not worth a dependency, and a dependency would have to cross-compile
     /// to four Android ABIs to earn its place.
-    fn plot_tide(ui: &mut egui::Ui, tides: &TideState) {
+    fn plot_tide(ui: &mut egui::Ui, tides: &TideState, units: rutter_core::units::Length) {
         const HEIGHT: f32 = 56.0;
 
         let width = ui.available_width();
@@ -2437,14 +2575,18 @@ impl Ui {
         painter.text(
             rect.left_bottom() + egui::vec2(3.0, -1.0),
             egui::Align2::LEFT_BOTTOM,
-            format!("{lowest:.1}"),
+            format!("{:.1}", units.from_metres(f64::from(lowest))),
             egui::FontId::proportional(9.0),
             ui.visuals().weak_text_color(),
         );
         painter.text(
             rect.left_top() + egui::vec2(3.0, 1.0),
             egui::Align2::LEFT_TOP,
-            format!("{highest:.1} m"),
+            format!(
+                "{:.1} {}",
+                units.from_metres(f64::from(highest)),
+                units.suffix()
+            ),
             egui::FontId::proportional(9.0),
             ui.visuals().weak_text_color(),
         );
@@ -2709,6 +2851,7 @@ mod font_tests {
             ui_state.show(
                 ui,
                 &PanelState {
+                    display: DisplayState::default(),
                     safe: None,
                     layers: entries.clone(),
                     vessel: populated_vessel(),
@@ -3013,6 +3156,7 @@ mod font_tests {
             ui_state.show(
                 ui,
                 &PanelState {
+                    display: DisplayState::default(),
                     safe: None,
                     layers: entries.clone(),
                     vessel: populated_vessel(),
@@ -3218,6 +3362,7 @@ mod font_tests {
                 ui_state.show(
                     ui,
                     &PanelState {
+                        display: DisplayState::default(),
                         safe: None,
                         draft: state,
                         wind: populated_wind(),
@@ -3270,6 +3415,7 @@ mod font_tests {
                 ui_state.show(
                     ui,
                     &PanelState {
+                        display: DisplayState::default(),
                         safe: None,
                         wind: wind.clone(),
                         status: "status".to_owned(),

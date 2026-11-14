@@ -44,6 +44,7 @@ fn with_stations() -> Option<App> {
             imagery_out: None,
             siren: None,
             keepalive: None,
+            zone: None,
             data_dir: None,
         },
         Some(2.0),

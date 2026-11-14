@@ -89,6 +89,9 @@ mod keepalive;
 mod siren;
 #[cfg(target_os = "android")]
 mod watch;
+// The phone's local time rules.
+#[cfg(target_os = "android")]
+mod zone;
 
 // The only unsafe thing in the project, and unavoidable: the NDK's glue
 // finds this entry point by symbol name, so it cannot be mangled. Spelled
@@ -340,6 +343,9 @@ fn open_bundled_sources(app: &AndroidApp) -> Sources {
         // The foreground service, so an anchor watch survives the screen
         // going off.
         keepalive: Some(std::sync::Arc::new(keepalive::Service)),
+        // The phone's zone, which it keeps updated and which knows every
+        // daylight-saving rule there is.
+        zone: Some(std::sync::Arc::new(zone::Device)),
         data_dir: app.internal_data_path(),
     }
 }
@@ -435,6 +441,13 @@ struct Platform {
     /// calls every frame to learn zero again.
     inset_tries: u8,
 }
+
+/// The boat, as a multiple of the screen's own density.
+///
+/// A little over one: correcting for the density alone would make it the
+/// size it is on a desktop, and a desktop is looked at from a table while
+/// a phone is looked at in a cockpit in the sun.
+const BOAT_SCALE: f32 = 1.3;
 
 /// How much bigger the text is than egui's desktop default.
 const FONT_SCALE: f32 = 1.25;
@@ -882,6 +895,14 @@ impl ApplicationHandler for Platform {
 
         let ctx = egui::Context::default();
         size_for_fingers(&ctx);
+        if let Some(renderer) = self.renderer.as_mut() {
+            // The hull is laid out in physical pixels, and this screen
+            // has `pixels_per_point` of them per point — so without this
+            // the boat comes out at a third the size it is on a desktop.
+            // Scaled by the density rather than by a constant, because
+            // the thing being corrected for *is* the density.
+            renderer.set_boat_scale(pixels_per_point * BOAT_SCALE);
+        }
         self.egui = Some(EguiState {
             ctx,
             events: Vec::new(),

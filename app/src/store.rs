@@ -75,6 +75,10 @@ pub struct Settings {
     /// them: a file listing what to show would silently hide anything the
     /// chart gained since it was written.
     pub hidden_layers: Vec<String>,
+    /// What lengths are shown in — see [`rutter_core::units::Length`].
+    pub units: rutter_core::units::Length,
+    /// Whether times are shown locally rather than in UTC.
+    pub local_time: bool,
     /// Keys this build did not recognise, kept so writing the file back
     /// does not discard a newer build's settings.
     ///
@@ -102,6 +106,11 @@ impl Default for Settings {
             route_visible: true,
             nmea: String::new(),
             hidden_layers: Vec::new(),
+            // Metres and UTC: what every chart, almanac and weather
+            // product is published in, so the default matches the source
+            // data and a change is a deliberate act.
+            units: rutter_core::units::Length::Metres,
+            local_time: false,
             unknown: BTreeMap::new(),
         }
     }
@@ -249,6 +258,11 @@ impl Settings {
         out.vessel_visible = flag(&found, "vessel_visible", out.vessel_visible);
         out.route_visible = flag(&found, "route_visible", out.route_visible);
         out.nmea = found.get("nmea").cloned().unwrap_or_default();
+        out.units = found
+            .get("units")
+            .and_then(|text| rutter_core::units::Length::parse(text))
+            .unwrap_or(out.units);
+        out.local_time = flag(&found, "local_time", out.local_time);
         out.hidden_layers = found
             .get("hidden_layers")
             .map(|v| {
@@ -271,7 +285,7 @@ impl Settings {
         out
     }
 
-    const KNOWN_KEYS: [&'static str; 14] = [
+    const KNOWN_KEYS: [&'static str; 16] = [
         "draft_m",
         "safety_m",
         "draft_check",
@@ -286,6 +300,8 @@ impl Settings {
         "route_visible",
         "nmea",
         "hidden_layers",
+        "units",
+        "local_time",
     ];
 
     fn to_text(&self) -> String {
@@ -315,6 +331,11 @@ impl Settings {
             "temperature_opacity = {:.3}\n",
             self.temperature_opacity
         ));
+
+        out.push_str("\n# How things are shown. Units are metres, feet or fathoms;\n");
+        out.push_str("# local_time swaps UTC for whatever the system's zone is.\n");
+        out.push_str(&format!("units = {}\n", self.units.key()));
+        out.push_str(&format!("local_time = {}\n", self.local_time));
 
         out.push_str("\n# Chart layers to keep hidden, by name.\n");
         out.push_str(&format!(
@@ -1001,14 +1022,47 @@ mod tests {
         // Downgrading must not reset what the newer build was keeping.
         // Otherwise running an older binary once costs you settings you
         // never touched.
-        let text = "draft_m = 2.0\nnight_mode = true\nunits = feet\n";
+        // `units` was the example here once and has since become a key
+        // this build knows, which would have made the test pass without
+        // testing anything. Replaced with keys that are still unknown.
+        let text = "draft_m = 2.0\nnight_mode = true\nmagnetic_bearings = true\n";
         let settings = Settings::parse(text);
         let written = settings.to_text();
         assert!(written.contains("night_mode = true"), "{written}");
-        assert!(written.contains("units = feet"), "{written}");
+        assert!(written.contains("magnetic_bearings = true"), "{written}");
         // And it round-trips again rather than accumulating duplicates.
         let again = Settings::parse(&written).to_text();
         assert_eq!(again.matches("night_mode").count(), 1, "{again}");
+    }
+
+    #[test]
+    fn how_things_are_shown_survives_a_restart() {
+        // The whole point of putting these in the settings file: a boat
+        // set to feet should not come up in metres tomorrow, because a
+        // depth in the wrong unit is not a cosmetic problem.
+        use rutter_core::units::Length;
+
+        for units in Length::ALL {
+            for local_time in [false, true] {
+                let settings = Settings {
+                    units,
+                    local_time,
+                    ..Settings::default()
+                };
+                let again = Settings::parse(&settings.to_text());
+                assert_eq!(again.units, units, "{units:?}");
+                assert_eq!(again.local_time, local_time, "{units:?} {local_time}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_unit_falls_back_rather_than_guessing() {
+        // Hand-edited files are expected — the header says so. A unit
+        // nobody can parse must leave the default standing, not pick one.
+        let settings = Settings::parse("units = furlongs\nlocal_time = perhaps\n");
+        assert_eq!(settings.units, Settings::default().units);
+        assert_eq!(settings.local_time, Settings::default().local_time);
     }
 
     #[test]

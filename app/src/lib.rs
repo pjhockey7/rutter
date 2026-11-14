@@ -32,6 +32,7 @@ pub mod nmea;
 mod serial;
 pub mod siren;
 pub mod store;
+pub mod zone;
 pub use charts::ChartWorker;
 
 use rutter_charts::{ChartSource, Collected, ImagerySource};
@@ -45,9 +46,10 @@ use rutter_core::track::{self, Track};
 use rutter_core::{chart, LatLon, View};
 pub use rutter_render::AlarmState;
 use rutter_render::{
-    Action, CurrentState, DownloadProgress, DownloadState, DraftState, FieldPatch, ImageryState,
-    LayerEntry, Overlay, PanelState, Renderer, RouteState, TemperatureState, TideMarker,
-    TideReading, TideState, TimeState, TrackState, Ui, VesselState, WaypointRow, WindState,
+    Action, CurrentState, DisplayState, DownloadProgress, DownloadState, DraftState, FieldPatch,
+    ImageryState, LayerEntry, Overlay, PanelState, Renderer, RouteState, TemperatureState,
+    TideMarker, TideReading, TideState, TimeState, TrackState, Ui, VesselState, WaypointRow,
+    WindState,
 };
 
 /// Re-exported so a platform can name the panel's input without depending
@@ -372,6 +374,10 @@ pub struct Sources {
     /// — which on a desktop is until someone closes it, and on a phone is
     /// whenever the system feels like it. The panel says which.
     pub keepalive: Option<std::sync::Arc<dyn keepalive::Keepalive>>,
+    /// The system's local time rules, where the platform can supply
+    /// them. `None` leaves every time in UTC, which is correct and
+    /// legible — just inconvenient. See [`zone::Zone`].
+    pub zone: Option<std::sync::Arc<dyn zone::Zone>>,
     pub data_dir: Option<std::path::PathBuf>,
     /// Where a download should write its MBTiles file.
     ///
@@ -469,6 +475,23 @@ pub struct App {
     siren: Option<std::sync::Arc<dyn siren::Siren>>,
     /// Keeping the process running while a watch stands.
     keepalive: Option<std::sync::Arc<dyn keepalive::Keepalive>>,
+    /// The system's local time rules, if it has any to offer.
+    zone: Option<std::sync::Arc<dyn zone::Zone>>,
+    /// Whether times are shown in UTC or locally.
+    shown_as: zone::Shown,
+    /// The clock every time on the panel is formatted against, resolved
+    /// once a frame.
+    ///
+    /// Cached rather than asked per time: on Android the answer is two
+    /// JNI calls, and a panel formats a couple of dozen times a frame.
+    /// Caching also guarantees that every time on one panel is in the
+    /// same scale, which matters more — a list mixing UTC and local
+    /// would be worse than either.
+    clock: zone::Clock,
+    /// What lengths are shown in. Metres everywhere inside; this is the
+    /// last step before a number reaches a person. See
+    /// [`rutter_core::units`].
+    units: rutter_core::units::Length,
     /// The reason last passed to [`keepalive::Keepalive::hold`], or
     /// `None` while nothing is held. Kept so the hold is taken, changed
     /// and dropped on transitions rather than re-announced every frame.
@@ -615,6 +638,10 @@ impl App {
             fetcher: sources.fetcher,
             siren: sources.siren,
             keepalive: sources.keepalive,
+            zone: sources.zone,
+            shown_as: zone::Shown::default(),
+            clock: zone::Clock::utc(),
+            units: rutter_core::units::Length::default(),
             held: None,
             watch,
             last_sounded,
@@ -796,6 +823,12 @@ impl App {
 
     /// Bring every GPU-side thing in line with the view. Call before drawing.
     pub fn refresh(&mut self, renderer: &mut Renderer) {
+        // The clock first, so every time drawn this frame is in one
+        // scale. Resolved against the time being *shown* rather than
+        // against now, so a day planned across a daylight-saving change
+        // reads in the offset that applies to that day.
+        self.clock = zone::Clock::resolve(self.shown_as, self.zone.as_deref(), self.shown_time());
+
         // Before anything else: a new fix can move the view, and the tile
         // set, the tide station and the overlay all follow from the view.
         self.poll_nmea();
@@ -1219,6 +1252,8 @@ impl App {
             // stores the complement, so a chart that gains a layer shows
             // it rather than hiding it silently.
             hidden_layers: self.hidden_layer_names(),
+            units: self.units,
+            local_time: self.shown_as == zone::Shown::Local,
             ..self.saved_settings.clone()
         }
     }
@@ -1249,6 +1284,12 @@ impl App {
         self.temperature_opacity = settings.temperature_opacity;
         self.vessel_visible = settings.vessel_visible;
         self.route_visible = settings.route_visible;
+        self.units = settings.units;
+        self.shown_as = if settings.local_time {
+            zone::Shown::Local
+        } else {
+            zone::Shown::Utc
+        };
 
         // A saved address wins over the built-in GPS, the same way a
         // command-line one does: naming a feed is a decision.
@@ -1516,7 +1557,7 @@ impl App {
             format!(
                 "{:.1} nm to run, arriving {} ({})",
                 rutter_core::geo::metres_to_nm(progress.remaining_m),
-                format_utc_hhmm(unix_now() + secs),
+                self.clock.hhmm(unix_now() + secs),
                 format_away(secs)
             )
         });
@@ -1639,13 +1680,17 @@ impl App {
                 .iter()
                 .map(|a| match a.kind {
                     alarm::Kind::AnchorDrag => {
-                        format!("{} — {:.0} m from the anchor", a.kind.label(), a.value_m)
+                        format!(
+                            "{} — {} from the anchor",
+                            a.kind.label(),
+                            self.units.horizontal().show(a.value_m)
+                        )
                     }
                     alarm::Kind::Shallow => {
                         format!(
-                            "{} — {:.1} m under the transducer",
+                            "{} — {} under the transducer",
                             a.kind.label(),
-                            a.value_m
+                            self.units.show(a.value_m)
                         )
                     }
                 })
@@ -1686,7 +1731,7 @@ impl App {
             points: self.track.len(),
             distance: (distance > 0.005).then(|| format!("{distance:.2} nm run")),
             since: span
-                .map(|(from, to)| format!("{} to {}", format_utc_hhmm(from), format_utc_hhmm(to))),
+                .map(|(from, to)| format!("{} to {}", self.clock.hhmm(from), self.clock.hhmm(to))),
             // More than one run means the feed dropped out and the line is
             // broken. Said out loud, because a break in a track looks like
             // a bug rather than a gap in the record.
@@ -1833,7 +1878,7 @@ impl App {
                             };
                             format!(
                                 "{} {}  {}",
-                                format_utc_hhmm(e.unix),
+                                self.clock.hhmm(e.unix),
                                 what,
                                 format_away(e.unix - shown)
                             )
@@ -2102,7 +2147,7 @@ impl App {
             offset_secs: self.time_offset(),
             min_secs: min,
             max_secs: max,
-            shown: format_utc_hhmm(shown),
+            shown: self.clock.hhmm(shown),
             away: if self.time_offset() == 0 {
                 String::new()
             } else {
@@ -2131,6 +2176,16 @@ impl App {
             // whether it is behind a camera cutout. The shim that does
             // fills this in after the call.
             safe: None,
+            display: DisplayState {
+                units: self.units,
+                local_time: self.shown_as == zone::Shown::Local,
+                zone_available: self.zone.is_some(),
+                clock: if self.clock.is_utc() {
+                    "UTC".to_owned()
+                } else {
+                    self.clock.suffix().to_owned()
+                },
+            },
             layers: self.layer_entries.clone(),
             vessel: self.vessel_state(),
             imagery: ImageryState {
@@ -2153,7 +2208,7 @@ impl App {
             time: self.time_state(),
             draft: self.draft_state(renderer),
             wind: self.wind_state(),
-            status: status_line(&self.view),
+            status: status_line(&self.view, self.units),
         }
     }
 
@@ -2492,6 +2547,26 @@ impl App {
                     self.route_visible = *on;
                     touched = true;
                 }
+                Action::SetUnits(unit) => {
+                    self.units = *unit;
+                    touched = true;
+                }
+                Action::SetLocalTime(local) => {
+                    self.shown_as = if *local {
+                        zone::Shown::Local
+                    } else {
+                        zone::Shown::Utc
+                    };
+                    // Straight away rather than waiting for the next
+                    // frame's refresh, so the panel that caused this
+                    // redraws in the clock the tap just chose.
+                    self.clock = zone::Clock::resolve(
+                        self.shown_as,
+                        self.zone.as_deref(),
+                        self.shown_time(),
+                    );
+                    touched = true;
+                }
                 Action::SetTrack(on) => {
                     self.track_visible = *on;
                     touched = true;
@@ -2665,6 +2740,8 @@ impl App {
                 | Action::SetTemperature(_)
                 | Action::SetTemperatureOpacity(_)
                 | Action::SetRoute(_)
+                | Action::SetUnits(_)
+                | Action::SetLocalTime(_)
                 | Action::SetTrack(_)
                 | Action::SetRecording(_)
                 | Action::ClearTrack
@@ -2884,7 +2961,7 @@ impl App {
             heading: heading_line(vessel),
             depth: vessel
                 .depth_m
-                .map(|d| format!("{:.1} m under the transducer", d.value)),
+                .map(|d| format!("{} under the transducer", self.units.show(d.value))),
             wind: vessel.apparent_wind.map(|w| apparent_wind_line(w.value)),
             age: age.map(fix_age_line),
             stale: age.is_some_and(|s| s > FIX_STALE_SECS),
@@ -2894,7 +2971,7 @@ impl App {
             using_device_gps: matches!(nmea.endpoint(), nmea::Endpoint::Device),
             accuracy: vessel
                 .accuracy_m
-                .map(|a| format!("within {:.0} m", a.value.max(1.0))),
+                .map(|a| format!("within {}", self.units.horizontal().show(a.value.max(1.0)))),
             address: match nmea.endpoint() {
                 // Nothing to type: the built-in GPS is not an address, and
                 // seeding the box with a fake one would be worse than
@@ -2987,9 +3064,9 @@ impl App {
                     Kind::High => "High".to_owned(),
                     Kind::Low => "Low".to_owned(),
                 },
-                when: format_utc_hhmm(e.unix),
+                when: self.clock.hhmm(e.unix),
                 away: format_away(e.unix - now),
-                height: format!("{:.2} m", e.height_m),
+                height: self.units.show_precise(e.height_m),
                 high: e.kind == Kind::High,
             })
             .collect();
@@ -3006,7 +3083,7 @@ impl App {
             second: now,
             station_id: station.id.clone(),
             name: station.name.clone(),
-            now: format!("{:+.2} m", station.height_at(now)),
+            now: self.units.show_signed(station.height_at(now)),
             next,
             curve,
             now_at: BEHIND as f32 / (AHEAD + BEHIND) as f32,
@@ -3337,13 +3414,18 @@ fn bytes_roughly(bytes: u64) -> String {
 ///
 /// Degrees and decimal minutes, which is how a position is read aloud and
 /// written in a log — not decimal degrees, which no one on a boat uses.
-pub fn status_line(view: &View) -> String {
+pub fn status_line(view: &View, units: rutter_core::units::Length) -> String {
     let scale = chart::metres_per_pixel(view.centre.lat, view.tile_zoom());
+    // The horizontal unit: this is a distance across the chart, and a
+    // scale in fathoms per pixel would be a curiosity rather than a
+    // reading.
+    let units = units.horizontal();
     format!(
-        "{}   z{:.1}   {:.0} m/px",
+        "{}   z{:.1}   {:.0} {}/px",
         format_position(view.centre),
         view.zoom,
-        scale
+        units.from_metres(scale),
+        units.suffix()
     )
 }
 
@@ -3473,15 +3555,6 @@ fn unix_now() -> i64 {
 /// needs a timezone database, which is a dependency this has not earned yet
 /// — so until then the honest thing is to say which zone this is. The
 /// relative "in 2h 11m" beside it is what you actually steer by.
-fn format_utc_hhmm(unix: i64) -> String {
-    let seconds_into_day = unix.rem_euclid(86_400);
-    format!(
-        "{:02}:{:02}Z",
-        seconds_into_day / 3600,
-        (seconds_into_day % 3600) / 60
-    )
-}
-
 /// How far off something is, as "in 2h 11m" or "12m ago".
 fn format_away(seconds: i64) -> String {
     let past = seconds < 0;
@@ -3637,27 +3710,6 @@ mod tests {
         assert!(barb_lattice(&view_at(32.7, -117.25, 11.0), 0.0).is_empty());
         assert!(barb_lattice(&view_at(32.7, -117.25, 11.0), -0.25).is_empty());
         assert!(barb_lattice(&view_at(32.7, -117.25, 11.0), f64::NAN).is_empty());
-    }
-
-    #[test]
-    fn utc_times_are_formatted_from_the_epoch_correctly() {
-        // 2026-03-01T15:25:00Z — the high water NOAA publishes for San
-        // Diego that afternoon, so the arithmetic is checked against a real
-        // instant rather than a round number.
-        assert_eq!(format_utc_hhmm(1_772_378_700), "15:25Z");
-        // Midnight and the second before it, the two the modulo gets wrong.
-        assert_eq!(format_utc_hhmm(1_772_323_200), "00:00Z");
-        assert_eq!(format_utc_hhmm(1_772_323_199), "23:59Z");
-    }
-
-    #[test]
-    fn utc_formatting_survives_times_before_1970() {
-        // `%` on a negative i64 is negative in Rust, which would print
-        // "-1:-1Z". `rem_euclid` is what makes this right, and a clock that
-        // has not been set yet is exactly when it would show.
-        let formatted = format_utc_hhmm(-1);
-        assert_eq!(formatted, "23:59Z");
-        assert!(!formatted.contains('-'));
     }
 
     #[test]
@@ -3864,7 +3916,10 @@ mod tests {
     fn the_status_line_still_carries_the_position_it_used_to() {
         // The formatter was shared with the boat's readout; the view's own
         // line must not have changed shape in the process.
-        let line = status_line(&view_at(32.68, -117.23, 12.0));
+        let line = status_line(
+            &view_at(32.68, -117.23, 12.0),
+            rutter_core::units::Length::Metres,
+        );
         assert!(
             line.starts_with("32°40.80'N  117°13.80'W"),
             "status line reads {line:?}"
@@ -3943,6 +3998,7 @@ mod tests {
                 imagery_out: None,
                 siren: None,
                 keepalive: None,
+                zone: None,
                 data_dir: None,
             },
             None,
@@ -4002,6 +4058,7 @@ mod tests {
                 imagery_out: None,
                 siren: None,
                 keepalive: None,
+                zone: None,
                 data_dir: None,
             },
             None,

@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 mod siren;
+mod zone;
 
 use rutter_app::{App, NmeaEndpoint, Position, Sources, Viewport};
 use rutter_charts::{ChartSource, ImagerySource};
@@ -342,6 +343,9 @@ fn load_sources() -> Result<(Sources, Option<f64>, Opening), String> {
             // question, not an anchor-watch one, and one the user is in a
             // better position to answer than this app is.
             keepalive: None,
+            // The host's own time-zone rules, through libc — so the
+            // Settings tab can offer local time at all.
+            zone: Some(std::sync::Arc::new(zone::System)),
             data_dir: data_directory(),
             // Default: beside the other data files. The download
             // replaces whatever is there, which on a desktop is what you

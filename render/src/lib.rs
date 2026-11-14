@@ -31,9 +31,9 @@
 pub mod ui;
 
 pub use ui::{
-    Action, AlarmState, CurrentState, DownloadProgress, DownloadState, DraftState, ImageryState,
-    LayerEntry, PanelState, RouteState, Tab, TemperatureState, TideMarker, TideReading, TideState,
-    TimeState, TrackState, Ui, VesselState, WaypointRow, WindState,
+    Action, AlarmState, CurrentState, DisplayState, DownloadProgress, DownloadState, DraftState,
+    ImageryState, LayerEntry, PanelState, RouteState, Tab, TemperatureState, TideMarker,
+    TideReading, TideState, TimeState, TrackState, Ui, VesselState, WaypointRow, WindState,
 };
 
 use rutter_core::chart::{self, ChartStyle, StyledArea, StyledLine, StyledPoint, TileId};
@@ -41,6 +41,13 @@ use rutter_core::depth::{self, Clearance, Draft, Tally, TideWindow};
 use rutter_core::View;
 
 /// Sea. Everything is drawn over this.
+/// How large the boat is drawn by default.
+///
+/// Above one: the hull was laid out against a desktop window and is a
+/// little small even there — it is the one mark on the chart that must
+/// never be hunted for.
+const DEFAULT_BOAT_SCALE: f32 = 1.25;
+
 const SEA: wgpu::Color = wgpu::Color {
     r: 0.043,
     g: 0.149,
@@ -646,6 +653,8 @@ pub struct Renderer {
     /// The part of the surface the chart may use, in surface pixels, or
     /// `None` for all of it. See [`Renderer::set_letterbox`].
     letterbox: Option<(u32, u32, u32, u32)>,
+    /// How large to draw the boat. See [`Renderer::set_boat_scale`].
+    boat_scale: f32,
     bind_layout: wgpu::BindGroupLayout,
     /// egui's wgpu backend, which owns its own pipelines and font atlas and
     /// draws into the chart's render pass.
@@ -1286,6 +1295,7 @@ impl Renderer {
         Ok(Self {
             // A window fills itself; only a phone has anything to avoid.
             letterbox: None,
+            boat_scale: DEFAULT_BOAT_SCALE,
             surface,
             device,
             queue,
@@ -1338,6 +1348,25 @@ impl Renderer {
     /// A zero in either dimension means the window is minimised, or — on
     /// Android — that the activity is going away. Reconfiguring to zero is a
     /// validation error, so it is ignored.
+    /// How large to draw the boat, as a multiple of the base size.
+    ///
+    /// A platform's business, because the thing it has to correct for is
+    /// a platform fact: the hull is laid out in *physical* pixels, and a
+    /// phone has two or three of those per point. Left alone, the one
+    /// mark that must never be hunted for came out a third of the size
+    /// on the device where the screen is smallest.
+    ///
+    /// Clamped rather than trusted — a zero would make the boat vanish
+    /// and a huge value would cover the chart, and neither should be
+    /// reachable by a platform getting its arithmetic wrong.
+    pub fn set_boat_scale(&mut self, scale: f32) {
+        self.boat_scale = if scale.is_finite() {
+            scale.clamp(0.5, 6.0)
+        } else {
+            DEFAULT_BOAT_SCALE
+        };
+    }
+
     /// Confine the chart to part of the surface.
     ///
     /// `None` fills it, which is what a desktop window wants. A phone
@@ -2302,6 +2331,17 @@ impl Renderer {
                     /// Reach of its cross.
                     const DR_CROSS: f32 = 12.0;
 
+                    // These are *physical* pixels, so on a phone at 2.6
+                    // pixels per point the whole mark came out about a
+                    // third the size it is on a desktop — the one symbol
+                    // that must never be hunted for, and the hardest to
+                    // see. The platform sets the scale; see
+                    // `Renderer::set_boat_scale`.
+                    let k = self.boat_scale;
+                    let (bow, quarter_aft, beam, transom) =
+                        (BOW * k, QUARTER_AFT * k, BEAM * k, TRANSOM * k);
+                    let (dr_ring, dr_cross) = (DR_RING * k, DR_CROSS * k);
+
                     // Black, at the hull's own alpha. The outline is what
                     // separates the boat from whatever it is over — orange
                     // on an orange roof, or on the amber of a
@@ -2316,14 +2356,14 @@ impl Renderer {
                         // hull it stands in for.
                         let ring = |i: usize| {
                             let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
-                            [DR_RING * a.cos(), DR_RING * a.sin()]
+                            [dr_ring * a.cos(), dr_ring * a.sin()]
                         };
                         for i in 0..RING_SEGMENTS {
                             triangle([0.0, 0.0], ring(i), ring(i + 1), colour);
                             segment(ring(i), ring(i + 1), edge);
                         }
-                        segment([-DR_CROSS, 0.0], [DR_CROSS, 0.0], edge);
-                        segment([0.0, -DR_CROSS], [0.0, DR_CROSS], edge);
+                        segment([-dr_cross, 0.0], [dr_cross, 0.0], edge);
+                        segment([0.0, -dr_cross], [0.0, dr_cross], edge);
                         continue;
                     };
 
@@ -2336,10 +2376,10 @@ impl Renderer {
                     let point =
                         |d: f32, w: f32| [along.0 * d + across.0 * w, along.1 * d + across.1 * w];
 
-                    let bow = point(BOW, 0.0);
-                    let port = point(QUARTER_AFT, -BEAM);
-                    let starboard = point(QUARTER_AFT, BEAM);
-                    let transom = point(TRANSOM, 0.0);
+                    let bow = point(bow, 0.0);
+                    let port = point(quarter_aft, -beam);
+                    let starboard = point(quarter_aft, beam);
+                    let transom = point(transom, 0.0);
 
                     // Two triangles about the notch, so the concave stern
                     // stays concave. One triangle bow-port-starboard would

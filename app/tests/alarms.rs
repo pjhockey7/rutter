@@ -113,6 +113,7 @@ fn app_with_both(
             imagery_out: None,
             siren,
             keepalive,
+            zone: None,
             data_dir: None,
         },
         None,
