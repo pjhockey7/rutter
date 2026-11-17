@@ -311,6 +311,45 @@ Stated plainly, because the whole point of
   and 16 KB-aligned, v2+v3 signatures — but verified is not the same as
   tried, and I have not had a device to try it on.
 
+## Licence
+
+**MIT or Apache-2.0**, at your option — the Rust ecosystem's convention,
+and what every one of this project's 427 dependencies already uses. Full
+text in [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+Take whichever suits you. MIT is the shortest permissive licence there
+is; Apache-2.0 adds an explicit patent grant that some organisations
+require before they will take on a dependency. Contributions are offered
+under the same dual licence unless you say otherwise.
+
+Not GPL, which this was first declared as. Apple's App Store terms
+impose per-device limits and DRM that conflict with the GPL's "no further
+restrictions" clause — the reason VLC was pulled from the store in 2011
+— and iOS is a stated target here.
+
+### The data is separate, and already free
+
+The licence above covers the code. The charts and forecasts this app is
+built around are not ours to licence, and do not need to be: every
+default source is a US government work in the public domain.
+
+| Source | What it is | Status |
+| --- | --- | --- |
+| NOAA ENC | The charts themselves | Public domain, no registration |
+| USGS imagery | The aerial underlay | Public domain |
+| NOAA harmonic constituents | Tides and tidal currents | Public domain |
+| NOAA GFS | Wind and air temperature | Public domain |
+
+That is a deliberate constraint rather than a happy accident: the app
+supports open data only. A plotter whose charts stop working when a
+subscription lapses is a plotter you cannot rely on, and the chart is
+the part you are relying on most.
+
+What this does *not* mean is that the data is free of obligations in use.
+NOAA ENCs are not a substitute for the official paper chart for
+navigation, and nothing here is certified for it. See
+[What is not done](#what-is-not-done).
+
 ## Notes kept because they cost something to learn
 
 - **Wind must be interpolated as components, never as a bearing.** Halfway

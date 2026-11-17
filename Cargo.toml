@@ -23,7 +23,20 @@ edition = "2021"
 # comes from rust-overlay (currently 1.99), and the NDK only supplies clang
 # for linking and for the C in SQLite. There was never a reason to hold back.
 rust-version = "1.95"
-license = "GPL-3.0-or-later"
+# Dual, which is the Rust ecosystem's convention and what every one of
+# this project's 427 dependencies already uses. A user picks whichever
+# suits them: MIT is the shortest permissive licence there is, and
+# Apache-2.0 adds an explicit patent grant that some organisations
+# require before they will touch a dependency.
+#
+# Not GPL, which this was first declared as. Apple's App Store terms
+# impose per-device limits and DRM that conflict with the GPL's "no
+# further restrictions" clause — the reason VLC was pulled from the
+# store in 2011 — and iOS is a stated target of this project.
+#
+# The data is a separate question and already settled: NOAA charts,
+# USGS imagery and GFS are US government works in the public domain.
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 rutter-core = { path = "core" }
