@@ -1,0 +1,62 @@
+[package]
+name = "rutter-ios"
+description = "iOS board support: UIKit entry point, CoreLocation, AVAudioSession"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# A static library, which is what Xcode links into the app bundle. Unlike
+# Android — where the APK loads a `.so` through `System.loadLibrary` — an
+# iOS app is one executable, so the Rust side is archived in rather than
+# loaded at runtime.
+#
+# `rlib` alongside it so `cargo check` on a Linux laptop still works. That
+# matters more here than it did for Android: none of this can be *built*
+# off a Mac, and type-checking is the only verification available.
+name = "rutter_ios"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rutter-app.workspace = true
+# The same HTTPS fetcher the other platforms use. rustls on `ring` builds
+# for aarch64-apple-ios; `NSURLSession` is a `TileFetcher` impl away if
+# the system certificate store or a marina's captive portal ever demands
+# it.
+rutter-fetch.workspace = true
+rutter-charts.workspace = true
+rutter-render.workspace = true
+rutter-tides.workspace = true
+rutter-core.workspace = true
+
+egui.workspace = true
+pollster.workspace = true
+log.workspace = true
+
+winit = { workspace = true, features = ["rwh_06"] }
+
+# Apple-only, so a check on a Linux laptop does not try to build UIKit
+# bindings. `cfg(target_vendor)` rather than `target_os`, so the modules
+# are shared with a macOS shim when that is written — the frameworks
+# named here all exist on both.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# The objc2 0.6 family, matching what winit already pulls in: mixing
+# major versions means two incompatible `NSObject` types, and an object
+# handed from one to the other does not type-check.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+# The phone's GPS. There is no C API for it — CoreLocation is
+# Objective-C, and a delegate object is required, which is why this needs
+# real bindings rather than a few `extern "C"` declarations.
+objc2-core-location = "0.3"
+# Safe-area insets, and the application object for lifecycle questions.
+objc2-ui-kit = "0.3"
+# The alarm. `AVAudioSession` is what decides whether a sound is heard
+# when the ringer switch is off, which is the whole point of an anchor
+# alarm.
+objc2-av-foundation = "0.3"
+libc = "0.2"
+
+[lints]
+workspace = true

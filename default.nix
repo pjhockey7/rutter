@@ -166,7 +166,13 @@ let
   muslTarget = "x86_64-unknown-linux-musl";
   muslCc = pkgs.pkgsCross.musl64.stdenv.cc;
 
-  rustTargets = androidRustTargets ++ [ muslTarget ];
+  # iOS. Nothing here can be *built* on Linux — that needs Apple's SDK and
+  # linker — but `cargo check` does not link, and having std for the target
+  # means the iOS shim can at least be type-checked from this machine
+  # rather than written blind and discovered to be wrong on a Mac.
+  iosTargets = [ "aarch64-apple-ios" "aarch64-apple-ios-sim" ];
+
+  rustTargets = androidRustTargets ++ iosTargets ++ [ muslTarget ];
 
   # Rust from rust-overlay rather than nixpkgs, for one reason: the targets
   # override. nixpkgs' rustc ships std for the build host only, so a

@@ -405,9 +405,44 @@ trusted.
 - [ ] **Search by name.** No way to find a harbour, a buoy or a tide station
       except by panning to it.
 
-- [ ] **iOS, Windows and macOS shims.** Stated targets, and the board-support
-      split was built for exactly this. Each is a window, an event loop and a
-      set of file paths.
+- [ ] **iOS: build it on a Mac.** The shim is written —
+      `platform/ios/`, with the entry point, CoreLocation, the audio
+      session, safe-area insets, bundle paths, the time zone and the
+      background location session that stands in for Android's foreground
+      service. `ios/Info.plist` and `ios/main.m` are there, and
+      `ios/README.md` has the build.
+
+      **It has never been compiled against the SDK, linked, signed or
+      run**, because none of that is possible off macOS. What has been
+      done is type-checking: the toolchain now carries
+      `aarch64-apple-ios`, and every Apple module checks clean for it
+      against stub `rutter-app`/`rutter-core` crates — the real ones
+      cannot be checked for an Apple target from Linux, because
+      `libsqlite3-sys` compiles C in its build script.
+
+      That catches a wrong type, a missing argument and a method the
+      bindings do not have. It does not catch a wrong *selector*:
+      `msg_send!` resolves names at runtime, so a typo is a crash on a
+      Mac. `ios/README.md` lists what to expect to go wrong, in order.
+
+      One finding worth keeping: `objc2-av-foundation` 0.3 ships **stubs**
+      for `AVAudioSession` and `AVAudioPlayer` — the generated files are
+      two lines of header comment. So the audio reaches those two classes
+      through the Objective-C runtime by name instead.
+
+- [ ] **Windows and macOS shims.** Stated targets, and the board-support
+      split was built for exactly this. Each is a window, an event loop
+      and a set of file paths. macOS is the cheaper of the two now: it
+      shares `zone.rs` with Linux and most of `platform/ios` besides the
+      UIKit parts.
+
+- [ ] **Share the touch platform code.** `platform/ios/src/lib.rs` and
+      `platform/android/src/lib.rs` now hold the same touch translation,
+      the same gesture-settling fix, the same letterboxing and the same
+      finger-sizing — written twice. Worth extracting once iOS has
+      actually run, and not before: factoring code against a platform
+      that has never executed is how you get an abstraction that fits
+      neither.
 
 ## Design note: many screens on one boat
 

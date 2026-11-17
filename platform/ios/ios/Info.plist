@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  rutter's iOS bundle description.
+
+  Hand-written, like the Android manifest, and for the same reason: it is
+  a dozen keys and every one of them is a decision worth being able to
+  read later. Xcode will happily generate this and then hide it behind a
+  settings pane.
+
+  NOTHING HERE HAS BEEN TESTED. It cannot be off a Mac. Each key is
+  commented with what it is for, so a wrong one can be found by reading
+  rather than by bisecting a launch failure.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>rutter</string>
+    <key>CFBundleName</key>
+    <string>rutter</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.pjhockey7.rutter</string>
+    <key>CFBundleExecutable</key>
+    <string>rutter</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!--
+      The launch screen, and it is not optional.
+
+      Without one iOS runs the app in a compatibility letterbox: black
+      bars top and bottom, a reduced resolution, and none of the screen
+      the safe-area work in src/insets.rs is written against. An empty
+      dict is enough to say "this app is built for modern screens" — it
+      does not need a storyboard with anything in it.
+    -->
+    <key>UILaunchScreen</key>
+    <dict/>
+
+    <!--
+      Why the app wants location, shown verbatim in the permission
+      dialogue. Apple rejects a build with this missing, and a vague one
+      gets a lower grant rate — so it says what it is actually for.
+    -->
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>rutter shows your boat on the chart and watches your anchor. Without your position it is a chart you have to place yourself on.</string>
+
+    <!--
+      Background location, which on iOS is the whole of the anchor-watch
+      story: there is no foreground service, and an app without this is
+      suspended seconds after the screen goes off — taking the anchor
+      watch with it. Paired with `allowsBackgroundLocationUpdates` at
+      runtime; both are required, neither is sufficient. See
+      src/keepalive.rs.
+    -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>location</string>
+    </array>
+
+    <!--
+      The chart, the imagery and the track are the user's. Both keys so
+      the app's Documents directory shows up in the Files app: a chart
+      downloaded on the boat can be copied off, and one prepared ashore
+      can be dropped in without a cable.
+    -->
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+
+    <!--
+      Landscape as well as portrait. A plotter at the chart table is
+      landscape; a phone in a pocket is portrait. Upside-down is left out
+      on purpose — it puts the home indicator where a thumb rests.
+    -->
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <!--
+      arm64 only, matching the one Rust target that is built. The
+      simulator is x86_64 on an Intel Mac, which is why the build script
+      names `aarch64-apple-ios-sim` separately.
+    -->
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+        <string>location-services</string>
+        <string>gps</string>
+    </array>
+
+    <!--
+      iOS 14 floors it. Metal through wgpu wants 13 at the very least,
+      and 14 is what `UILaunchScreen` needs.
+    -->
+    <key>MinimumOSVersion</key>
+    <string>14.0</string>
+
+    <!--
+      The chart is its own interface and the status bar sits over the top
+      of it. Hidden, with the safe-area insets still respected — see
+      src/insets.rs — so nothing lands under the notch regardless.
+    -->
+    <key>UIStatusBarHidden</key>
+    <true/>
+    <key>UIViewControllerBasedStatusBarAppearance</key>
+    <false/>
+</dict>
+</plist>

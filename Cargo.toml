@@ -9,6 +9,7 @@ members = [
 	"fetch",
 	"platform/linux",
 	"platform/android",
+	"platform/ios",
 ]
 
 # Shared metadata, so a version bump is one edit rather than four.
